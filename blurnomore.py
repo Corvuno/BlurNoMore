@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-BlurNoMore - turn a folder of small, blurry drawings into one sharp, print-ready A4 PDF for tracing.
+BlurNoMore - turn a folder of small, blurry drawings into one sharp, print-ready A4 PDF for tracing,
+or make bigger, AI-restored copies of any pictures ("Upscale images").
 
 Start it by double-clicking BlurNoMore.bat (or run:  python blurnomore.py).
 That opens a window where you choose the folder, how many images and all settings.
@@ -11,13 +12,19 @@ Command line (optional):
 Per image it: crops empty paper, upscales with Real-ESRGAN (GPU) when the image is
 too small for A4 at the chosen dpi, strengthens very thin lines, fits it on A4 and
 writes one multi-page PDF with the date and time in its name. Originals are never
-touched. Work files and logs go in <folder>\\_blurnomore_work.
+touched. Work files and logs go in <save folder>\\_blurnomore_work.
+
+Upscale mode (--mode upscale) only enlarges: 2x, 3x or 4x, into a new folder
+BlurNoMore_upscaled_<date>_<time> in the save folder. --preview shows up to 4 images
+(original next to result, plus close-ups) as picture sheets before a real run.
 """
 import argparse
 import hashlib
 import json
+import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -38,16 +45,20 @@ except ImportError:
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "3.1"
+VERSION = "4.0"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
-DEFAULT_FOLDER = r"I:\Oneplus Backup\Draw\New folder"
+DEFAULT_FOLDER = str(Path.home() / "Pictures")
 ESRGAN_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
               "realesrgan-ncnn-vulkan-20220424-windows.zip")
 MODEL_GENERAL = "realesrgan-x4plus"
 MODEL_ANIME = "realesrgan-x4plus-anime"
 AI_MIN_SCALE = 1.25  # below this much enlargement, plain Lanczos is enough
-SETTINGS_FILE = Path(__file__).with_name("blurnomore_settings.json")
+APP_DIR = Path(__file__).parent
+SETTINGS_FILE = APP_DIR / "blurnomore_settings.json"
+ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once, next to the program
+MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pairs
+BIG_RESULT_PIXELS = 100_000_000
 
 
 # ===================================================================== options
@@ -68,6 +79,11 @@ class Options:
     use_ai: bool = True          # Real-ESRGAN upscaling
     color_model: str = "general"  # "general" or "anime" (coloured art only)
     redo: bool = False           # ignore pages made in earlier runs
+    mode: str = "pdf"            # "pdf" = Tracing PDF, "upscale" = Upscale images
+    save_to: str = ""            # where results and _blurnomore_work go; empty = the images folder
+    scale: int = 2               # upscale mode: 2, 3 or 4 times bigger
+    up_model: str = "auto"       # upscale mode: "auto", "general", "anime" or an extra model's name
+    file_type: str = "png"       # upscale mode: "png" or "jpg"
     open_when_done: bool = True  # GUI only
 
 
@@ -160,11 +176,33 @@ def _find_exe(base):
     return None
 
 
+def extra_models():
+    """Names of the extra models in the models folder next to the program (sorted)."""
+    if not MODELS_DIR.is_dir():
+        return []
+    return sorted(p.name[:-6] for p in MODELS_DIR.glob("*.param") if (MODELS_DIR / (p.name[:-6] + ".bin")).is_file())
+
+
+def model_scale(name):
+    """Native enlargement of an extra model, read from its name (2x / x2, 3x / x3, else 4)."""
+    m = re.search(r"(?<![0-9])(?:([23])x|x([23]))(?![0-9])", name.lower())
+    return int(m.group(1) or m.group(2)) if m else 4
+
+
 def ensure_esrgan(work, log):
-    d = work / "realesrgan"
-    exe = _find_exe(d)
-    if exe:
-        return exe
+    # Next to the program is the home of Real-ESRGAN; the old place (in the work folder) still counts.
+    for base in (ESRGAN_DIR, work / "realesrgan"):
+        exe = _find_exe(base)
+        if exe:
+            return exe
+    d = ESRGAN_DIR
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".write_test"
+        probe.write_text("x")
+        probe.unlink()
+    except OSError:
+        d = work / "realesrgan"           # the program folder is not writable
     try:
         log("Downloading Real-ESRGAN (about 45 MB) ...")
         d.mkdir(parents=True, exist_ok=True)
@@ -180,13 +218,13 @@ def ensure_esrgan(work, log):
         return None
 
 
-def run_esrgan(img, model, exe, tmp, log):
+def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4):
     tin, tout = tmp / "in.png", tmp / "out.png"
     if tout.exists():
         tout.unlink()
     img.save(tin)
     cmd = [str(exe), "-i", str(tin), "-o", str(tout), "-n", model,
-           "-s", "4", "-m", str(exe.parent / "models"), "-f", "png"]
+           "-s", str(native), "-m", str(model_dir or exe.parent / "models"), "-f", "png"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not tout.exists():
         log("  Real-ESRGAN failed. Output:")
@@ -274,60 +312,19 @@ def choose_images(files, count, pick):
     return numbered
 
 
-def run(o, log, should_stop=lambda: False):
-    """Do the whole job. Returns the PDF path, or None."""
-    folder = Path(o.folder)
-    if not folder.is_dir():
-        log(f"Folder not found: {folder}")
-        return None
-    files = list_images(folder)
-    if not files:
-        log(f"No images found in {folder}")
-        return None
-
-    started = time.time()
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    work = folder / "_blurnomore_work"
-    old_work = folder / "_tracing_work"      # name used by earlier versions: keep its cache
-    if old_work.exists() and not work.exists():
-        try:
-            old_work.rename(work)
-        except OSError:
-            pass
-    (work / "logs").mkdir(parents=True, exist_ok=True)
-    logfile = open(work / "logs" / f"{stamp}.log", "w", encoding="utf-8")
-
-    def L(msg=""):
-        log(msg)
-        logfile.write(msg + "\n")
-        logfile.flush()
-
-    try:
-        return _run(o, L, should_stop, folder, files, stamp, work, started)
-    except Exception:  # noqa: BLE001
-        L("UNEXPECTED ERROR:")
-        L(traceback.format_exc())
-        return None
-    finally:
-        L(f"Log saved: {work / 'logs' / (stamp + '.log')}")
-        logfile.close()
+def output_dir(o):
+    """Where results and _blurnomore_work go: 'Save to', or the images folder when that is empty."""
+    return Path(o.save_to.strip().strip('"')) if o.save_to.strip() else Path(o.folder)
 
 
-def _run(o, L, should_stop, folder, files, stamp, work, started):
-    L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
-    L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
-    L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
-
-    key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
-                  o.color_boost, o.use_ai, o.color_model)
-    key = hashlib.md5(repr(key_fields).encode()).hexdigest()[:8]
-    pages_dir = work / f"pages_{key}"
-    fit_dir = work / "fitted_cache"
-    tmp = work / "tmp"
-    for d in (pages_dir, fit_dir, tmp):
-        d.mkdir(parents=True, exist_ok=True)
-
-    sel_file = work / "last_selection.json"
+def select_images(o, L, folder, files, work):
+    """The images this run (or its preview) uses. Returns (numbered, selection file)."""
+    out = work.parent
+    if out.resolve() == folder.resolve():
+        sel_file = work / "last_selection.json"
+    else:   # two image folders saving to one place must not mix their selections
+        tag = hashlib.md5(str(folder.resolve()).encode()).hexdigest()[:8]
+        sel_file = work / f"last_selection_{tag}.json"
     numbered = None
     if o.repeat_last:
         try:
@@ -342,16 +339,255 @@ def _run(o, L, should_stop, folder, files, stamp, work, started):
             numbered = None
     if numbered is None:
         numbered = choose_images(files, o.count, o.pick)
+    return numbered, sel_file
+
+
+def prepare(o, L, folder, out):
+    """Work folder, or None (after saying why) when the save folder cannot be made."""
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        L(f"Cannot make the folder to save in: {out} ({e}). Choose another folder under 'Save to'.")
+        return None
+    work = out / "_blurnomore_work"
+    old_work = out / "_tracing_work"      # name used by earlier versions: keep its cache
+    if old_work.exists() and not work.exists():
+        try:
+            old_work.rename(work)
+        except OSError:
+            pass
+    try:
+        (work / "logs").mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        L(f"Cannot make the work folder in {out} ({e}). Choose another folder under 'Save to'.")
+        return None
+    return work
+
+
+def run(o, log, should_stop=lambda: False):
+    """Do the whole job. Returns the PDF path (mode pdf) or the folder of upscaled
+    copies (mode upscale), or None."""
+    folder = Path(o.folder)
+    if not folder.is_dir():
+        log(f"Folder not found: {folder}")
+        return None
+    files = list_images(folder)
+    if not files:
+        log(f"No images found in {folder}")
+        return None
+
+    started = time.time()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out = output_dir(o)
+    work = prepare(o, log, folder, out)
+    if work is None:
+        return None
+    logfile = open(work / "logs" / f"{stamp}.log", "w", encoding="utf-8")
+
+    def L(msg=""):
+        log(msg)
+        logfile.write(msg + "\n")
+        logfile.flush()
+
+    try:
+        return _run(o, L, should_stop, folder, out, files, stamp, work, started)
+    except Exception:  # noqa: BLE001
+        L("UNEXPECTED ERROR:")
+        L(traceback.format_exc())
+        return None
+    finally:
+        L(f"Log saved: {work / 'logs' / (stamp + '.log')}")
+        logfile.close()
+
+
+class Context:
+    """What the per-image work needs: settings, log, folders, and the Real-ESRGAN program
+    (exe becomes None for the rest of the run when it fails)."""
+
+    def __init__(self, o, L, work):
+        self.o, self.L, self.work, self.exe = o, L, work, None
+        key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
+                      o.color_boost, o.use_ai, o.color_model)
+        key = hashlib.md5(repr(key_fields).encode()).hexdigest()[:8]
+        self.pages_dir = work / f"pages_{key}"
+        self.fit_dir = work / "fitted_cache"
+        self.tmp = work / "tmp"
+        self.cache_dir = work / "preview_cache"
+        dirs = (self.pages_dir, self.fit_dir, self.tmp) if o.mode == "pdf" else (self.tmp,)
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+        self.up_model = o.up_model
+        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime") + tuple(extra_models()):
+            L(f"Unknown upscale model '{o.up_model}'; choosing automatically.")
+            self.up_model = "auto"
+
+    def start_ai(self):
+        if self.o.use_ai:
+            self.exe = ensure_esrgan(self.work, self.L)
+        if self.o.use_ai and self.exe:
+            self.L(f"Real-ESRGAN: {self.exe}")
+
+
+def source_id(path):
+    st = path.stat()
+    return hashlib.md5(f"{path.name}{st.st_size}{int(st.st_mtime)}".encode()).hexdigest()[:8]
+
+
+# ---- one PDF page
+def make_page(c, path, src_id, im):
+    """Crop, upscale and place one image on its A4 page (or reuse the cached page).
+    Returns a dict about it; 'im' is the picture after the crop."""
+    o, L = c.o, c.L
+    w0, h0 = im.size
+    box = find_content_box(im) if o.autocrop else None
+    note = ""
+    if box:
+        im = im.crop(box)
+        note = f"cropped {w0}x{h0} -> {im.size[0]}x{im.size[1]}"
+    w, h = im.size
+    cls, stats = classify(im)
+    page, target, s, box_px = page_geometry(w, h, o.dpi, o.margin_mm, o.fit == "fill")
+
+    mono = cls in ("lineart", "shaded") or not o.keep_color
+    ext = ".png" if (mono and o.fade == 0) else ".jpg"
+    page_path = c.pages_dir / f"{path.stem[:40]}_{src_id}{ext}"
+
+    if o.redo or not page_path.exists():
+        model = MODEL_ANIME if cls in ("lineart", "shaded") else (
+            MODEL_ANIME if o.color_model == "anime" else MODEL_GENERAL)
+        method = "downscale" if s <= 1 else "lanczos"
+        fit = None
+        if s > AI_MIN_SCALE and c.exe is not None:
+            cache = c.fit_dir / f"{path.stem[:40]}_{src_id}_{model}_{w}x{h}_{target[0]}x{target[1]}.png"
+            if cache.exists() and not o.redo:
+                fit = Image.open(cache).convert("RGB")
+                method = f"AI {model} (cached)"
+            else:
+                up = run_esrgan(im, model, c.exe, c.tmp, L)
+                if up is None:
+                    L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
+                    c.exe = None
+                    method = "lanczos (AI failed)"
+                else:
+                    fit = up.resize(target, Image.LANCZOS)
+                    fit.save(cache)
+                    method = f"AI {model}"
+        if fit is None:
+            fit = im.resize(target, Image.LANCZOS)
+
+        fit = strengthen_thin(fit, o.thicken / 100.0)
+        out = finish(fit, cls, o)
+        white = 255 if out.mode == "L" else (255, 255, 255)
+        if out.size[0] > box_px[0] or out.size[1] > box_px[1]:   # "fill": trim to the page
+            cw, ch = min(out.size[0], box_px[0]), min(out.size[1], box_px[1])
+            l, t = (out.size[0] - cw) // 2, (out.size[1] - ch) // 2
+            out = out.crop((l, t, l + cw, t + ch))
+        canvas = Image.new(out.mode, page, white)
+        canvas.paste(out, ((page[0] - out.size[0]) // 2, (page[1] - out.size[1]) // 2))
+        if ext == ".png":
+            canvas.save(page_path, optimize=True, dpi=(o.dpi, o.dpi))
+        else:
+            canvas.save(page_path, quality=95, subsampling=0, dpi=(o.dpi, o.dpi))
+    else:
+        method = "page reused from earlier run"
+    return {"page_path": page_path, "im": im, "w0": w0, "h0": h0, "w": w, "h": h,
+            "cls": cls, "s": s, "method": method, "note": note}
+
+
+def page_line(tag, r, t0):
+    warn = "  LOW SOURCE RESOLUTION (>6x enlargement, will look soft)" if r["s"] > 6 else ""
+    return (f"{tag}\n    {r['w']}x{r['h']}  {r['cls']}  x{r['s']:.2f}  {r['method']}  {r['note']}  "
+            f"({time.time() - t0:.1f}s){warn}")
+
+
+def page_to_original(o, w, h):
+    """Where the cropped original (w x h) sits on its page: (scale, page x, page y) so that
+    original x = (page x - offset x) / scale. Same geometry as make_page."""
+    page, target, s, box_px = page_geometry(w, h, o.dpi, o.margin_mm, o.fit == "fill")
+    ow, oh = min(target[0], box_px[0]), min(target[1], box_px[1])
+    trim = ((target[0] - ow) // 2, (target[1] - oh) // 2) if (target[0] > box_px[0] or target[1] > box_px[1]) else (0, 0)
+    place = ((page[0] - ow) // 2, (page[1] - oh) // 2)
+    return target[0] / w, target[1] / h, place[0] - trim[0], place[1] - trim[1]
+
+
+# ---- one upscaled image
+def upscale_model(c, cls):
+    """(model name, model folder, native scale) for this kind of picture, or None for plain resizing."""
+    if c.exe is None:
+        return None
+    pick = c.up_model
+    if pick == "auto":
+        pick = "anime" if cls in ("lineart", "flatcolor") else "general"
+    if pick == "anime":
+        return MODEL_ANIME, c.exe.parent / "models", 4
+    if pick == "general":
+        return MODEL_GENERAL, c.exe.parent / "models", 4
+    return pick, MODELS_DIR, model_scale(pick)
+
+
+def make_upscaled(c, path, src_id, im, store=False):
+    """Enlarge one image to exactly scale x its size. A result made by the preview is reused;
+    with store=True a new result is kept for the run that follows."""
+    o, L = c.o, c.L
+    w, h = im.size
+    cls, stats = classify(im)
+    kind = "drawing" if cls in ("lineart", "flatcolor") else "photo"
+    target = (w * o.scale, h * o.scale)
+    m = upscale_model(c, cls)
+    label = m[0] if m else "plain"
+    cache = c.cache_dir / f"{path.stem[:40]}_{src_id}_{label}_x{o.scale}.png"
+    if cache.exists() and not o.redo:
+        res = Image.open(cache).convert("RGB")
+        res.load()
+        method = f"{label} (cached)" if m else "lanczos (cached)"
+        return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label}
+    res = None
+    method = "lanczos"
+    if m:
+        up = run_esrgan(im, m[0], c.exe, c.tmp, L, m[1], m[2])
+        if up is None:
+            L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
+            c.exe = None
+            method, label = "lanczos (AI failed)", "plain"
+        else:
+            res = up.resize(target, Image.LANCZOS)
+            method = f"AI {m[0]}"
+    if res is None:
+        res = im.resize(target, Image.LANCZOS)
+    if store:
+        try:
+            c.cache_dir.mkdir(parents=True, exist_ok=True)
+            res.save(c.cache_dir / f"{path.stem[:40]}_{src_id}_{label}_x{o.scale}.png")
+        except Exception:  # noqa: BLE001
+            pass
+    return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label}
+
+
+def upscaled_line(tag, r, scale, name, t0):
+    big = r["w"] * r["h"] * scale * scale
+    warn = f"  VERY LARGE RESULT ({big / 1e6:.0f} megapixels): big file, slow" if big > BIG_RESULT_PIXELS else ""
+    return (f"{tag}\n    {r['w']}x{r['h']}  {r['kind']}  {r['method']}  x{scale}  -> {name}  "
+            f"({time.time() - t0:.1f}s){warn}")
+
+
+def _run(o, L, should_stop, folder, out, files, stamp, work, started):
+    L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
+    L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
+    L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
+
+    c = Context(o, L, work)
+    numbered, sel_file = select_images(o, L, folder, files, work)
     try:
         sel_file.write_text(json.dumps([p.name for _, p in numbered], indent=1), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
     L(f"{len(numbered)} of {len(files)} images in {folder}\n")
 
-    exe = ensure_esrgan(work, L) if o.use_ai else None
-    if o.use_ai and exe:
-        L(f"Real-ESRGAN: {exe}")
+    c.start_ai()
+    upscale = o.mode == "upscale"
     pdf_inputs, report = [], []
+    up_dir = out / f"BlurNoMore_upscaled_{stamp}"
+    ext = "jpg" if o.file_type == "jpg" else "png"
 
     for n, (idx, path) in enumerate(numbered, 1):
         if should_stop():
@@ -360,67 +596,26 @@ def _run(o, L, should_stop, folder, files, stamp, work, started):
         t0 = time.time()
         tag = f"[{n}/{len(numbered)}] #{idx} {path.name[:50]}"
         try:
-            st = path.stat()
-            src_id = hashlib.md5(f"{path.name}{st.st_size}{int(st.st_mtime)}".encode()).hexdigest()[:8]
+            src_id = source_id(path)
             im = load_rgb(path)
-            w0, h0 = im.size
-
-            box = find_content_box(im) if o.autocrop else None
-            note = ""
-            if box:
-                im = im.crop(box)
-                note = f"cropped {w0}x{h0} -> {im.size[0]}x{im.size[1]}"
-            w, h = im.size
-            cls, stats = classify(im)
-            page, target, s, box_px = page_geometry(w, h, o.dpi, o.margin_mm, o.fit == "fill")
-
-            mono = cls in ("lineart", "shaded") or not o.keep_color
-            ext = ".png" if (mono and o.fade == 0) else ".jpg"
-            page_path = pages_dir / f"{path.stem[:40]}_{src_id}{ext}"
-
-            if o.redo or not page_path.exists():
-                model = MODEL_ANIME if cls in ("lineart", "shaded") else (
-                    MODEL_ANIME if o.color_model == "anime" else MODEL_GENERAL)
-                method = "downscale" if s <= 1 else "lanczos"
-                fit = None
-                if s > AI_MIN_SCALE and exe is not None:
-                    cache = fit_dir / f"{path.stem[:40]}_{src_id}_{model}_{w}x{h}_{target[0]}x{target[1]}.png"
-                    if cache.exists() and not o.redo:
-                        fit = Image.open(cache).convert("RGB")
-                        method = f"AI {model} (cached)"
-                    else:
-                        up = run_esrgan(im, model, exe, tmp, L)
-                        if up is None:
-                            L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
-                            exe = None
-                            method = "lanczos (AI failed)"
-                        else:
-                            fit = up.resize(target, Image.LANCZOS)
-                            fit.save(cache)
-                            method = f"AI {model}"
-                if fit is None:
-                    fit = im.resize(target, Image.LANCZOS)
-
-                fit = strengthen_thin(fit, o.thicken / 100.0)
-                out = finish(fit, cls, o)
-                white = 255 if out.mode == "L" else (255, 255, 255)
-                if out.size[0] > box_px[0] or out.size[1] > box_px[1]:   # "fill": trim to the page
-                    cw, ch = min(out.size[0], box_px[0]), min(out.size[1], box_px[1])
-                    l, t = (out.size[0] - cw) // 2, (out.size[1] - ch) // 2
-                    out = out.crop((l, t, l + cw, t + ch))
-                canvas = Image.new(out.mode, page, white)
-                canvas.paste(out, ((page[0] - out.size[0]) // 2, (page[1] - out.size[1]) // 2))
-                if ext == ".png":
-                    canvas.save(page_path, optimize=True, dpi=(o.dpi, o.dpi))
+            if upscale:
+                r = make_upscaled(c, path, src_id, im)
+                up_dir.mkdir(parents=True, exist_ok=True)
+                name, k = f"{path.stem}_x{o.scale}.{ext}", 2
+                while (up_dir / name).exists():
+                    name, k = f"{path.stem}_x{o.scale}_{k}.{ext}", k + 1
+                if ext == "jpg":
+                    r["result"].save(up_dir / name, quality=95, subsampling=0)
                 else:
-                    canvas.save(page_path, quality=95, subsampling=0, dpi=(o.dpi, o.dpi))
+                    r["result"].save(up_dir / name)
+                pdf_inputs.append(name)
+                L(upscaled_line(tag, r, o.scale, name, t0))
+                report.append([idx, path.name, f"{r['w']}x{r['h']}", r["kind"], o.scale, r["method"], name])
             else:
-                method = "page reused from earlier run"
-
-            pdf_inputs.append(str(page_path))
-            warn = "  LOW SOURCE RESOLUTION (>6x enlargement, will look soft)" if s > 6 else ""
-            L(f"{tag}\n    {w}x{h}  {cls}  x{s:.2f}  {method}  {note}  ({time.time() - t0:.1f}s){warn}")
-            report.append([idx, path.name, f"{w0}x{h0}", cls, round(s, 2), method, note])
+                r = make_page(c, path, src_id, im)
+                pdf_inputs.append(str(r["page_path"]))
+                L(page_line(tag, r, t0))
+                report.append([idx, path.name, f"{r['w0']}x{r['h0']}", r["cls"], round(r["s"], 2), r["method"], r["note"]])
         except Exception:  # noqa: BLE001
             L(f"{tag}\n    ERROR:")
             L("    " + traceback.format_exc().replace("\n", "\n    "))
@@ -430,15 +625,18 @@ def _run(o, L, should_stop, folder, files, stamp, work, started):
         L("Nothing to write.")
         return None
 
-    dpi = o.dpi
+    if upscale:
+        result = up_dir
+    else:
+        dpi = o.dpi
 
-    def layout(wpx, hpx, _ndpi):
-        wpt, hpt = wpx * 72.0 / dpi, hpx * 72.0 / dpi
-        return wpt, hpt, wpt, hpt
+        def layout(wpx, hpx, _ndpi):
+            wpt, hpt = wpx * 72.0 / dpi, hpx * 72.0 / dpi
+            return wpt, hpt, wpt, hpt
 
-    out_pdf = folder / f"BlurNoMore_A4_{stamp}_{len(pdf_inputs)}p.pdf"
-    with open(out_pdf, "wb") as f:
-        f.write(img2pdf.convert(pdf_inputs, layout_fun=layout))
+        result = out / f"BlurNoMore_A4_{stamp}_{len(pdf_inputs)}p.pdf"
+        with open(result, "wb") as f:
+            f.write(img2pdf.convert(pdf_inputs, layout_fun=layout))
 
     try:
         import csv
@@ -449,15 +647,142 @@ def _run(o, L, should_stop, folder, files, stamp, work, started):
     except Exception:  # noqa: BLE001
         pass
 
-    L(f"\nDONE in {time.time() - started:.0f}s: {out_pdf}  ({len(pdf_inputs)} pages)")
-    L("Print at 100% / 'Actual size', not 'Fit to page'.")
-    return out_pdf
+    if upscale:
+        L(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} images)")
+    else:
+        L(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} pages)")
+        L("Print at 100% / 'Actual size', not 'Fit to page'.")
+    return result
+
+
+# ================================================================== preview
+def busiest_box(im, size=400):
+    """Box (x0, y0, x1, y1) of about size x size pixels where the picture has the most edges."""
+    W, H = im.size
+    bw, bh = min(size, W), min(size, H)
+    g = im.convert("L")
+    f = min(1.0, 800.0 / max(W, H))
+    if f < 1.0:
+        g = g.resize((max(1, round(W * f)), max(1, round(H * f))), Image.BILINEAR)
+    a = np.asarray(g).astype(np.float32)
+    e = np.zeros_like(a)
+    e[:, 1:] += np.abs(np.diff(a, axis=1))
+    e[1:, :] += np.abs(np.diff(a, axis=0))
+    sw, sh = max(1, round(bw * f)), max(1, round(bh * f))
+    ii = np.pad(e, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    sums = ii[sh:, sw:] - ii[:-sh, sw:] - ii[sh:, :-sw] + ii[:-sh, :-sw]
+    y, x = np.unravel_index(int(np.argmax(sums)), sums.shape)
+    x0 = min(max(0, int(round(x / f))), W - bw)
+    y0 = min(max(0, int(round(y / f))), H - bh)
+    return (x0, y0, x0 + bw, y0 + bh)
+
+
+def make_preview(o, log, n=4):
+    """Process up to n images exactly as the run would and return what to show: a list of dicts
+    with name, cls (class), kind, method, original, result, detail_original, detail_result.
+    Writes only into the work folder (pages and results are kept for the run that follows)."""
+    folder = Path(o.folder)
+    if not folder.is_dir():
+        log(f"Folder not found: {folder}")
+        return []
+    files = list_images(folder)
+    if not files:
+        log(f"No images found in {folder}")
+        return []
+    work = prepare(o, log, folder, output_dir(o))
+    if work is None:
+        return []
+    c = Context(o, log, work)
+    numbered, _ = select_images(o, log, folder, files, work)
+    idx_of = {p: i for i, p in numbered}
+    picks = [(idx_of[p], p) for _, p in choose_images([p for _, p in numbered], n, "spread")]
+    log(f"Preview of {len(picks)} images in {folder}")
+    c.start_ai()
+    items = []
+    for k, (idx, path) in enumerate(picks, 1):
+        t0 = time.time()
+        tag = f"[{k}/{len(picks)}] #{idx} {path.name[:50]}"
+        try:
+            src_id = source_id(path)
+            im = load_rgb(path)
+            if o.mode == "upscale":
+                r = make_upscaled(c, path, src_id, im, store=True)
+                orig, res = im, r["result"]
+                box = busiest_box(res)
+                fx = fy = float(o.scale)
+                dx = dy = 0.0
+                log(upscaled_line(tag, r, o.scale, "(preview)", t0))
+            else:
+                r = make_page(c, path, src_id, im)
+                orig = r["im"]
+                res = Image.open(r["page_path"]).convert("RGB")
+                box = busiest_box(res)
+                fx, fy, dx, dy = page_to_original(o, r["w"], r["h"])
+                log(page_line(tag, r, t0))
+            ow, oh = orig.size
+            sx0, sx1 = (min(max((box[0] - dx) / fx, 0.0), ow - 1), min(max((box[2] - dx) / fx, 1.0), ow))
+            sy0, sy1 = (min(max((box[1] - dy) / fy, 0.0), oh - 1), min(max((box[3] - dy) / fy, 1.0), oh))
+            size = (box[2] - box[0], box[3] - box[1])
+            d_orig = orig.resize(size, Image.BICUBIC, box=(sx0, sy0, max(sx1, sx0 + 1), max(sy1, sy0 + 1)))
+            items.append({"name": path.name, "cls": r["cls"], "method": r["method"], "original": orig,
+                          "result": res, "detail_original": d_orig, "detail_result": res.crop(box)})
+        except Exception:  # noqa: BLE001
+            log(f"{tag}\n    ERROR:")
+            log("    " + traceback.format_exc().replace("\n", "\n    "))
+    return items
+
+
+def preview_sheet(item, panel=560):
+    """One picture: original | result on top, the two close-ups below, with small captions."""
+    from PIL import ImageDraw
+    bg, pad, cap = (235, 235, 235), 10, 24
+
+    def fit(im, side):
+        im = im.copy().convert("RGB")
+        im.thumbnail((side, side))
+        return im
+
+    top = [fit(item["original"], panel), fit(item["result"], panel)]
+    low = [item["detail_original"].convert("RGB"), item["detail_result"].convert("RGB")]
+    row1 = max(i.size[1] for i in top)
+    row2 = max(i.size[1] for i in low)
+    W = 2 * panel + 3 * pad
+    H = pad + cap + row1 + pad + cap + row2 + pad + cap
+    sheet = Image.new("RGB", (W, H), bg)
+    d = ImageDraw.Draw(sheet)
+    d.text((pad, 3), f"{item['name']}   {item['cls']}   {item['method']}", fill=(0, 0, 0))
+    y = pad + cap
+    for j, (im, label) in enumerate(zip(top, (f"Original ({item['original'].size[0]}x{item['original'].size[1]})",
+                                              f"Result ({item['result'].size[0]}x{item['result'].size[1]})"))):
+        x = pad + j * (panel + pad)
+        d.text((x, y - 14), label, fill=(0, 0, 0))
+        sheet.paste(im, (x + (panel - im.size[0]) // 2, y))
+    y += row1 + pad + cap
+    for j, (im, label) in enumerate(zip(low, ("Close-up: original, plain enlargement", "Close-up: result, same spot"))):
+        x = pad + j * (panel + pad)
+        d.text((x, y - 14), label, fill=(0, 0, 0))
+        sheet.paste(im, (x + (panel - im.size[0]) // 2, y))
+    return sheet
+
+
+def save_preview_sheets(o, items, stamp=None):
+    """Save one sheet PNG per item in <work>/previews/<stamp>/. Returns the paths."""
+    stamp = stamp or datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    d = output_dir(o) / "_blurnomore_work" / "previews" / stamp
+    d.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for k, it in enumerate(items, 1):
+        p = d / f"{k}_{Path(it['name']).stem[:40]}.png"
+        preview_sheet(it).save(p)
+        paths.append(p)
+    return paths
 
 
 # ====================================================================== GUI
 HELP = {
-    "folder": "Folder with your drawings. The PDF is saved here with the date and time in its name, "
-              "so an earlier PDF is never overwritten. Logs and work files go in _blurnomore_work.",
+    "folder": "Folder with your pictures. Nothing in it is ever changed. The result is saved here too, with the "
+              "date and time in its name, unless you choose another place under 'Save results to'. "
+              "Logs and work files go in _blurnomore_work.",
     "count": "Handy for a quick test. 'Spread evenly' picks images from all over the folder, "
              "so you see different kinds of drawings. 'First ones' takes them in name order.",
     "repeat": "Runs again on exactly the same images as the last run in this folder, whatever the "
@@ -484,6 +809,21 @@ HELP = {
     "model": "General: natural look, best for painted or shaded coloured art and scans (default). "
              "Anime: crisper flat colours, but can look smooth and plastic on shaded art. "
              "Black and white art always uses Anime.",
+    "mode": "Tracing PDF: crops, enlarges and fits every picture on an A4 page, for tracing. "
+            "Upscale images: only makes each picture 2x, 3x or 4x bigger, for general use, and saves "
+            "them as new picture files. No cropping, no line work, no pages.",
+    "save_to": "Where the results are saved: the PDF, or the folder of bigger pictures, and the "
+               "_blurnomore_work folder. Empty = next to the pictures (in the images folder). "
+               "A folder that does not exist yet is made. Your original pictures are never touched.",
+    "scale": "Upscale images only. How many times bigger the pictures become: 2, 3 or 4. "
+             "A 1000 pixel wide picture becomes 2000, 3000 or 4000 pixels wide. Bigger takes longer "
+             "and makes bigger files; it cannot bring back detail that is not there.",
+    "up_model": "Upscale images only. Automatic looks at each picture: drawings and flat colour use the "
+                "Anime model, photos and black and white photos use the General model. General or Anime "
+                "forces one for all pictures. Other models you put in the models folder next to "
+                "the program (NAME.param and NAME.bin) are listed here too.",
+    "file_type": "Upscale images only. PNG keeps every pixel exactly (big files). JPG is much smaller "
+                 "(top quality, 95) and fine for photos.",
     "redo": "Ignore pages made in earlier runs. Changing a setting already makes new pages on its own; "
             "use this for a clean rebuild.",
 }
@@ -798,8 +1138,20 @@ def main():
     if len(sys.argv) == 1:
         launch_gui()
         return
-    ap = argparse.ArgumentParser(description="BlurNoMore: drawings -> sharp A4 tracing PDF (no arguments = open the window)")
-    ap.add_argument("folder")
+    ap = argparse.ArgumentParser(description="BlurNoMore: pictures -> sharp A4 tracing PDF, or bigger AI-restored copies "
+                                             "(no arguments = open the window)")
+    ap.add_argument("folder", help="folder with the pictures (never changed)")
+    ap.add_argument("--mode", choices=["pdf", "upscale"], default="pdf",
+                    help="pdf = Tracing PDF (default), upscale = Upscale images")
+    ap.add_argument("--save-to", default="", metavar="FOLDER",
+                    help="where the PDF / upscaled folder and _blurnomore_work go (default: the images folder)")
+    ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
+    ap.add_argument("--upscale-model", default="auto", metavar="NAME",
+                    help="upscale mode: auto (default), general, anime, or the name of an extra model "
+                         "in the models folder: " + (", ".join(extra_models()) or "none found"))
+    ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
+    ap.add_argument("--preview", action="store_true",
+                    help="make picture sheets for up to 4 images (original, result, close-ups) and stop")
     ap.add_argument("--count", type=int, default=0, help="number of images, 0 = all")
     ap.add_argument("--pick", choices=["spread", "first"], default="spread")
     ap.add_argument("--same", action="store_true", help="repeat the images used in the last run")
@@ -817,7 +1169,15 @@ def main():
     a = ap.parse_args()
     o = Options(folder=a.folder, count=a.count, pick=a.pick, repeat_last=a.same, fit="fill" if a.fill else "whole", margin_mm=a.margin, dpi=a.dpi,
                 autocrop=not a.no_crop, thicken=a.thicken, fade=a.fade, keep_color=not a.grey,
-                color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo)
+                color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
+                mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format)
+    if a.preview:
+        items = make_preview(o, print)
+        if not items:
+            sys.exit(1)
+        for p in save_preview_sheets(o, items):
+            print(f"Preview sheet: {p}")
+        sys.exit(0)
     sys.exit(0 if run(o, print) else 1)
 
 

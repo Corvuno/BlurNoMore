@@ -1,14 +1,17 @@
 # BlurNoMore
 
-Turns a folder of small, blurry drawings into one sharp, print-ready A4 PDF that you can trace through tracing paper.
+Two jobs for a folder of small, blurry pictures:
 
-Windows, Python 3, one `.py` file, a settings window. Built in conversation with Claude, version 3.1.
+- **Tracing PDF**: one sharp, print-ready A4 PDF that you can trace through tracing paper.
+- **Upscale images**: a new folder of bigger copies (2x, 3x or 4x), restored by AI, for general use. No tracing steps, no A4.
+
+Windows, Python 3, one `.py` file, a settings window. Built in conversation with Claude, version 4.0.
 
 ## Why it exists
 
 You collect drawings from the web and phone backups to learn to draw by tracing them. Those files are usually 500 to 1500 pixels wide, with soft lines, paper borders and a random shape. A4 at 300 dpi needs about 2480 x 3508 pixels. Printed straight, the lines are blurry, thin, and sometimes too light to see through tracing paper. Doing 40 or more images by hand in an editor is slow. BlurNoMore does the whole batch in one run.
 
-## What it does to every image
+## What it does to every image (Tracing PDF)
 
 1. **Reads** the image (jpg, png, webp, bmp, tif) and fixes its rotation.
 2. **Classifies** it: line art, shaded black and white, flat colour, or painted colour. This only decides which AI model and which tone treatment to use.
@@ -18,6 +21,15 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 6. **Tone work**: black and white art gets pure white paper and solid black ink; colour art stays in colour.
 7. **Fits it on A4** (portrait or landscape, whichever suits the picture) with a margin, centred.
 8. **Writes one PDF**, one image per page, named with the date and time so nothing is overwritten. Print at 100% ("Actual size").
+
+## What it does to every image (Upscale images)
+
+1. **Reads** the image and fixes its rotation. Nothing is cropped, thinned or placed on a page.
+2. **Chooses a model** (Automatic): drawings and flat colour art use the Anime model, photos and black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one, or use an extra model.
+3. **Enlarges** with Real-ESRGAN (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size. Without the AI it resizes plainly. Images that are already big are enlarged too.
+4. **Saves** `<name>_x<scale>.png` (or `.jpg`) into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
+
+**Preview** (`--preview`) shows up to 4 of the images the run would use, before the run: original next to result, plus a close-up of the busiest spot in both. For the PDF it shows the finished A4 page. The work is kept, so the real run afterwards reuses it. A preview writes no PDF and no output folder.
 
 ## Why it makes these choices
 
@@ -31,11 +43,23 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 
 ## Settings (all explained in the window)
 
+**Both modes**
+
 | Setting | Default | What it does |
 |---|---|---|
-| Folder | your drawings folder | Where the images are; the PDF is saved here too |
-| How many images | All | All, or N images, spread evenly or the first N |
-| Same images as last run | off | Repeats the previous selection in this folder |
+| Folder (`folder`) | your Pictures folder | Where the images are. They are never changed |
+| Mode (`--mode`) | Tracing PDF | `pdf` = Tracing PDF, `upscale` = Upscale images |
+| Save to (`--save-to`) | next to the images | Where the PDF or the upscaled folder and `_blurnomore_work` go. Missing folders are made. Selections are remembered per images folder |
+| How many images (`--count`, `--pick`) | All | All, or N images, spread evenly or the first N |
+| Same images as last run (`--same`) | off | Repeats the previous selection in this folder |
+| Use AI upscaler (`--no-ai` turns it off) | on | Off = plain resizing, faster but blurrier |
+| Redo all pages (`--redo`) | off | Ignores cached pages and results |
+| Preview (`--preview`) | | Command line: makes picture sheets for up to 4 images and stops |
+
+**Tracing PDF**
+
+| Setting | Default | What it does |
+|---|---|---|
 | Fit on the page | Whole picture | Whole picture, or fill the page and trim the edges |
 | Page margin (mm) | 10 | White border on the A4 page |
 | Print resolution (dpi) | 300 | Page sharpness; 200 is smaller and faster |
@@ -44,9 +68,15 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Lighten print | 0 | Fades the print so your pencil stands out |
 | Keep colours | on | Off prints everything in grey |
 | Colour boost | 0 | More saturation and contrast for pale art |
-| Use AI upscaler | on | Off = plain resizing, faster but blurrier |
 | AI model for coloured art | General | General, or Anime |
-| Redo all pages | off | Ignores cached pages |
+
+**Upscale images**
+
+| Setting | Default | What it does |
+|---|---|---|
+| Scale (`--scale`) | 2 | 2, 3 or 4 times bigger |
+| Upscale model (`--upscale-model`) | Automatic | Automatic, `general`, `anime`, or the name of an extra model |
+| File type (`--format`) | PNG | `png` (exact, big) or `jpg` (quality 95, smaller) |
 
 The same settings exist as command-line options. Run `python blurnomore.py --help` for the list.
 
@@ -54,7 +84,9 @@ The same settings exist as command-line options. Run `python blurnomore.py --hel
 
 - `blurnomore.py` is the program (window and command line).
 - `BlurNoMore.bat` checks for Python, installs `pillow`, `numpy` and `img2pdf`, and opens the window. Keep it next to the `.py`.
-- In your images folder it creates `BlurNoMore_A4_<date>_<time>_<n>p.pdf` and a `_blurnomore_work` folder with the downloaded Real-ESRGAN, caches and a log of every run. An older `_tracing_work` folder is renamed automatically.
+- In the folder you choose under "Save to" (by default your images folder) it creates `BlurNoMore_A4_<date>_<time>_<n>p.pdf`, or for Upscale images a new folder `BlurNoMore_upscaled_<date>_<time>`, and a `_blurnomore_work` folder with caches, previews and a log of every run. An older `_tracing_work` folder is renamed automatically.
+- `realesrgan` next to the program holds the downloaded Real-ESRGAN, so it is downloaded once (an older copy inside a `_blurnomore_work` folder is still found and used).
+- `models` next to the program (optional): put extra models there as `NAME.param` plus `NAME.bin` (ncnn format, as Real-ESRGAN ncnn uses). They show up as upscale models. A name with `2x`/`x2` or `3x`/`x3` is a 2x or 3x model; otherwise 4x.
 - `blurnomore_settings.json` next to the program remembers your last settings.
 
 ## Requirements
@@ -71,6 +103,7 @@ Windows with Python 3 ("Add to PATH" ticked), internet on the first AI run (abou
 
 ## Version history
 
+- 4.0: Upscale images mode (2x/3x/4x, automatic model per picture, extra models, PNG or JPG), "Save to" folder, preview of up to 4 images, Real-ESRGAN kept next to the program, default folder is Pictures.
 - 3.1: renamed to BlurNoMore; work folder renamed.
 - 3.0: settings window, crop only trims real paper, "Fit on the page", "Same images as last run", unique file names, copyable log.
 - 2.x: thin-line boost, colour kept for colour art, trial mode, `.bat` launcher.

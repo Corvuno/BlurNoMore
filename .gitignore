@@ -3,4 +3,6 @@ __pycache__/
 blurnomore_settings.json
 _blurnomore_work/
 _tracing_work/
+realesrgan/
+models/
 BlurNoMore_A4_*.pdf
