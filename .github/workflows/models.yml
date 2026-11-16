@@ -23,3 +23,9 @@ jobs:
           python-version: '3.12'
       - run: pip install --quiet pillow numpy img2pdf onnxruntime opencv-python-headless
       - run: python tests/models_check.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: face-check
+          path: models_check_output/
+          if-no-files-found: ignore

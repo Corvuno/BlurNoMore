@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
+FACE_URL = "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/messi5.jpg"
 sys.path.insert(0, str(ROOT))
 
 
@@ -50,9 +51,24 @@ def main():
         with Image.open(only_file(out / "faces")) as r:
             assert r.size == (320, 240), f"face result is {r.size}, expected 320x240"
 
+        # a real photo with a face (OpenCV's sample picture, downloaded here, never kept in the repo)
+        import urllib.request
+        faces_in = Path(t) / "real"
+        faces_in.mkdir()
+        urllib.request.urlretrieve(FACE_URL, faces_in / "face.jpg")
+        log = run_py(faces_in, "--mode", "upscale", "--no-ai", "--faces", "--face-strength", "70",
+                     "--scale", "2", "--save-to", out / "realface")
+        import re
+        m = re.search(r"(\d+) faces? restored", log)
+        assert m and int(m.group(1)) >= 1, "no face was found and restored in the sample photo"
+        keep = ROOT / "models_check_output"
+        keep.mkdir(exist_ok=True)
+        only_file(out / "realface").replace(keep / "face_restored_x2.png")
+        Image.open(faces_in / "face.jpg").save(keep / "face_original.png")
+
         # the face restorer itself: download, start, one 512x512 forward pass
         import blurnomore as b
-        c = b.Context(b.Options(folder=str(d), save_to=str(out / "ctx"), mode="upscale"), print, out / "ctx")
+        c = b.Context(b.Options(inputs=[str(d)], save_to=str(out / "ctx"), mode="upscale"), print, out / "ctx")
         sess = b.load_gfpgan(c)
         assert sess is not None, "GFPGAN could not be loaded"
         y = sess.run(None, {sess.get_inputs()[0].name: np.zeros((1, 3, 512, 512), np.float32)})[0]
