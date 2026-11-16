@@ -12,6 +12,9 @@ if not exist "%~dp0blurnomore.py" goto noscript
 echo Checking Python packages (first time takes a minute)...
 %PY% -m pip install --quiet --disable-pip-version-check pillow numpy img2pdf
 if errorlevel 1 goto piperr
+rem Optional: the Web photo model (DAT) and face restoration. If this fails the program still starts.
+%PY% -m pip install --quiet --disable-pip-version-check onnxruntime-directml opencv-python-headless
+if errorlevel 1 echo Note: the optional packages onnxruntime-directml and opencv-python-headless were not installed. The Web photo model and face restoration are off; everything else works.
 
 echo Opening BlurNoMore...
 %PY% "%~dp0blurnomore.py"

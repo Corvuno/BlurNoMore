@@ -43,6 +43,18 @@ try:
 except ImportError:
     sys.exit("Missing packages. Run:  pip install pillow numpy img2pdf")
 
+# Optional: the DAT photo model and face restoration need these. Without them everything else works.
+try:
+    import onnxruntime as ort
+    HAVE_ORT = True
+except Exception:  # noqa: BLE001  (a missing or broken install both mean "not available")
+    ort, HAVE_ORT = None, False
+try:
+    import cv2
+    HAVE_CV2 = True
+except Exception:  # noqa: BLE001
+    cv2, HAVE_CV2 = None, False
+
 Image.MAX_IMAGE_PIXELS = None
 
 VERSION = "4.0"
@@ -59,6 +71,19 @@ SETTINGS_FILE = APP_DIR / "blurnomore_settings.json"
 ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once, next to the program
 MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pairs
 BIG_RESULT_PIXELS = 100_000_000
+INSTALL_HINT = "Install onnxruntime-directml (and opencv-python-headless for faces) with pip"
+# DAT "Web photo" model by Philip Hofmann (CC-BY-4.0), run through onnxruntime
+DAT_FILE = "4xRealWebPhoto_v4_fp32_opset17.onnx"
+DAT_URL = "https://huggingface.co/Phips/4xRealWebPhoto_v4_dat2/resolve/main/" + DAT_FILE
+# Face restoration: GFPGAN 1.4 (restores) and OpenCV's YuNet (finds faces and their 5 landmarks)
+GFPGAN_FILE = "gfpgan_1.4.onnx"
+GFPGAN_URL = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/" + GFPGAN_FILE
+YUNET_FILE = "face_detection_yunet_2023mar.onnx"
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/" + YUNET_FILE
+FACE_TEMPLATE = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
+                          [201.26117, 371.41043], [313.08905, 371.15118]], dtype=np.float32)  # 512x512 FFHQ
+# model files the program uses itself: they are not offered as extra models
+OWN_MODELS = {DAT_FILE[:-5], GFPGAN_FILE[:-5], YUNET_FILE[:-5]}
 
 
 # ===================================================================== options
@@ -84,6 +109,8 @@ class Options:
     scale: int = 2               # upscale mode: 2, 3 or 4 times bigger
     up_model: str = "auto"       # upscale mode: "auto", "general", "anime" or an extra model's name
     file_type: str = "png"       # upscale mode: "png" or "jpg"
+    faces: bool = False          # upscale mode: restore faces (GFPGAN)
+    face_strength: int = 50      # 0-100, how much of the restored face is used
     open_when_done: bool = True  # GUI only
 
 
@@ -177,10 +204,13 @@ def _find_exe(base):
 
 
 def extra_models():
-    """Names of the extra models in the models folder next to the program (sorted)."""
+    """Names of the extra models in the models folder next to the program (sorted): ncnn
+    NAME.param + NAME.bin pairs, and NAME.onnx files."""
     if not MODELS_DIR.is_dir():
         return []
-    return sorted(p.name[:-6] for p in MODELS_DIR.glob("*.param") if (MODELS_DIR / (p.name[:-6] + ".bin")).is_file())
+    names = {p.name[:-6] for p in MODELS_DIR.glob("*.param") if (MODELS_DIR / (p.name[:-6] + ".bin")).is_file()}
+    names |= {p.name[:-5] for p in MODELS_DIR.glob("*.onnx")} - OWN_MODELS
+    return sorted(names)
 
 
 def model_scale(name):
@@ -189,20 +219,25 @@ def model_scale(name):
     return int(m.group(1) or m.group(2)) if m else 4
 
 
+def writable_dir(preferred, fallback):
+    """preferred if files can be made there, else fallback."""
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write_test"
+        probe.write_text("x")
+        probe.unlink()
+        return preferred
+    except OSError:
+        return fallback
+
+
 def ensure_esrgan(work, log):
     # Next to the program is the home of Real-ESRGAN; the old place (in the work folder) still counts.
     for base in (ESRGAN_DIR, work / "realesrgan"):
         exe = _find_exe(base)
         if exe:
             return exe
-    d = ESRGAN_DIR
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-        probe = d / ".write_test"
-        probe.write_text("x")
-        probe.unlink()
-    except OSError:
-        d = work / "realesrgan"           # the program folder is not writable
+    d = writable_dir(ESRGAN_DIR, work / "realesrgan")   # the program folder may not be writable
     try:
         log("Downloading Real-ESRGAN (about 45 MB) ...")
         d.mkdir(parents=True, exist_ok=True)
@@ -233,6 +268,202 @@ def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4):
     out = Image.open(tout).convert("RGB")
     out.load()
     return out
+
+
+# ================================================================ ONNX models
+class OnnxModel:
+    """An upscaling model run with onnxruntime. tile is the fixed tile side of a model that has a
+    fixed input size, else None."""
+
+    def __init__(self, sess, native, tile=None):
+        self.sess, self.native, self.tile = sess, native, tile
+        self.input = sess.get_inputs()[0].name
+
+
+def fetch_model(c, name, url, size):
+    """Path of a model file in the models folder, downloading it on first use (to a temporary
+    name, so a broken download is never used). None when it cannot be had."""
+    for base in (MODELS_DIR, c.work / "models"):
+        if (base / name).is_file():
+            return base / name
+    d = writable_dir(MODELS_DIR, c.work / "models")
+    part = d / (name + ".part")
+    try:
+        c.L(f"Downloading {name} (about {size}) ...")
+        d.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(url, part)
+        os.replace(part, d / name)
+        return d / name
+    except Exception as e:  # noqa: BLE001
+        c.L(f"  Could not download {name}: {e}")
+        c.L(f"  Download it manually from {url}")
+        c.L(f"  and put it in {d}.")
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def make_session(c, path):
+    """An onnxruntime session on the GPU (DirectML) when there is one, else the CPU."""
+    prov = c.providers()
+    opts = ort.SessionOptions()
+    if "DmlExecutionProvider" in prov:
+        opts.enable_mem_pattern = False       # DirectML needs these two
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    try:
+        sess = ort.InferenceSession(str(path), opts, providers=prov)
+    except Exception as e:  # noqa: BLE001
+        if len(prov) < 2:
+            raise
+        c.L(f"  The GPU did not start ({e}); using the CPU.")
+        c.prov = ["CPUExecutionProvider"]
+        sess = ort.InferenceSession(str(path), opts, providers=c.prov)
+    c.once("provider", "ONNX Runtime uses " + ("the GPU (DirectML)" if sess.get_providers()[0] == "DmlExecutionProvider"
+                                               else "the CPU"))
+    return sess
+
+
+def run_tiles(model, im, tile=256, over=16):
+    """Enlarge a PIL image with an ONNX model in tiles (input RGB 0..1, NCHW). Each tile is full
+    size (the picture is edge-padded), the overlap is cropped away and the centre kept."""
+    tile = model.tile or tile
+    over = min(over, tile // 4)
+    step, n = tile - 2 * over, model.native
+    a = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+    H, W = a.shape[:2]
+    ny, nx = -(-H // step), -(-W // step)
+    a = np.pad(a, ((over, ny * step + over - H), (over, nx * step + over - W), (0, 0)), mode="reflect")
+    out = np.zeros((ny * step * n, nx * step * n, 3), np.uint8)
+    keep = slice(over * n, (over + step) * n)
+    for j in range(ny):
+        for i in range(nx):
+            t = a[j * step:j * step + tile, i * step:i * step + tile].transpose(2, 0, 1)[None]
+            r = model.sess.run(None, {model.input: np.ascontiguousarray(t)})[0][0][:, keep, keep]
+            out[j * step * n:(j + 1) * step * n, i * step * n:(i + 1) * step * n] = (
+                np.clip(r.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
+    return Image.fromarray(out[:H * n, :W * n], "RGB")
+
+
+def load_onnx(c, name):
+    """The ONNX model 'dat' or an extra model's name, ready to run; None (after saying why) when not."""
+    if name in c.models:
+        return c.models[name]
+    c.models[name] = None
+    what = "the DAT model" if name == "dat" else f"the model '{name}'"
+    if not HAVE_ORT:
+        c.once("no-ort-" + name, f"{INSTALL_HINT} to use {what}; using Real-ESRGAN instead")
+        return None
+    path = fetch_model(c, DAT_FILE, DAT_URL, "49 MB") if name == "dat" else MODELS_DIR / f"{name}.onnx"
+    if path is None:
+        return None
+    try:
+        sess = make_session(c, path)
+        shape = sess.get_inputs()[0].shape
+        fixed = shape[2] if len(shape) == 4 and isinstance(shape[2], int) and shape[2] == shape[3] else None
+        model = OnnxModel(sess, 4 if name == "dat" else model_scale(name), fixed)
+        if name == "dat":
+            if not c.gpu():
+                c.L("  The DAT model on the CPU is slow (minutes per photo).")
+        else:   # check the scale in the name by one small tile
+            t = model.tile or 64
+            got = model.sess.run(None, {model.input: np.zeros((1, 3, t, t), np.float32)})[0].shape[2] // t
+            if got != model.native:
+                c.L(f"  Model '{name}': the name says {model.native}x but it enlarges {got}x; using {got}x.")
+                model.native = got
+    except Exception as e:  # noqa: BLE001
+        c.L(f"  Could not start {what}: {e}")
+        return None
+    c.models[name] = model
+    return model
+
+
+# ============================================================ face restoration
+def load_detector(c):
+    """OpenCV's YuNet face finder, or None. Not tried again after a failure."""
+    if "detector" not in c.models:
+        c.models["detector"] = None
+        path = fetch_model(c, YUNET_FILE, YUNET_URL, "230 KB")
+        if path:
+            try:
+                c.models["detector"] = cv2.FaceDetectorYN.create(str(path), "", (320, 320), 0.7)
+            except Exception as e:  # noqa: BLE001
+                c.L(f"  Could not start the face finder: {e}")
+    return c.models["detector"]
+
+
+def load_gfpgan(c):
+    """The GFPGAN face restorer (an onnxruntime session), or None."""
+    if "gfpgan" not in c.models:
+        c.models["gfpgan"] = None
+        path = fetch_model(c, GFPGAN_FILE, GFPGAN_URL, "340 MB")
+        if path:
+            try:
+                c.models["gfpgan"] = make_session(c, path)
+            except Exception as e:  # noqa: BLE001
+                c.L(f"  Could not start the face restorer: {e}")
+    return c.models["gfpgan"]
+
+
+def detect_faces(detector, a):
+    """The 5 landmarks (5x2: eyes, nose, mouth corners) of each face of at least 48 px in the
+    RGB array a. Looked for on a copy of at most 1600 px, so big pictures stay quick."""
+    f = min(1.0, 1600.0 / max(a.shape[:2]))
+    small = cv2.resize(a, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else a
+    detector.setInputSize((small.shape[1], small.shape[0]))
+    _, rows = detector.detect(np.ascontiguousarray(small[..., ::-1]))   # YuNet wants BGR
+    return [(r[4:14].reshape(5, 2) / f).astype(np.float32) for r in (rows if rows is not None else [])
+            if min(r[2], r[3]) / f >= 48]
+
+
+def restore_faces(c, im):
+    """Find the faces in a PIL image and restore each one with GFPGAN. Returns (image, number);
+    the number is None when faces were not looked for (said in the log why)."""
+    o = c.o
+    if o.face_strength <= 0:
+        c.once("face0", "Face strength is 0: faces are left as they are.")
+        return im, None
+    if not (HAVE_ORT and HAVE_CV2):
+        c.once("no-faces", f"{INSTALL_HINT} to restore faces; faces are skipped")
+        return im, None
+    detector = load_detector(c)
+    if detector is None:
+        return im, None
+    a = np.asarray(im.convert("RGB"))
+    found = detect_faces(detector, a)
+    if not found:
+        return im, 0
+    sess = load_gfpgan(c)
+    if sess is None:
+        return im, None
+    s = min(o.face_strength, 100) / 100.0
+    mask = np.zeros((512, 512), np.float32)
+    cv2.ellipse(mask, (256, 270), (180, 215), 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), 20)
+    out, H, W, n = a.copy(), a.shape[0], a.shape[1], 0
+    for lm in found:
+        M, _ = cv2.estimateAffinePartial2D(lm, FACE_TEMPLATE, method=cv2.LMEDS)
+        if M is None:
+            continue
+        face = cv2.warpAffine(a, M, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        x = (face.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)[None]
+        y = sess.run(None, {sess.get_inputs()[0].name: np.ascontiguousarray(x)})[0][0].transpose(1, 2, 0)
+        y = np.clip((y + 1.0) * 127.5, 0, 255).astype(np.float32)
+        inv = cv2.invertAffineTransform(M)
+        pts = cv2.transform(np.array([[[0, 0], [512, 0], [512, 512], [0, 512]]], np.float32), inv)[0]
+        x0, y0 = max(0, int(np.floor(pts[:, 0].min()))), max(0, int(np.floor(pts[:, 1].min())))
+        x1, y1 = min(W, int(np.ceil(pts[:, 0].max()))), min(H, int(np.ceil(pts[:, 1].max())))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        inv[:, 2] -= (x0, y0)
+        size = (x1 - x0, y1 - y0)
+        back = cv2.warpAffine(y, inv, size, flags=cv2.INTER_LINEAR)
+        alpha = (cv2.warpAffine(mask, inv, size, flags=cv2.INTER_LINEAR) * s)[..., None]
+        region = out[y0:y1, x0:x1].astype(np.float32)
+        out[y0:y1, x0:x1] = np.clip(region * (1 - alpha) + back * alpha + 0.5, 0, 255).astype(np.uint8)
+        n += 1
+    return Image.fromarray(out, "RGB"), n
 
 
 # ============================================================ tone & line work
@@ -406,6 +637,7 @@ class Context:
 
     def __init__(self, o, L, work):
         self.o, self.L, self.work, self.exe = o, L, work, None
+        self.models, self.prov, self.said = {}, None, set()   # ONNX models by name, providers, notes made
         key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
                       o.color_boost, o.use_ai, o.color_model)
         key = hashlib.md5(repr(key_fields).encode()).hexdigest()[:8]
@@ -417,9 +649,24 @@ class Context:
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
         self.up_model = o.up_model
-        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime") + tuple(extra_models()):
+        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", "dat") + tuple(extra_models()):
             L(f"Unknown upscale model '{o.up_model}'; choosing automatically.")
             self.up_model = "auto"
+
+    def once(self, key, msg):
+        """Say something once per run."""
+        if key not in self.said:
+            self.said.add(key)
+            self.L(msg)
+
+    def providers(self):
+        if self.prov is None:
+            avail = ort.get_available_providers() if HAVE_ORT else []
+            self.prov = [p for p in ("DmlExecutionProvider", "CPUExecutionProvider") if p in avail]
+        return self.prov
+
+    def gpu(self):
+        return "DmlExecutionProvider" in self.providers()
 
     def start_ai(self):
         if self.o.use_ai:
@@ -512,17 +759,26 @@ def page_to_original(o, w, h):
 
 # ---- one upscaled image
 def upscale_model(c, cls):
-    """(model name, model folder, native scale) for this kind of picture, or None for plain resizing."""
-    if c.exe is None:
+    """(engine, model name, model folder, native scale) for this kind of picture, or None for plain
+    resizing. The engine is "ncnn" (Real-ESRGAN program) or "onnx" (onnxruntime)."""
+    if not c.o.use_ai:
         return None
+    ncnn = "anime" if cls in ("lineart", "flatcolor") else "general"
     pick = c.up_model
     if pick == "auto":
-        pick = "anime" if cls in ("lineart", "flatcolor") else "general"
-    if pick == "anime":
-        return MODEL_ANIME, c.exe.parent / "models", 4
-    if pick == "general":
-        return MODEL_GENERAL, c.exe.parent / "models", 4
-    return pick, MODELS_DIR, model_scale(pick)
+        pick = "dat" if cls == "photo" and c.gpu() else ncnn
+    if pick == "dat":
+        if load_onnx(c, "dat"):
+            return "onnx", "dat", None, 4
+        pick = ncnn
+    if pick in ("anime", "general"):
+        if c.exe is None:
+            return None
+        return "ncnn", MODEL_ANIME if pick == "anime" else MODEL_GENERAL, c.exe.parent / "models", 4
+    if (MODELS_DIR / f"{pick}.param").is_file():
+        return ("ncnn", pick, MODELS_DIR, model_scale(pick)) if c.exe else None
+    model = load_onnx(c, pick)
+    return ("onnx", pick, None, model.native) if model else None
 
 
 def make_upscaled(c, path, src_id, im, store=False):
@@ -534,8 +790,13 @@ def make_upscaled(c, path, src_id, im, store=False):
     kind = "drawing" if cls in ("lineart", "flatcolor") else "photo"
     target = (w * o.scale, h * o.scale)
     m = upscale_model(c, cls)
-    label = m[0] if m else "plain"
-    cache = c.cache_dir / f"{path.stem[:40]}_{src_id}_{label}_x{o.scale}.png"
+    label = m[1] if m else "plain"
+
+    def cache_file(name):
+        faces = f"_faces{o.face_strength}" if o.faces else ""
+        return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_x{o.scale}{faces}.png"
+
+    cache = cache_file(label)
     if cache.exists() and not o.redo:
         res = Image.open(cache).convert("RGB")
         res.load()
@@ -544,20 +805,35 @@ def make_upscaled(c, path, src_id, im, store=False):
     res = None
     method = "lanczos"
     if m:
-        up = run_esrgan(im, m[0], c.exe, c.tmp, L, m[1], m[2])
+        up = None
+        if m[0] == "ncnn":
+            up = run_esrgan(im, m[1], c.exe, c.tmp, L, m[2], m[3])
+            if up is None:
+                L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
+                c.exe = None
+        else:
+            try:
+                up = run_tiles(c.models[m[1]], im)
+            except Exception:  # noqa: BLE001
+                L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
+                L(f"  Using plain resizing instead of '{m[1]}' for the rest of this run.")
+                c.models[m[1]] = None
         if up is None:
-            L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
-            c.exe = None
             method, label = "lanczos (AI failed)", "plain"
         else:
             res = up.resize(target, Image.LANCZOS)
-            method = f"AI {m[0]}"
+            method = f"AI {m[1]}"
     if res is None:
         res = im.resize(target, Image.LANCZOS)
+    if o.faces:
+        res, nf = restore_faces(c, res)
+        if nf is not None:
+            L(f"  {nf} face{'' if nf == 1 else 's'} restored")
+            method += f" + {nf} face{'' if nf == 1 else 's'}" if nf else ""
     if store:
         try:
             c.cache_dir.mkdir(parents=True, exist_ok=True)
-            res.save(c.cache_dir / f"{path.stem[:40]}_{src_id}_{label}_x{o.scale}.png")
+            res.save(cache_file(label))
         except Exception:  # noqa: BLE001
             pass
     return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label}
@@ -805,7 +1081,7 @@ HELP = {
     "boost": "Stronger colours and a bit more contrast, for pale or washed-out artwork. "
              "0 = unchanged. Try 20 to 40 for pale pictures.",
     "ai": "Real-ESRGAN on your GPU enlarges small images and adds detail (first run downloads about 45 MB). "
-          "Off = plain resizing: much faster but blurrier.",
+          "Off = plain resizing: much faster but blurrier. Also switches off the Web photo model.",
     "model": "General: natural look, best for painted or shaded coloured art and scans (default). "
              "Anime: crisper flat colours, but can look smooth and plastic on shaded art. "
              "Black and white art always uses Anime.",
@@ -819,9 +1095,17 @@ HELP = {
              "A 1000 pixel wide picture becomes 2000, 3000 or 4000 pixels wide. Bigger takes longer "
              "and makes bigger files; it cannot bring back detail that is not there.",
     "up_model": "Upscale images only. Automatic looks at each picture: drawings and flat colour use the "
-                "Anime model, photos and black and white photos use the General model. General or Anime "
+                "Anime model; photos use the Web photo model (DAT) when your graphics card can run it, "
+                "otherwise the General model; black and white photos use the General model. 'dat' forces the "
+                "Web photo model (slow without a graphics card; needs onnxruntime-directml). General or Anime "
                 "forces one for all pictures. Other models you put in the models folder next to "
-                "the program (NAME.param and NAME.bin) are listed here too.",
+                "the program (NAME.param and NAME.bin, or NAME.onnx) are listed here too.",
+    "faces": "Upscale images only. Finds faces in the enlarged picture and restores them with GFPGAN. "
+             "Needs onnxruntime-directml and opencv-python-headless. The first time it downloads about "
+             "340 MB. Off = faces are left as the enlargement makes them.",
+    "face_strength": "Upscale images only, when 'Restore faces' is on. How much of the restored face is used: "
+                     "0 = none, 50 = half (default), 100 = fully restored. Lower looks more like the "
+                     "original, higher is sharper but can look smoother or change the face.",
     "file_type": "Upscale images only. PNG keeps every pixel exactly (big files). JPG is much smaller "
                  "(top quality, 95) and fine for photos.",
     "redo": "Ignore pages made in earlier runs. Changing a setting already makes new pages on its own; "
@@ -1147,9 +1431,12 @@ def main():
                     help="where the PDF / upscaled folder and _blurnomore_work go (default: the images folder)")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
-                    help="upscale mode: auto (default), general, anime, or the name of an extra model "
+                    help="upscale mode: auto (default), general, anime, dat (Web photo model), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
+    ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces (GFPGAN)")
+    ap.add_argument("--face-strength", type=int, default=50, metavar="N",
+                    help="upscale mode: 0-100, how much of the restored face is used (default 50)")
     ap.add_argument("--preview", action="store_true",
                     help="make picture sheets for up to 4 images (original, result, close-ups) and stop")
     ap.add_argument("--count", type=int, default=0, help="number of images, 0 = all")
@@ -1170,7 +1457,8 @@ def main():
     o = Options(folder=a.folder, count=a.count, pick=a.pick, repeat_last=a.same, fit="fill" if a.fill else "whole", margin_mm=a.margin, dpi=a.dpi,
                 autocrop=not a.no_crop, thicken=a.thicken, fade=a.fade, keep_color=not a.grey,
                 color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
-                mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format)
+                mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format,
+                faces=a.faces, face_strength=min(100, max(0, a.face_strength)))
     if a.preview:
         items = make_preview(o, print)
         if not items:

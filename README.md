@@ -25,9 +25,10 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 ## What it does to every image (Upscale images)
 
 1. **Reads** the image and fixes its rotation. Nothing is cropped, thinned or placed on a page.
-2. **Chooses a model** (Automatic): drawings and flat colour art use the Anime model, photos and black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one, or use an extra model.
-3. **Enlarges** with Real-ESRGAN (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size. Without the AI it resizes plainly. Images that are already big are enlarged too.
-4. **Saves** `<name>_x<scale>.png` (or `.jpg`) into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
+2. **Chooses a model** (Automatic): drawings and flat colour art use the Anime model; photos use the Web photo model (DAT) when onnxruntime can use your graphics card, otherwise the General model; black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one, or use an extra model.
+3. **Enlarges** with the chosen model (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size. Without the AI it resizes plainly. Images that are already big are enlarged too.
+4. **Restores faces** (optional, off by default): finds faces in the enlarged picture and restores each with GFPGAN, blended in by a strength from 0 to 100.
+5. **Saves** `<name>_x<scale>.png` (or `.jpg`) into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
 
 **Preview** (`--preview`) shows up to 4 of the images the run would use, before the run: original next to result, plus a close-up of the busiest spot in both. For the PDF it shows the finished A4 page. The work is kept, so the real run afterwards reuses it. A preview writes no PDF and no output folder.
 
@@ -75,23 +76,32 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Setting | Default | What it does |
 |---|---|---|
 | Scale (`--scale`) | 2 | 2, 3 or 4 times bigger |
-| Upscale model (`--upscale-model`) | Automatic | Automatic, `general`, `anime`, or the name of an extra model |
+| Upscale model (`--upscale-model`) | Automatic | Automatic, `general`, `anime`, `dat` (Web photo model), or the name of an extra model |
 | File type (`--format`) | PNG | `png` (exact, big) or `jpg` (quality 95, smaller) |
+| Restore faces (`--faces`) | off | Finds faces and restores them with GFPGAN. Needs onnxruntime and OpenCV (see Requirements) |
+| Face strength (`--face-strength`) | 50 | 0 to 100: how much of the restored face is used. 0 leaves faces as they are |
 
 The same settings exist as command-line options. Run `python blurnomore.py --help` for the list.
 
 ## Files
 
 - `blurnomore.py` is the program (window and command line).
-- `BlurNoMore.bat` checks for Python, installs `pillow`, `numpy` and `img2pdf`, and opens the window. Keep it next to the `.py`.
+- `BlurNoMore.bat` checks for Python, installs `pillow`, `numpy` and `img2pdf` (and, if it can, the optional `onnxruntime-directml` and `opencv-python-headless`), and opens the window. Keep it next to the `.py`.
 - In the folder you choose under "Save to" (by default your images folder) it creates `BlurNoMore_A4_<date>_<time>_<n>p.pdf`, or for Upscale images a new folder `BlurNoMore_upscaled_<date>_<time>`, and a `_blurnomore_work` folder with caches, previews and a log of every run. An older `_tracing_work` folder is renamed automatically.
 - `realesrgan` next to the program holds the downloaded Real-ESRGAN, so it is downloaded once (an older copy inside a `_blurnomore_work` folder is still found and used).
-- `models` next to the program (optional): put extra models there as `NAME.param` plus `NAME.bin` (ncnn format, as Real-ESRGAN ncnn uses). They show up as upscale models. A name with `2x`/`x2` or `3x`/`x3` is a 2x or 3x model; otherwise 4x.
+- `models` next to the program: the downloaded DAT and face models go here (first use only: the log says the size first). You can also put extra models there as `NAME.param` plus `NAME.bin` (ncnn format, as Real-ESRGAN ncnn uses) or as `NAME.onnx` (RGB 0..1 in and out). They show up as upscale models. A name with `2x`/`x2` or `3x`/`x3` is a 2x or 3x model; otherwise 4x (an `.onnx` model's size is checked with one small test picture, and the measured size is used if the name was wrong).
 - `blurnomore_settings.json` next to the program remembers your last settings.
 
 ## Requirements
 
 Windows with Python 3 ("Add to PATH" ticked), internet on the first AI run (about 45 MB download from GitHub), and a GPU with Vulkan support for the AI step. Without a GPU it falls back to plain resizing and says so in the log.
+
+Optional, installed by the `.bat` when possible: `onnxruntime-directml` (runs on any DirectX 12 graphics card, falls back to the CPU) and `opencv-python-headless`. Without them everything else works, and the log says what to install. They give you:
+
+- **Web photo model (DAT)**, `4xRealWebPhoto_v4` by Philip Hofmann (CC-BY-4.0), about 49 MB, downloaded on first use from Hugging Face. Made for compressed web photos. Automatic uses it for photos only when a graphics card runs it; `--upscale-model dat` uses it anywhere, but on the CPU it takes minutes per photo.
+- **Face restoration**: OpenCV's YuNet face finder (230 KB) and GFPGAN 1.4 (about 340 MB, from the facefusion model collection on Hugging Face), downloaded when you first switch faces on.
+
+The "Models" check on GitHub downloads these and runs them on made-up pictures; the normal Checks never download models.
 
 ## Known limits
 
@@ -103,7 +113,7 @@ Windows with Python 3 ("Add to PATH" ticked), internet on the first AI run (abou
 
 ## Version history
 
-- 4.0: Upscale images mode (2x/3x/4x, automatic model per picture, extra models, PNG or JPG), "Save to" folder, preview of up to 4 images, Real-ESRGAN kept next to the program, default folder is Pictures.
+- 4.0: Upscale images mode (2x/3x/4x, automatic model per picture, extra models, PNG or JPG), "Save to" folder, preview of up to 4 images, Real-ESRGAN kept next to the program, default folder is Pictures. Web photo model (DAT) and face restoration through onnxruntime (optional), extra `.onnx` models.
 - 3.1: renamed to BlurNoMore; work folder renamed.
 - 3.0: settings window, crop only trims real paper, "Fit on the page", "Same images as last run", unique file names, copyable log.
 - 2.x: thin-line boost, colour kept for colour art, trial mode, `.bat` launcher.

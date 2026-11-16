@@ -1,0 +1,25 @@
+name: Models
+
+# Downloads the real DAT and face models and runs them on made-up pictures (CPU only, slow).
+# Not part of the normal Checks, which never download models.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+  push:
+    paths:
+      - blurnomore.py
+      - tests/models_check.py
+      - .github/workflows/models.yml
+
+jobs:
+  models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet pillow numpy img2pdf onnxruntime opencv-python-headless
+      - run: python tests/models_check.py

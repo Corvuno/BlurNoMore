@@ -15,6 +15,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install --quiet pillow numpy img2pdf
+      - run: pip install --quiet pillow numpy img2pdf onnxruntime
       - run: python -m py_compile blurnomore.py tests/smoke.py
       - run: python tests/smoke.py
