@@ -1,8 +1,10 @@
 """Smoke check: builds a PDF from three made-up drawings without the AI step, then an upscaled
-copy of each into another folder, then the preview sheets.
+copy of each into another folder (from a folder, from a file plus a folder, and from the last run's list),
+then the preview sheets.
 Run:  python tests/smoke.py   (needs pillow, numpy, img2pdf). Exits non-zero on failure.
 Leaves nothing behind: everything happens in a temporary folder."""
 import hashlib
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
+LAST_RUN = ROOT / "blurnomore_last_run.json"      # every run writes it
 
 
 def make_images(d):
@@ -44,6 +47,28 @@ def run_py(*args):
 
 
 def main():
+    saved = LAST_RUN.read_bytes() if LAST_RUN.exists() else None     # put back what was there
+    try:
+        check()
+    finally:
+        if saved is None:
+            LAST_RUN.unlink(missing_ok=True)
+        else:
+            LAST_RUN.write_bytes(saved)
+
+
+def check():
+    sys.path.insert(0, str(ROOT))
+    import blurnomore as bn
+    # file names: automatic, text after, text before; characters Windows does not allow are dropped
+    o = bn.Options(scale=3)
+    assert bn.result_name(o, "pic", "png", ROOT) == "pic_x3.png"
+    o = bn.Options(scale=3, name_mode="suffix", name_text=' _big?"<>|:*\\/ ')
+    assert bn.result_name(o, "pic", "png", ROOT) == "pic_big.png", bn.result_name(o, "pic", "png", ROOT)
+    o = bn.Options(name_mode="prefix", name_text="big_")
+    assert bn.result_name(o, "pic", "jpg", ROOT) == "big_pic.jpg"
+    assert bn.result_name(bn.Options(name_mode="suffix", name_text="  "), "pic", "png", ROOT) == "pic_x2.png"
+
     with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as t_out, tempfile.TemporaryDirectory() as t_out2:
         d = Path(t)
         make_images(d)
@@ -71,6 +96,19 @@ def main():
             src = next(n for n in names if Path(n).stem == p.stem.rsplit("_x", 1)[0])
             with Image.open(p) as im:
                 assert im.size == (names[src][0] * 2, names[src][1] * 2), f"{p.name} is not exactly 2x"
+        assert {p.name for p in d.iterdir()} == before_files, "the images folder gained or lost files"
+
+        # a file plus the folder it is in: each picture once, named with the owner's prefix; originals in the list order
+        out3 = out / "three"
+        run_py(d / "c_tiny.png", d, "--mode", "upscale", "--no-ai", "--name-prefix", "big_", "--save-to", out3)
+        made3 = sorted(p.name for p in next(out3.glob("BlurNoMore_upscaled_*")).iterdir())
+        assert made3 == ["big_a_lineart.png", "big_b_color.png", "big_c_tiny.png"], made3
+        assert json.loads(LAST_RUN.read_text(encoding="utf-8"))[0].endswith("c_tiny.png"), "last run list not written in order"
+        # the last run's images again, with no inputs, JPG with a suffix
+        out4 = out / "four"
+        run_py("--same", "--mode", "upscale", "--no-ai", "--name-suffix", "_web", "--format", "jpg", "--save-to", out4)
+        made4 = sorted(p.name for p in next(out4.glob("BlurNoMore_upscaled_*")).iterdir())
+        assert made4 == ["a_lineart_web.jpg", "b_color_web.jpg", "c_tiny_web.jpg"], made4
         assert {p.name for p in d.iterdir()} == before_files, "the images folder gained or lost files"
 
         # preview: one sheet per image (up to 4), only into the work folder

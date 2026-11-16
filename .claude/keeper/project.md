@@ -5,14 +5,16 @@ of that file.
 
 ## The areas
 
-- **Choosing images** — which images from the folder go in: `list_images`, `choose_images`, the
-  selection part of `_run` ("How many", "Same images as last run").
+- **Choosing images** — which images go in: the image list (folders and files, drag and drop),
+  `list_images`, the last-run list (`blurnomore_last_run.json`, "Same images as last run").
 - **Image work** — what happens to each picture: `load_rgb`, `classify`, `find_content_box`
   (crop), Real-ESRGAN (`ensure_esrgan`, `run_esrgan`), `strengthen_thin`, `finish` (tone, colour,
-  fade). The README's "Why it makes these choices" explains each.
+  fade), the "Bigger images" output (`make_upscaled`, automatic model choice, DAT and extra models
+  through onnxruntime, face restoration). The README's "Why it makes these choices" explains each.
 - **Page and PDF** — `page_geometry`, placing on the A4 canvas, caching of pages, writing the PDF
   and its name, the log and report.
-- **The window** — `launch_gui`, the `HELP` texts beside each setting, remembered settings.
+- **The window** — `build_window`/`launch_gui`, the `HELP` texts shown in the help box,
+  remembered settings, the preview window (`make_preview`).
 - **Starting and setup** — `BlurNoMore.bat` (finds Python, installs packages), the Real-ESRGAN
   download.
 - **Explaining** — `README.md`.

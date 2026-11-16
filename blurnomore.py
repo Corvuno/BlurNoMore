@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-BlurNoMore - turn a folder of small, blurry drawings into one sharp, print-ready A4 PDF for tracing,
-or make bigger, AI-restored copies of any pictures ("Upscale images").
+BlurNoMore - make bigger, AI-restored copies of any pictures, or turn small, blurry drawings
+into one sharp, print-ready A4 PDF for tracing.
 
 Start it by double-clicking BlurNoMore.bat (or run:  python blurnomore.py).
-That opens a window where you choose the folder, how many images and all settings.
+That opens a window where you add folders or pictures, say what they are and choose what comes out.
 
 Command line (optional):
-    python blurnomore.py "D:\\drawings" --count 6 --pick spread --thicken 70
+    python blurnomore.py "D:\\old phone" "D:\\more\\IMG_1.jpg" --scale 2
+    python blurnomore.py "D:\\drawings" --mode pdf --thicken 70
 
-Per image it: crops empty paper, upscales with Real-ESRGAN (GPU) when the image is
-too small for A4 at the chosen dpi, strengthens very thin lines, fits it on A4 and
-writes one multi-page PDF with the date and time in its name. Originals are never
-touched. Work files and logs go in <save folder>\\_blurnomore_work.
-
-Upscale mode (--mode upscale) only enlarges: 2x, 3x or 4x, into a new folder
-BlurNoMore_upscaled_<date>_<time> in the save folder. --preview shows up to 4 images
-(original next to result, plus close-ups) as picture sheets before a real run.
+Bigger images (the default) enlarge 2x, 3x or 4x into a new folder
+BlurNoMore_upscaled_<date>_<time> in the save folder. The PDF mode crops empty paper,
+upscales when the image is too small for A4 at the chosen dpi, strengthens very thin lines,
+fits it on A4 and writes one multi-page PDF with the date and time in its name. Originals are
+never touched. Work files and logs go in <save folder>\\_blurnomore_work.
+--preview shows up to 4 images (original next to result, plus close-ups) as picture sheets.
 """
 import argparse
 import hashlib
@@ -32,7 +31,7 @@ import time
 import traceback
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +53,12 @@ try:
     HAVE_CV2 = True
 except Exception:  # noqa: BLE001
     cv2, HAVE_CV2 = None, False
+# Optional: drag and drop of pictures onto the window's list. Without it the list works with the buttons.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAVE_DND = True
+except Exception:  # noqa: BLE001
+    HAVE_DND = False
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -68,6 +73,7 @@ MODEL_ANIME = "realesrgan-x4plus-anime"
 AI_MIN_SCALE = 1.25  # below this much enlargement, plain Lanczos is enough
 APP_DIR = Path(__file__).parent
 SETTINGS_FILE = APP_DIR / "blurnomore_settings.json"
+LAST_RUN_FILE = APP_DIR / "blurnomore_last_run.json"   # the images of the last run
 ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once, next to the program
 MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pairs
 BIG_RESULT_PIXELS = 100_000_000
@@ -89,10 +95,8 @@ OWN_MODELS = {DAT_FILE[:-5], GFPGAN_FILE[:-5], YUNET_FILE[:-5]}
 # ===================================================================== options
 @dataclass
 class Options:
-    folder: str = DEFAULT_FOLDER
-    count: int = 0               # 0 = all images
-    pick: str = "spread"         # "spread" (evenly over the folder) or "first"
-    repeat_last: bool = False    # run again on exactly the images used last time
+    inputs: list = field(default_factory=list)   # folders (all images directly in them) and/or image files
+    repeat_last: bool = False    # use the images of the last run instead of the inputs
     margin_mm: float = 10.0      # white border on the A4 page
     fit: str = "whole"           # "whole" picture on the page, or "fill" the page (crops edges)
     dpi: int = 300
@@ -104,10 +108,13 @@ class Options:
     use_ai: bool = True          # Real-ESRGAN upscaling
     color_model: str = "general"  # "general" or "anime" (coloured art only)
     redo: bool = False           # ignore pages made in earlier runs
-    mode: str = "pdf"            # "pdf" = Tracing PDF, "upscale" = Upscale images
-    save_to: str = ""            # where results and _blurnomore_work go; empty = the images folder
+    mode: str = "pdf"            # "pdf" = Tracing PDF, "upscale" = Bigger images
+    save_to: str = ""            # where results and _blurnomore_work go; empty = the folder of the first input
     scale: int = 2               # upscale mode: 2, 3 or 4 times bigger
-    up_model: str = "auto"       # upscale mode: "auto", "general", "anime" or an extra model's name
+    kind: str = "auto"           # upscale mode: "auto" (detect per image), "drawing" or "photo"
+    up_model: str = "auto"       # upscale mode: "auto", "general", "anime", "dat" or an extra model's name
+    name_mode: str = "auto"      # upscale mode: file name "auto" (<name>_x2), "suffix" or "prefix"
+    name_text: str = ""          # the suffix or prefix text (empty = auto)
     file_type: str = "png"       # upscale mode: "png" or "jpg"
     faces: bool = False          # upscale mode: restore faces (GFPGAN)
     face_strength: int = 50      # 0-100, how much of the restored face is used
@@ -532,48 +539,76 @@ def list_images(folder):
                   key=lambda p: p.name.lower())
 
 
-def choose_images(files, count, pick):
-    numbered = list(enumerate(files, 1))
-    if count and count < len(numbered):
-        if pick == "first":
-            numbered = numbered[:count]
-        else:
-            step = len(numbered) / count
-            numbered = [numbered[int(j * step)] for j in range(count)]
-    return numbered
+def spread(items, n):
+    """n items spread evenly over the list (all of them when there are fewer)."""
+    if n >= len(items):
+        return list(items)
+    step = len(items) / n
+    return [items[int(j * step)] for j in range(n)]
+
+
+def read_last_run():
+    """The image paths the last run used (blurnomore_last_run.json next to the program), or []."""
+    try:
+        return [str(p) for p in json.loads(LAST_RUN_FILE.read_text(encoding="utf-8"))]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def output_dir(o):
-    """Where results and _blurnomore_work go: 'Save to', or the images folder when that is empty."""
-    return Path(o.save_to.strip().strip('"')) if o.save_to.strip() else Path(o.folder)
+    """Where results and _blurnomore_work go: 'Save to', or the folder of the first input when that is empty."""
+    if o.save_to.strip():
+        return Path(o.save_to.strip().strip('"'))
+    first = (read_last_run() if o.repeat_last else []) or o.inputs
+    p = Path(str(first[0]).strip().strip('"')) if first else Path(DEFAULT_FOLDER)
+    return p if p.is_dir() else p.parent
 
 
-def select_images(o, L, folder, files, work):
-    """The images this run (or its preview) uses. Returns (numbered, selection file)."""
-    out = work.parent
-    if out.resolve() == folder.resolve():
-        sel_file = work / "last_selection.json"
-    else:   # two image folders saving to one place must not mix their selections
-        tag = hashlib.md5(str(folder.resolve()).encode()).hexdigest()[:8]
-        sel_file = work / f"last_selection_{tag}.json"
-    numbered = None
+def resolve_images(o, L):
+    """The image files this run (or its preview) works on: a folder gives all images directly in
+    it, a file is taken as given; duplicates go, the order stays. With 'same images as last run'
+    the list of the last run replaces the inputs. Problems are said through L."""
+    inputs = o.inputs
     if o.repeat_last:
-        try:
-            names = set(json.loads(sel_file.read_text(encoding="utf-8")))
-            numbered = [(i, p) for i, p in enumerate(files, 1) if p.name in names]
-            missing = len(names) - len(numbered)
-            L(f"Repeating the {len(numbered)} images from the last run"
-              + (f" ({missing} no longer in the folder)" if missing else ""))
-        except Exception:  # noqa: BLE001
-            L("No earlier selection found for this folder; choosing images normally.")
-        if not numbered:
-            numbered = None
-    if numbered is None:
-        numbered = choose_images(files, o.count, o.pick)
-    return numbered, sel_file
+        last = read_last_run()
+        if last:
+            L(f"Repeating the {len(last)} images from the last run")
+            inputs = last
+        else:
+            L("No earlier run found; using the images in the list.")
+    files, seen = [], set()
+    for raw in inputs:
+        p = Path(str(raw).strip().strip('"'))
+        if p.is_dir():
+            found = list_images(p)
+            if not found:
+                L(f"No images found in {p}")
+        elif p.is_file():
+            found = [p]
+        else:
+            L(f"Not found, skipped: {p}")
+            continue
+        for f in found:
+            key = os.path.normcase(os.path.abspath(f))
+            if key not in seen:
+                seen.add(key)
+                files.append(f)
+    return files
 
 
-def prepare(o, L, folder, out):
+def result_name(o, stem, ext, folder):
+    """File name of one bigger image: <name>_x2, or the owner's text after or before the name.
+    Never a name that is already taken in folder (a second one gets _2)."""
+    text = "".join(ch for ch in o.name_text if ch not in '<>:"/\\|?*' and ord(ch) >= 32).strip() \
+        if o.name_mode in ("suffix", "prefix") else ""
+    base = (text + stem if o.name_mode == "prefix" else stem + text) if text else f"{stem}_x{o.scale}"
+    name, k = f"{base}.{ext}", 2
+    while (folder / name).exists():
+        name, k = f"{base}_{k}.{ext}", k + 1
+    return name
+
+
+def prepare(L, out):
     """Work folder, or None (after saying why) when the save folder cannot be made."""
     try:
         out.mkdir(parents=True, exist_ok=True)
@@ -598,19 +633,18 @@ def prepare(o, L, folder, out):
 def run(o, log, should_stop=lambda: False):
     """Do the whole job. Returns the PDF path (mode pdf) or the folder of upscaled
     copies (mode upscale), or None."""
-    folder = Path(o.folder)
-    if not folder.is_dir():
-        log(f"Folder not found: {folder}")
-        return None
-    files = list_images(folder)
+    notes = []
+    files = resolve_images(o, notes.append)
     if not files:
-        log(f"No images found in {folder}")
+        for m in notes:
+            log(m)
+        log("No images to work on. Add a folder or some pictures first.")
         return None
 
     started = time.time()
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out = output_dir(o)
-    work = prepare(o, log, folder, out)
+    work = prepare(log, out)
     if work is None:
         return None
     logfile = open(work / "logs" / f"{stamp}.log", "w", encoding="utf-8")
@@ -621,7 +655,7 @@ def run(o, log, should_stop=lambda: False):
         logfile.flush()
 
     try:
-        return _run(o, L, should_stop, folder, out, files, stamp, work, started)
+        return _run(o, L, should_stop, out, files, notes, stamp, work, started)
     except Exception:  # noqa: BLE001
         L("UNEXPECTED ERROR:")
         L(traceback.format_exc())
@@ -786,7 +820,7 @@ def make_upscaled(c, path, src_id, im, store=False):
     with store=True a new result is kept for the run that follows."""
     o, L = c.o, c.L
     w, h = im.size
-    cls, stats = classify(im)
+    cls = {"drawing": "lineart", "photo": "photo"}.get(o.kind) or classify(im)[0]
     kind = "drawing" if cls in ("lineart", "flatcolor") else "photo"
     target = (w * o.scale, h * o.scale)
     m = upscale_model(c, cls)
@@ -846,18 +880,20 @@ def upscaled_line(tag, r, scale, name, t0):
             f"({time.time() - t0:.1f}s){warn}")
 
 
-def _run(o, L, should_stop, folder, out, files, stamp, work, started):
+def _run(o, L, should_stop, out, files, notes, stamp, work, started):
     L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
     L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
     L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
 
     c = Context(o, L, work)
-    numbered, sel_file = select_images(o, L, folder, files, work)
+    for m in notes:
+        L(m)
+    numbered = list(enumerate(files, 1))
     try:
-        sel_file.write_text(json.dumps([p.name for _, p in numbered], indent=1), encoding="utf-8")
+        LAST_RUN_FILE.write_text(json.dumps([str(p) for p in files], indent=1), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
-    L(f"{len(numbered)} of {len(files)} images in {folder}\n")
+    L(f"{len(numbered)} images. Saving in {out}\n")
 
     c.start_ai()
     upscale = o.mode == "upscale"
@@ -877,9 +913,7 @@ def _run(o, L, should_stop, folder, out, files, stamp, work, started):
             if upscale:
                 r = make_upscaled(c, path, src_id, im)
                 up_dir.mkdir(parents=True, exist_ok=True)
-                name, k = f"{path.stem}_x{o.scale}.{ext}", 2
-                while (up_dir / name).exists():
-                    name, k = f"{path.stem}_x{o.scale}_{k}.{ext}", k + 1
+                name = result_name(o, path.stem, ext, up_dir)
                 if ext == "jpg":
                     r["result"].save(up_dir / name, quality=95, subsampling=0)
                 else:
@@ -953,29 +987,27 @@ def busiest_box(im, size=400):
     return (x0, y0, x0 + bw, y0 + bh)
 
 
-def make_preview(o, log, n=4):
-    """Process up to n images exactly as the run would and return what to show: a list of dicts
-    with name, cls (class), kind, method, original, result, detail_original, detail_result.
+def make_preview(o, log, n=4, should_stop=lambda: False):
+    """Process up to n images (spread over the list) exactly as the run would and return what to show: a list of dicts
+    with name, kind, method, original, result, detail_original, detail_result.
     Writes only into the work folder (pages and results are kept for the run that follows)."""
-    folder = Path(o.folder)
-    if not folder.is_dir():
-        log(f"Folder not found: {folder}")
-        return []
-    files = list_images(folder)
+    files = resolve_images(o, log)
     if not files:
-        log(f"No images found in {folder}")
+        log("No images to work on. Add a folder or some pictures first.")
         return []
-    work = prepare(o, log, folder, output_dir(o))
+    work = prepare(log, output_dir(o))
     if work is None:
         return []
     c = Context(o, log, work)
-    numbered, _ = select_images(o, log, folder, files, work)
-    idx_of = {p: i for i, p in numbered}
-    picks = [(idx_of[p], p) for _, p in choose_images([p for _, p in numbered], n, "spread")]
-    log(f"Preview of {len(picks)} images in {folder}")
+    numbered = list(enumerate(files, 1))
+    picks = spread(numbered, n)
+    log(f"Preview of {len(picks)} of {len(files)} images")
     c.start_ai()
     items = []
     for k, (idx, path) in enumerate(picks, 1):
+        if should_stop():
+            log("\nStopped by user.")
+            break
         t0 = time.time()
         tag = f"[{k}/{len(picks)}] #{idx} {path.name[:50]}"
         try:
@@ -1000,7 +1032,7 @@ def make_preview(o, log, n=4):
             sy0, sy1 = (min(max((box[1] - dy) / fy, 0.0), oh - 1), min(max((box[3] - dy) / fy, 1.0), oh))
             size = (box[2] - box[0], box[3] - box[1])
             d_orig = orig.resize(size, Image.BICUBIC, box=(sx0, sy0, max(sx1, sx0 + 1), max(sy1, sy0 + 1)))
-            items.append({"name": path.name, "cls": r["cls"], "method": r["method"], "original": orig,
+            items.append({"name": path.name, "kind": r["kind"] if o.mode == "upscale" else r["cls"], "method": r["method"], "original": orig,
                           "result": res, "detail_original": d_orig, "detail_result": res.crop(box)})
         except Exception:  # noqa: BLE001
             log(f"{tag}\n    ERROR:")
@@ -1026,7 +1058,7 @@ def preview_sheet(item, panel=560):
     H = pad + cap + row1 + pad + cap + row2 + pad + cap
     sheet = Image.new("RGB", (W, H), bg)
     d = ImageDraw.Draw(sheet)
-    d.text((pad, 3), f"{item['name']}   {item['cls']}   {item['method']}", fill=(0, 0, 0))
+    d.text((pad, 3), f"{item['name']}   {item['kind']}   {item['method']}", fill=(0, 0, 0))
     y = pad + cap
     for j, (im, label) in enumerate(zip(top, (f"Original ({item['original'].size[0]}x{item['original'].size[1]})",
                                               f"Result ({item['result'].size[0]}x{item['result'].size[1]})"))):
@@ -1056,19 +1088,42 @@ def save_preview_sheets(o, items, stamp=None):
 
 # ====================================================================== GUI
 HELP = {
-    "folder": "Folder with your pictures. Nothing in it is ever changed. The result is saved here too, with the "
-              "date and time in its name, unless you choose another place under 'Save results to'. "
-              "Logs and work files go in _blurnomore_work.",
-    "count": "Handy for a quick test. 'Spread evenly' picks images from all over the folder, "
-             "so you see different kinds of drawings. 'First ones' takes them in name order.",
-    "repeat": "Runs again on exactly the same images as the last run in this folder, whatever the "
-              "'How many' setting says. Handy for comparing settings on the same test pages.",
+    "images": "The pictures to work on. 'Add folder' takes every picture directly in that folder (not the folders "
+              "inside it); 'Add files' lets you pick several pictures at once. You can also drag folders and "
+              "pictures onto the list. Nothing in them is ever changed.",
+    "last_run": "Fills the list with the pictures of your last run, so you can try other settings on the same "
+                "pictures and compare. Greyed out until you have run once.",
+    "kind": "What the pictures are. 'Detect for each image' looks at each picture and decides: drawing or line art, "
+            "or photo. Choose Drawing or Photo when all your pictures are the same kind and the detection "
+            "gets some wrong.",
+    "up_model": "Automatic picks the best model for each picture: drawings use the Drawing model; photos use the "
+                "Web photo model (DAT) when your graphics card can run it, otherwise the General model. "
+                "Web photo DAT is the best for compressed web photos but slow without a graphics card (needs "
+                "onnxruntime-directml). Other models you put in the models folder next to the program "
+                "(NAME.param and NAME.bin, or NAME.onnx) are listed here too.",
+    "scale": "How many times bigger the pictures become: 2, 3 or 4. A 1000 pixel wide picture becomes 2000, 3000 or "
+             "4000 pixels wide. Bigger takes longer and makes bigger files; it cannot bring back detail that "
+             "is not there.",
+    "faces": "Finds faces in the enlarged picture and restores them with GFPGAN. Needs onnxruntime-directml and "
+             "opencv-python-headless. The first time it downloads about 340 MB. Off = faces are left as the "
+             "enlargement makes them.",
+    "face_strength": "Only when 'Restore faces' is on. How much of the restored face is used: 0 = none, 50 = half "
+                     "(default), 100 = fully restored. Lower looks more like the original, higher is sharper but "
+                     "can look smoother or change the face.",
+    "mode": "What comes out. Bigger images: each picture becomes a new, bigger picture file. Tracing PDF: crops, "
+            "enlarges and fits every picture on an A4 page in one PDF, for tracing. One of the two per run.",
+    "name": "Bigger images only. How the new files are named. Automatic: photo_x2.png. Or add your own text after "
+            "the name (photo_big.png) or before it (big_photo.png), so you can find the pictures again. "
+            "Two files with the same name get _2.",
+    "name_text": "The text added to the name. Characters Windows does not allow in file names are left out.",
+    "file_type": "Bigger images only. PNG keeps every pixel exactly (big files). JPG is much smaller "
+                 "(top quality, 95) and fine for photos.",
     "fit": "Whole picture: nothing is cut off, but a picture with a different shape than A4 leaves "
            "white space at the top/bottom or the sides. Fill the page: enlarges until the page is full "
            "and trims the edges that do not fit.",
     "margin": "White border around the drawing on the A4 page, in mm. Printers cannot print right to the "
               "edge; 5 to 10 is normal.",
-    "dpi": "Pixels per inch of the pages. 300 = sharp print quality. 200 = smaller and faster. "
+    "dpi": "Tracing PDF only. Pixels per inch of the pages. 300 = sharp print quality. 200 = smaller and faster. "
            "Going above 300 rarely shows.",
     "crop": "Cuts away blank paper and scan borders around the drawing, so it fills the page. "
             "Switch off if it ever cuts off something you want to keep.",
@@ -1080,43 +1135,30 @@ HELP = {
              "Off: everything is printed in grey.",
     "boost": "Stronger colours and a bit more contrast, for pale or washed-out artwork. "
              "0 = unchanged. Try 20 to 40 for pale pictures.",
-    "ai": "Real-ESRGAN on your GPU enlarges small images and adds detail (first run downloads about 45 MB). "
-          "Off = plain resizing: much faster but blurrier. Also switches off the Web photo model.",
+    "ai": "The AI upscalers (Real-ESRGAN, and DAT for photos) on your graphics card enlarge and restore "
+          "detail; the first use downloads them. Off = plain resizing: much faster but blurrier.",
     "model": "General: natural look, best for painted or shaded coloured art and scans (default). "
              "Anime: crisper flat colours, but can look smooth and plastic on shaded art. "
              "Black and white art always uses Anime.",
-    "mode": "Tracing PDF: crops, enlarges and fits every picture on an A4 page, for tracing. "
-            "Upscale images: only makes each picture 2x, 3x or 4x bigger, for general use, and saves "
-            "them as new picture files. No cropping, no line work, no pages.",
     "save_to": "Where the results are saved: the PDF, or the folder of bigger pictures, and the "
-               "_blurnomore_work folder. Empty = next to the pictures (in the images folder). "
-               "A folder that does not exist yet is made. Your original pictures are never touched.",
-    "scale": "Upscale images only. How many times bigger the pictures become: 2, 3 or 4. "
-             "A 1000 pixel wide picture becomes 2000, 3000 or 4000 pixels wide. Bigger takes longer "
-             "and makes bigger files; it cannot bring back detail that is not there.",
-    "up_model": "Upscale images only. Automatic looks at each picture: drawings and flat colour use the "
-                "Anime model; photos use the Web photo model (DAT) when your graphics card can run it, "
-                "otherwise the General model; black and white photos use the General model. 'dat' forces the "
-                "Web photo model (slow without a graphics card; needs onnxruntime-directml). General or Anime "
-                "forces one for all pictures. Other models you put in the models folder next to "
-                "the program (NAME.param and NAME.bin, or NAME.onnx) are listed here too.",
-    "faces": "Upscale images only. Finds faces in the enlarged picture and restores them with GFPGAN. "
-             "Needs onnxruntime-directml and opencv-python-headless. The first time it downloads about "
-             "340 MB. Off = faces are left as the enlargement makes them.",
-    "face_strength": "Upscale images only, when 'Restore faces' is on. How much of the restored face is used: "
-                     "0 = none, 50 = half (default), 100 = fully restored. Lower looks more like the "
-                     "original, higher is sharper but can look smoother or change the face.",
-    "file_type": "Upscale images only. PNG keeps every pixel exactly (big files). JPG is much smaller "
-                 "(top quality, 95) and fine for photos.",
-    "redo": "Ignore pages made in earlier runs. Changing a setting already makes new pages on its own; "
-            "use this for a clean rebuild.",
+               "_blurnomore_work folder. 'Next to the images' = the folder of the first folder or picture in "
+               "the list. A folder that does not exist yet is made. Your original pictures are never touched.",
+    "redo": "Ignore pages and results made in earlier runs. Changing a setting already makes new ones on its "
+            "own; use this for a clean rebuild.",
+    "open": "Opens the PDF, or the folder of bigger pictures, when the run is finished.",
+    "run_preview": "Works on 4 of your pictures first (spread over the list) and shows each one next to its "
+                   "result, with close-ups. Then you choose 'Go on with all' or 'Change settings'.",
+    "run": "Works on all the pictures straight away.",
 }
+HELP_DEFAULT = "Point at a setting to see what it does."
 
 
 def load_settings():
     o = Options()
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if "inputs" not in data and data.get("folder"):
+            data["inputs"] = [data["folder"]]     # settings of an older version: one folder
         for f in fields(Options):
             if f.name in data:
                 setattr(o, f.name, type(getattr(o, f.name))(data[f.name]))
@@ -1132,33 +1174,60 @@ def save_settings(o):
         pass
 
 
-def launch_gui():
-    import os
+def build_window():
+    """Make the window. Returns an object with the root and the functions behind the buttons (so they can be
+    driven without clicking)."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     from tkinter import font as tkfont
+    from types import SimpleNamespace
+    from PIL import ImageTk
 
     o = load_settings()
-    root = tk.Tk()
-    root.title("BlurNoMore")
+    root, dnd = None, False
+    if HAVE_DND:
+        try:
+            root, dnd = TkinterDnD.Tk(), True
+        except Exception:  # noqa: BLE001  (the drag and drop library did not load: the window works without it)
+            root = None
+    if root is None:
+        root = tk.Tk()
+    root.title(f"BlurNoMore {VERSION}")
     root.geometry("1280x780")
-    root.minsize(1100, 600)
+    root.minsize(1100, 640)
 
     base = tkfont.nametofont("TkDefaultFont")
-    bold = base.copy()
-    bold.configure(weight="bold")
     small = base.copy()
     small.configure(size=max(base.cget("size") - 1, 8))
     mono = tkfont.nametofont("TkFixedFont")
 
+    # words in the window <-> values in Options
+    MAKE = {"Bigger images": "upscale", "Tracing PDF": "pdf"}
+    KIND = {"Detect for each image": "auto", "Drawing or line art": "drawing", "Photo": "photo"}
+    MODEL = {"Automatic": "auto", "General photo (Real-ESRGAN)": "general", "Web photo DAT (best, slower)": "dat",
+             "Drawing (Real-ESRGAN anime)": "anime", **{n: n for n in extra_models()}}
+    NAME = {"Automatic": "auto", "Text after the name": "suffix", "Text before the name": "prefix"}
+    SAVE = {"Next to the images": False, "A folder I choose": True}
+    COLOR_MODEL = {"General (recommended)": "general", "Anime": "anime"}
+    FIT = {"Whole picture": "whole", "Fill the page": "fill"}
+
+    def word(table, value, default):
+        return next((k for k, v in table.items() if v == value), default)
+
     # ---- variables
-    v_folder = tk.StringVar(value=o.folder)
-    v_mode = tk.StringVar(value="All images" if o.count == 0 else "Only a number of images")
-    v_count = tk.StringVar(value=str(o.count or 6))
-    v_pick = tk.StringVar(value="spread evenly" if o.pick == "spread" else "the first ones")
-    v_repeat = tk.BooleanVar(value=o.repeat_last)
+    v_make = tk.StringVar(value=word(MAKE, o.mode, "Tracing PDF"))
+    v_kind = tk.StringVar(value=word(KIND, o.kind, "Detect for each image"))
+    v_model = tk.StringVar(value=word(MODEL, o.up_model, "Automatic"))
+    v_scale = tk.StringVar(value=f"{o.scale}x")
+    v_faces = tk.BooleanVar(value=o.faces)
+    v_strength = tk.StringVar(value=str(o.face_strength))
+    v_name = tk.StringVar(value=word(NAME, o.name_mode, "Automatic"))
+    v_name_text = tk.StringVar(value=o.name_text)
+    v_type = tk.StringVar(value=o.file_type.upper())
+    v_save = tk.StringVar(value=word(SAVE, bool(o.save_to.strip()), "Next to the images"))
+    v_save_to = tk.StringVar(value=o.save_to)
+    v_fit = tk.StringVar(value=word(FIT, o.fit, "Whole picture"))
     v_margin = tk.StringVar(value=str(o.margin_mm))
-    v_fit = tk.StringVar(value="Whole picture" if o.fit == "whole" else "Fill the page")
     v_dpi = tk.StringVar(value=str(o.dpi))
     v_crop = tk.BooleanVar(value=o.autocrop)
     v_thick = tk.StringVar(value=str(o.thicken))
@@ -1166,48 +1235,87 @@ def launch_gui():
     v_color = tk.BooleanVar(value=o.keep_color)
     v_boost = tk.StringVar(value=str(o.color_boost))
     v_ai = tk.BooleanVar(value=o.use_ai)
-    v_model = tk.StringVar(value="General (recommended)" if o.color_model == "general" else "Anime")
+    v_color_model = tk.StringVar(value=word(COLOR_MODEL, o.color_model, "General (recommended)"))
     v_redo = tk.BooleanVar(value=o.redo)
     v_open = tk.BooleanVar(value=o.open_when_done)
-    v_found = tk.StringVar(value="")
+    v_help = tk.StringVar(value=HELP_DEFAULT)
+    v_count = tk.StringVar()
 
-    # ---- layout: settings (left) and log (right)
-    root.columnconfigure(0, weight=0)
+    # ---- layout: settings (left, scrolls) with the help box under it, and the log (right)
     root.columnconfigure(1, weight=1)
     root.rowconfigure(0, weight=1)
-
     left_outer = ttk.Frame(root)
     left_outer.grid(row=0, column=0, sticky="ns", padx=(10, 5), pady=10)
-    canvas = tk.Canvas(left_outer, width=520, highlightthickness=0)
+    left_outer.rowconfigure(0, weight=1)
+    canvas = tk.Canvas(left_outer, width=560, highlightthickness=0)
     scroll = ttk.Scrollbar(left_outer, orient="vertical", command=canvas.yview)
     left = ttk.Frame(canvas)
+    left.columnconfigure(0, weight=1)
+    win_id = canvas.create_window((0, 0), window=left, anchor="nw")
     left.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.create_window((0, 0), window=left, anchor="nw")
+    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
     canvas.configure(yscrollcommand=scroll.set)
-    canvas.pack(side="left", fill="y", expand=True)
-    scroll.pack(side="right", fill="y")
+    canvas.grid(row=0, column=0, sticky="ns")
+    scroll.grid(row=0, column=1, sticky="ns")
+    help_box = ttk.Label(left_outer, textvariable=v_help, font=small, wraplength=540, justify="left",
+                         relief="groove", padding=6, anchor="nw")
+    help_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    left_outer.configure(height=700)
+
+    def over_left(w):
+        while w is not None:
+            if w is left_outer:
+                return True
+            w = w.master
+        return False
 
     def wheel(e):
-        canvas.yview_scroll(int(-1 * (e.delta / 120)) if e.delta else 0, "units")
-    canvas.bind_all("<MouseWheel>", wheel)
+        """Scroll the settings only while the pointer is over them (and not over the list, which scrolls itself)."""
+        w = root.winfo_containing(e.x_root, e.y_root)
+        if w is None or not over_left(w) or isinstance(w, tk.Listbox) or canvas.yview() == (0.0, 1.0):
+            return
+        step = (-1 if e.delta > 0 else 1) if e.delta else (-1 if e.num == 4 else 1)
+        canvas.yview_scroll(step, "units")
+    for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        root.bind_all(ev, wheel)
 
     right = ttk.Frame(root)
     right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
     right.rowconfigure(1, weight=1)
     right.columnconfigure(0, weight=1)
 
-    r = [0]
+    # ---- helpers to build rows
+    counters, only = {}, {"upscale": [], "pdf": []}
 
-    def add(title, widget_builder, help_key):
-        row = ttk.Frame(left)
-        row.grid(row=r[0], column=0, sticky="ew", pady=(0, 7))
-        r[0] += 1
-        top = ttk.Frame(row)
-        top.pack(fill="x")
-        ttk.Label(top, text=title, font=bold, width=26).pack(side="left")
-        widget_builder(top).pack(side="left")
-        ttk.Label(row, text=HELP[help_key], font=small, foreground="#555555",
-                  wraplength=470, justify="left").pack(fill="x", anchor="w")
+    def tip(w, key):
+        """Show the help text of a setting while the pointer is over it or it has the focus."""
+        for x in (w, *w.winfo_children()):
+            x.bind("<Enter>", lambda e: v_help.set(HELP[key]), add="+")
+            x.bind("<FocusIn>", lambda e: v_help.set(HELP[key]), add="+")
+            x.bind("<Leave>", lambda e: v_help.set(HELP_DEFAULT), add="+")
+
+    def group(title, parent=None):
+        g = ttk.LabelFrame(parent or left, text=title, padding=(8, 4)) if title else ttk.Frame(parent or left)
+        g.grid(row=len((parent or left).grid_slaves()), column=0, sticky="ew", pady=(0, 8))
+        g.columnconfigure(1, weight=1)
+        return g
+
+    def row(g, label, build, key, out=None):
+        """One setting: a label and what you change it with. out = 'upscale' or 'pdf': shown only for that output."""
+        i = counters[g] = counters.get(g, -1) + 1
+        g.columnconfigure(0, minsize=210)      # the settings of all groups line up
+        lab = ttk.Label(g, text=label)
+        lab.grid(row=i, column=0, sticky="w", padx=(0, 8), pady=2)
+        w = build(g)
+        w.grid(row=i, column=1, sticky="w", pady=2)
+        tip(lab, key)
+        tip(w, key)
+        if out:
+            only[out] += [lab, w]
+        return w
+
+    def combo(var, values, width=30):
+        return lambda p: ttk.Combobox(p, textvariable=var, state="readonly", width=width, values=list(values))
 
     def spin(var, lo, hi, step, width=6):
         return lambda p: ttk.Spinbox(p, from_=lo, to=hi, increment=step, textvariable=var, width=width)
@@ -1215,75 +1323,197 @@ def launch_gui():
     def check(var, text):
         return lambda p: ttk.Checkbutton(p, text=text, variable=var)
 
-    # folder
-    def build_folder(p):
-        f = ttk.Frame(p)
-        ttk.Entry(f, textvariable=v_folder, width=26).pack(side="left")
-        ttk.Button(f, text="Browse...", command=lambda: browse()).pack(side="left", padx=4)
-        return f
+    def entry_row(var, browse_cmd=None):
+        def build(p):
+            f = ttk.Frame(p)
+            e = ttk.Entry(f, textvariable=var, width=24)
+            e.pack(side="left")
+            if browse_cmd:
+                ttk.Button(f, text="Browse...", command=browse_cmd).pack(side="left", padx=4)
+            return f
+        return build
 
-    def browse():
-        d = filedialog.askdirectory(initialdir=v_folder.get() or None, title="Folder with drawings")
+    # ---- 1. Images
+    inputs, found = list(o.inputs), {}
+    g1 = group("1. Images")
+    g1.columnconfigure(0, weight=1)
+    bar = ttk.Frame(g1)
+    bar.grid(row=0, column=0, sticky="w")
+    list_frame = ttk.Frame(g1)
+    list_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+    list_frame.columnconfigure(0, weight=1)
+    lb = tk.Listbox(list_frame, height=7, selectmode="extended", exportselection=False, font=mono)
+    lb_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=lb_scroll.set)
+    lb.grid(row=0, column=0, sticky="ew")
+    lb_scroll.grid(row=0, column=1, sticky="ns")
+    ttk.Label(g1, textvariable=v_count, font=small).grid(row=3, column=0, sticky="w", pady=(2, 0))
+    for w in (bar, list_frame, lb):
+        tip(w, "images")
+
+    def add_paths(paths):
+        """Add folders and picture files to the list (no duplicates, no other files). Returns how many were added."""
+        added, skipped = 0, 0
+        have = {os.path.normcase(os.path.abspath(p)) for p in inputs}
+        for p in paths:
+            p = str(p).strip().strip('"')
+            key = os.path.normcase(os.path.abspath(p))
+            if key in have:
+                continue
+            if os.path.isdir(p) or (os.path.isfile(p) and Path(p).suffix.lower() in EXTS):
+                inputs.append(p)
+                have.add(key)
+                added += 1
+            else:
+                skipped += 1
+        if skipped:
+            append(f"{skipped} dropped item(s) skipped: not a folder or a picture file.")
+        refresh_list()
+        return added
+
+    def shorten(p, n=44):
+        return p if len(p) <= n else f"{Path(p).anchor}...{os.sep}{Path(p).name}"
+
+    def refresh_list():
+        lb.delete(0, "end")
+        total = 0
+        for p in inputs:
+            if os.path.isdir(p):
+                if p not in found:
+                    try:
+                        found[p] = len(list_images(p))
+                    except OSError:
+                        found[p] = 0
+                total += found[p]
+                lb.insert("end", f"{shorten(p)}  (whole folder, {found[p]})")
+            else:
+                total += 1
+                lb.insert("end", Path(p).name)
+        v_count.set(f"{total} images" if inputs else "No images yet: add a folder or some pictures.")
+        b_last.configure(state="normal" if read_last_run() else "disabled")
+
+    def add_folder():
+        d = filedialog.askdirectory(initialdir=(inputs[-1] if inputs and os.path.isdir(inputs[-1]) else DEFAULT_FOLDER),
+                                    title="Folder with pictures")
         if d:
-            v_folder.set(d)
+            add_paths([d])
 
-    add("Folder with drawings", build_folder, "folder")
-    ttk.Label(left, textvariable=v_found, font=small).grid(row=r[0], column=0, sticky="w")
-    r[0] += 1
+    def add_files():
+        names = filedialog.askopenfilenames(title="Choose pictures (hold Ctrl or Shift to pick several)",
+                                            filetypes=[("Pictures", " ".join("*" + e for e in sorted(EXTS))),
+                                                       ("All files", "*.*")])
+        if names:
+            add_paths(root.tk.splitlist(names))
 
-    # how many
-    def build_count(p):
-        f = ttk.Frame(p)
-        cb = ttk.Combobox(f, textvariable=v_mode, state="readonly", width=22,
-                          values=["All images", "Only a number of images"])
-        cb.grid(row=0, column=0, sticky="w")
-        sp = ttk.Spinbox(f, from_=1, to=9999, textvariable=v_count, width=5)
-        sp.grid(row=0, column=1, padx=4)
-        pk = ttk.Combobox(f, textvariable=v_pick, state="readonly", width=22,
-                          values=["spread evenly", "the first ones"])
-        pk.grid(row=1, column=0, sticky="w", pady=(3, 0))
+    def remove_selected():
+        for i in reversed(lb.curselection()):
+            del inputs[i]
+        refresh_list()
 
-        def sync(*_):
-            state = "normal" if v_mode.get() != "All images" else "disabled"
-            sp.configure(state=state)
-            pk.configure(state="readonly" if state == "normal" else "disabled")
-        cb.bind("<<ComboboxSelected>>", sync)
-        sync()
-        return f
+    def clear_list():
+        inputs.clear()
+        refresh_list()
 
-    add("How many images", build_count, "count")
-    add("Same images as last run", check(v_repeat, "on"), "repeat")
+    def last_run_images():
+        inputs[:] = read_last_run()
+        refresh_list()
 
-    add("Fit on the page",
-        lambda p: ttk.Combobox(p, textvariable=v_fit, state="readonly", width=22,
-                               values=["Whole picture", "Fill the page"]), "fit")
-    add("Page margin (mm)", spin(v_margin, 0, 40, 1), "margin")
-    add("Print resolution (dpi)", spin(v_dpi, 150, 600, 50), "dpi")
-    add("Crop empty paper", check(v_crop, "on"), "crop")
-    add("Strengthen thin lines (0-100)", spin(v_thick, 0, 100, 10), "thicken")
-    add("Lighten print (0-100)", spin(v_fade, 0, 90, 10), "fade")
-    add("Keep colours", check(v_color, "on  (off = all grey)"), "color")
-    add("Colour boost (0-100)", spin(v_boost, 0, 100, 10), "boost")
-    add("Use AI upscaler", check(v_ai, "on  (needs a GPU)"), "ai")
-    add("AI model for coloured art",
-        lambda p: ttk.Combobox(p, textvariable=v_model, state="readonly", width=22,
-                               values=["General (recommended)", "Anime"]), "model")
-    add("Redo all pages", check(v_redo, "on"), "redo")
-    row = ttk.Frame(left)
-    row.grid(row=r[0], column=0, sticky="w", pady=4)
-    ttk.Checkbutton(row, text="Open the PDF when finished", variable=v_open).pack(side="left")
-    r[0] += 1
+    ttk.Button(bar, text="Add folder...", command=add_folder).pack(side="left", padx=(0, 4))
+    ttk.Button(bar, text="Add files...", command=add_files).pack(side="left", padx=(0, 4))
+    ttk.Button(bar, text="Remove", command=remove_selected).pack(side="left", padx=(0, 4))
+    ttk.Button(bar, text="Clear", command=clear_list).pack(side="left", padx=(0, 4))
+    b_last = ttk.Button(bar, text="Last run's images", command=last_run_images)
+    b_last.pack(side="left")
+    tip(b_last, "last_run")
+    if dnd:
+        try:
+            lb.drop_target_register(DND_FILES)
+            lb.dnd_bind("<<Drop>>", lambda e: add_paths(root.tk.splitlist(e.data)))
+            ttk.Label(g1, text="or drag pictures or folders onto the list", font=small,
+                      foreground="#555555").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        except Exception:  # noqa: BLE001
+            dnd = False
 
-    # buttons + log
+    # ---- 2. What kind of images
+    g2 = group("2. What kind of images")
+    row(g2, "Kind", combo(v_kind, KIND), "kind", "upscale")
+    row(g2, "Model", combo(v_model, MODEL), "up_model", "upscale")
+    row(g2, "Use AI upscaler", check(v_ai, "on  (needs a GPU)"), "ai")
+    row(g2, "Model for coloured art", combo(v_color_model, COLOR_MODEL), "model", "pdf")
+
+    # ---- 3. Options
+    g3 = group("3. Options")
+    row(g3, "Enlarge", combo(v_scale, ["2x", "3x", "4x"], 8), "scale", "upscale")
+    row(g3, "Restore faces", check(v_faces, "on"), "faces", "upscale")
+    w_strength = row(g3, "Face strength (0-100)", spin(v_strength, 0, 100, 10), "face_strength", "upscale")
+    row(g3, "Crop empty paper", check(v_crop, "on"), "crop", "pdf")
+    row(g3, "Strengthen thin lines (0-100)", spin(v_thick, 0, 100, 10), "thicken", "pdf")
+    row(g3, "Lighten print (0-100)", spin(v_fade, 0, 90, 10), "fade", "pdf")
+    row(g3, "Keep colours", check(v_color, "on  (off = all grey)"), "color", "pdf")
+    row(g3, "Colour boost (0-100)", spin(v_boost, 0, 100, 10), "boost", "pdf")
+
+    # ---- 4. What comes out
+    g4 = group("4. What comes out")
+    row(g4, "Make", combo(v_make, MAKE), "mode")
+    row(g4, "Name", combo(v_name, NAME), "name", "upscale")
+    w_name_text = row(g4, "Text for the name", entry_row(v_name_text), "name_text", "upscale")
+    row(g4, "File type", combo(v_type, ["PNG", "JPG"], 8), "file_type", "upscale")
+    row(g4, "Fit on the page", combo(v_fit, FIT), "fit", "pdf")
+    row(g4, "Page margin (mm)", spin(v_margin, 0, 40, 1), "margin", "pdf")
+
+    def browse_save():
+        d = filedialog.askdirectory(initialdir=v_save_to.get() or None, title="Folder to save in")
+        if d:
+            v_save_to.set(d)
+            v_save.set("A folder I choose")
+    row(g4, "Save to", combo(v_save, SAVE, 22), "save_to")
+    w_save_to = row(g4, "", entry_row(v_save_to, browse_save), "save_to")
+
+    # ---- More settings (folds open)
+    more_open = [False]
+    fold = ttk.Label(left, text="> More settings", foreground="#2f6fb3", cursor="hand2")
+    fold.grid(row=len(left.grid_slaves()), column=0, sticky="w", pady=(0, 4))
+    g5 = group(None)
+    row(g5, "Print resolution (dpi)", spin(v_dpi, 150, 600, 50), "dpi", "pdf")
+    row(g5, "Redo all pages", check(v_redo, "on"), "redo")
+    row(g5, "Open the result when finished", check(v_open, "on"), "open")
+
+    def toggle_more(*_):
+        more_open[0] = not more_open[0]
+        fold.configure(text=("v More settings" if more_open[0] else "> More settings"))
+        if more_open[0]:
+            g5.grid()
+        else:
+            g5.grid_remove()
+    fold.bind("<Button-1>", toggle_more)
+    g5.grid_remove()
+
+    # ---- what shows and what is greyed
+    def sync(*_):
+        mode = MAKE.get(v_make.get(), "pdf")
+        for m, widgets in only.items():
+            for w in widgets:
+                (w.grid if m == mode else w.grid_remove)()
+        w_strength.configure(state="normal" if v_faces.get() else "disabled")
+        auto_name = NAME.get(v_name.get()) == "auto"
+        for e in w_name_text.winfo_children():
+            e.configure(state="disabled" if auto_name else "normal")
+        for e in w_save_to.winfo_children():
+            e.configure(state="normal" if SAVE.get(v_save.get()) else "disabled")
+    for var in (v_make, v_faces, v_name, v_save):
+        var.trace_add("write", sync)
+    sync()
+
+    # ---- buttons + log
     btns = ttk.Frame(right)
     btns.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-    b_start = ttk.Button(btns, text="Start")
-    b_stop = ttk.Button(btns, text="Stop after this image", state="disabled")
-    b_copy = ttk.Button(btns, text="Copy log")
-    b_open = ttk.Button(btns, text="Open folder")
-    for b in (b_start, b_stop, b_copy, b_open):
+    b_prev = ttk.Button(btns, text="Run with preview")
+    b_run = ttk.Button(btns, text="Run")
+    b_stop = ttk.Button(btns, text="Stop", state="disabled")
+    for b, k in ((b_prev, "run_preview"), (b_run, "run")):
         b.pack(side="left", padx=(0, 6))
-
+        tip(b, k)
+    b_stop.pack(side="left", padx=(0, 6))
     log_text = tk.Text(right, wrap="none", font=mono, height=20, undo=False)
     ysb = ttk.Scrollbar(right, orient="vertical", command=log_text.yview)
     xsb = ttk.Scrollbar(right, orient="horizontal", command=log_text.xview)
@@ -1291,6 +1521,12 @@ def launch_gui():
     log_text.grid(row=1, column=0, sticky="nsew")
     ysb.grid(row=1, column=1, sticky="ns")
     xsb.grid(row=2, column=0, sticky="ew")
+    foot = ttk.Frame(right)
+    foot.grid(row=3, column=0, sticky="w", pady=(6, 0))
+    b_copy = ttk.Button(foot, text="Copy log")
+    b_open = ttk.Button(foot, text="Open output folder")
+    for b in (b_copy, b_open):
+        b.pack(side="left", padx=(0, 6))
 
     def block_typing(e):
         if (e.state & 0x4) and e.keysym.lower() in ("c", "a"):
@@ -1302,23 +1538,14 @@ def launch_gui():
     log_text.bind("<Control-a>", lambda e: (log_text.tag_add("sel", "1.0", "end"), "break")[1])
 
     q = queue.Queue()
-    state = {"stop": False, "thread": None, "last_pdf": None}
+    state = {"stop": False, "last_out": None}
 
     def append(msg):
         log_text.insert("end", msg + "\n")
         log_text.see("end")
 
-    append("Choose a folder and settings on the left, then press Start.\n"
+    append("Add folders or pictures on the left, choose what to do with them, then press Run.\n"
            "The log here can be selected and copied (Ctrl+C), or press 'Copy log'.")
-
-    def count_found(*_):
-        try:
-            n = len(list_images(v_folder.get()))
-            v_found.set(f"   {n} images found in this folder")
-        except Exception:  # noqa: BLE001
-            v_found.set("   folder not found")
-    v_folder.trace_add("write", count_found)
-    count_found()
 
     def gather():
         def num(var, name, cast=int):
@@ -1327,12 +1554,19 @@ def launch_gui():
             except ValueError:
                 raise ValueError(f"'{name}' must be a number") from None
         ob = Options()
-        ob.folder = v_folder.get().strip().strip('"')
-        ob.count = 0 if v_mode.get() == "All images" else max(1, num(v_count, "How many images"))
-        ob.pick = "spread" if v_pick.get().startswith("spread") else "first"
-        ob.repeat_last = bool(v_repeat.get())
+        ob.inputs = list(inputs)
+        ob.mode = MAKE[v_make.get()]
+        ob.kind = KIND[v_kind.get()]
+        ob.up_model = MODEL.get(v_model.get(), "auto")
+        ob.scale = int(v_scale.get()[0])
+        ob.faces = bool(v_faces.get())
+        ob.face_strength = min(100, max(0, num(v_strength, "Face strength")))
+        ob.name_mode = NAME[v_name.get()]
+        ob.name_text = v_name_text.get().strip()
+        ob.file_type = v_type.get().lower()
+        ob.save_to = v_save_to.get().strip().strip('"') if SAVE[v_save.get()] else ""
+        ob.fit = FIT[v_fit.get()]
         ob.margin_mm = max(0.0, num(v_margin, "Page margin", float))
-        ob.fit = "whole" if v_fit.get().startswith("Whole") else "fill"
         ob.dpi = max(72, num(v_dpi, "Print resolution"))
         ob.autocrop = bool(v_crop.get())
         ob.thicken = min(100, max(0, num(v_thick, "Strengthen thin lines")))
@@ -1340,36 +1574,42 @@ def launch_gui():
         ob.keep_color = bool(v_color.get())
         ob.color_boost = min(100, max(0, num(v_boost, "Colour boost")))
         ob.use_ai = bool(v_ai.get())
-        ob.color_model = "general" if v_model.get().startswith("General") else "anime"
+        ob.color_model = COLOR_MODEL[v_color_model.get()]
         ob.redo = bool(v_redo.get())
         ob.open_when_done = bool(v_open.get())
         return ob
 
-    def worker(opts):
-        pdf = None
+    def worker(opts, preview):
+        out = None
         try:
-            pdf = run(opts, lambda m: q.put(("log", m)), lambda: state["stop"])
+            if preview:
+                items = make_preview(opts, lambda m: q.put(("log", m)), 4, lambda: state["stop"])
+                q.put(("preview", (items, opts)))
+            else:
+                out = run(opts, lambda m: q.put(("log", m)), lambda: state["stop"])
         except Exception:  # noqa: BLE001
             q.put(("log", "UNEXPECTED ERROR:\n" + traceback.format_exc()))
-        q.put(("done", str(pdf) if pdf else None))
+        q.put(("done", str(out) if out else None))
 
-    def start():
+    def start_run(opts, preview=False):
+        log_text.delete("1.0", "end")
+        state["stop"] = False
+        for b in (b_prev, b_run):
+            b.configure(state="disabled")
+        b_stop.configure(state="normal")
+        threading.Thread(target=worker, args=(opts, preview), daemon=True).start()
+
+    def begin(preview):
         try:
             opts = gather()
         except ValueError as e:
             messagebox.showerror("Check the settings", str(e))
             return
-        if not Path(opts.folder).is_dir():
-            messagebox.showerror("Folder not found", f"Cannot find:\n{opts.folder}\n\nIs the drive connected?")
+        if not opts.inputs:
+            messagebox.showerror("No images", "Add a folder or some pictures first.")
             return
         save_settings(opts)
-        log_text.delete("1.0", "end")
-        state["stop"] = False
-        b_start.configure(state="disabled")
-        b_stop.configure(state="normal")
-        t = threading.Thread(target=worker, args=(opts,), daemon=True)
-        state["thread"] = t
-        t.start()
+        start_run(opts, preview)
 
     def stop():
         state["stop"] = True
@@ -1381,13 +1621,99 @@ def launch_gui():
         root.clipboard_append(log_text.get("1.0", "end-1c"))
         append("(log copied to clipboard)")
 
-    def open_folder():
-        d = v_folder.get().strip().strip('"')
-        try:
-            if hasattr(os, "startfile"):
-                os.startfile(d)  # noqa: S606
-        except Exception as e:  # noqa: BLE001
-            append(f"Could not open folder: {e}")
+    def open_path(p):
+        if hasattr(os, "startfile"):
+            try:
+                os.startfile(str(p))  # noqa: S606
+            except Exception as e:  # noqa: BLE001
+                append(f"Could not open {p}: {e}")
+        else:
+            append(f"Output: {p}")
+
+    def open_output():
+        if state["last_out"]:
+            p = Path(state["last_out"])
+            open_path(p if p.is_dir() else p.parent)
+        else:
+            try:
+                open_path(output_dir(gather()))
+            except ValueError as e:
+                append(str(e))
+
+    # ---- the preview window
+    def show_preview(items, opts):
+        if not items:
+            append("Nothing to show in the preview.")
+            return
+        win = tk.Toplevel(root)
+        win.title("Preview")
+        win.geometry("1120x780")
+        win.transient(root)
+        holder = ttk.Frame(win)
+        holder.pack(fill="both", expand=True, padx=10, pady=10)
+        keep = []     # the pictures shown must stay referenced or they vanish
+
+        def pic(parent, im, box, text):
+            t = im.copy().convert("RGB")
+            t.thumbnail(box)
+            p = ImageTk.PhotoImage(t)
+            keep.append(p)
+            f = ttk.Frame(parent)
+            lab = ttk.Label(f, image=p)
+            lab.pack()
+            ttk.Label(f, text=text, font=small).pack()
+            return f
+
+        def clear():
+            for w in holder.winfo_children():
+                w.destroy()
+            keep.clear()
+
+        def show_grid():
+            clear()
+            holder.columnconfigure((0, 1), weight=1, uniform="c")
+            for i, it in enumerate(items):
+                cell = ttk.Frame(holder, relief="groove", padding=6, cursor="hand2")
+                cell.grid(row=i // 2, column=i % 2, sticky="nsew", padx=4, pady=4)
+                pics = ttk.Frame(cell)
+                pics.pack()
+                pic(pics, it["original"], (240, 270), "Original").pack(side="left", padx=4)
+                pic(pics, it["result"], (240, 270), "Result").pack(side="left", padx=4)
+                ttk.Label(cell, text=f"{it['name']}   {it['kind']}   {it['method']}", font=small,
+                          wraplength=500).pack()
+                todo = [cell]
+                while todo:      # a click anywhere in the pair opens it
+                    w = todo.pop()
+                    w.bind("<Button-1>", lambda e, it=it: show_big(it))
+                    todo += w.winfo_children()
+            win_hint.configure(text="Click a pair to see it big.")
+
+        def show_big(it):
+            clear()
+            holder.columnconfigure((0, 1), weight=1, uniform="c")
+            ttk.Label(holder, text=f"{it['name']}   {it['kind']}   {it['method']}", font=small).grid(
+                row=0, column=0, columnspan=2, sticky="w")
+            ow, oh = it["original"].size
+            rw, rh = it["result"].size
+            pic(holder, it["original"], (530, 330), f"Original ({ow}x{oh})").grid(row=1, column=0, pady=4)
+            pic(holder, it["result"], (530, 330), f"Result ({rw}x{rh})").grid(row=1, column=1, pady=4)
+            pic(holder, it["detail_original"], (530, 280), "Close-up: original, plain enlargement").grid(
+                row=2, column=0, pady=4)
+            pic(holder, it["detail_result"], (530, 280), "Close-up: result, same spot").grid(row=2, column=1, pady=4)
+            ttk.Button(holder, text="Back to all", command=show_grid).grid(row=3, column=0, sticky="w", pady=4)
+            win_hint.configure(text="")
+
+        def go_on():
+            win.destroy()
+            start_run(opts)
+        bar2 = ttk.Frame(win)
+        bar2.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bar2, text="Go on with all", command=go_on).pack(side="left", padx=(0, 6))
+        ttk.Button(bar2, text="Change settings", command=win.destroy).pack(side="left")
+        win_hint = ttk.Label(bar2, text="", font=small)
+        win_hint.pack(side="right")
+        show_grid()
+        return SimpleNamespace(win=win, items=items, show_big=show_big, show_grid=show_grid, go_on=go_on)
 
     def poll():
         try:
@@ -1395,26 +1721,38 @@ def launch_gui():
                 kind, payload = q.get_nowait()
                 if kind == "log":
                     append(payload)
+                elif kind == "preview":
+                    state["preview"] = show_preview(*payload)
                 else:
-                    b_start.configure(state="normal")
+                    for b in (b_prev, b_run):
+                        b.configure(state="normal")
                     b_stop.configure(state="disabled")
+                    refresh_list()
                     if payload:
-                        state["last_pdf"] = payload
-                        if v_open.get() and hasattr(os, "startfile"):
-                            try:
-                                os.startfile(payload)  # noqa: S606
-                            except Exception as e:  # noqa: BLE001
-                                append(f"Could not open PDF: {e}")
+                        state["last_out"] = payload
+                        if v_open.get():
+                            open_path(payload)
         except queue.Empty:
             pass
         root.after(120, poll)
 
-    b_start.configure(command=start)
+    b_prev.configure(command=lambda: begin(True))
+    b_run.configure(command=lambda: begin(False))
     b_stop.configure(command=stop)
     b_copy.configure(command=copy_log)
-    b_open.configure(command=open_folder)
+    b_open.configure(command=open_output)
+    refresh_list()
     root.after(120, poll)
-    root.mainloop()
+    return SimpleNamespace(root=root, gather=gather, add_paths=add_paths, remove_selected=remove_selected,
+                           clear_list=clear_list, last_run_images=last_run_images, inputs=inputs, listbox=lb,
+                           count_text=v_count, vars=SimpleNamespace(make=v_make, save=v_save, save_to=v_save_to,
+                                                                    name=v_name, faces=v_faces, ai=v_ai),
+                           begin=begin, state=state, log_text=log_text, help_text=v_help, sync=sync,
+                           toggle_more=toggle_more, dnd=dnd, left=left)
+
+
+def launch_gui():
+    build_window().root.mainloop()
 
 
 # ====================================================================== CLI
@@ -1422,14 +1760,20 @@ def main():
     if len(sys.argv) == 1:
         launch_gui()
         return
-    ap = argparse.ArgumentParser(description="BlurNoMore: pictures -> sharp A4 tracing PDF, or bigger AI-restored copies "
+    ap = argparse.ArgumentParser(description="BlurNoMore: bigger AI-restored copies of pictures, or a sharp A4 tracing PDF "
                                              "(no arguments = open the window)")
-    ap.add_argument("folder", help="folder with the pictures (never changed)")
+    ap.add_argument("inputs", nargs="*", help="folders (all pictures directly in them) and/or picture files (never changed)")
     ap.add_argument("--mode", choices=["pdf", "upscale"], default="pdf",
-                    help="pdf = Tracing PDF (default), upscale = Upscale images")
+                    help="pdf = Tracing PDF (default), upscale = Bigger images")
     ap.add_argument("--save-to", default="", metavar="FOLDER",
-                    help="where the PDF / upscaled folder and _blurnomore_work go (default: the images folder)")
+                    help="where the PDF / upscaled folder and _blurnomore_work go (default: the folder of the first input)")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
+    ap.add_argument("--kind", choices=["auto", "drawing", "photo"], default="auto",
+                    help="upscale mode: auto = detect for each image (default), or say they are all drawings or photos")
+    ap.add_argument("--name-suffix", default="", metavar="TEXT",
+                    help="upscale mode: name the files <name>TEXT instead of <name>_x2")
+    ap.add_argument("--name-prefix", default="", metavar="TEXT",
+                    help="upscale mode: name the files TEXT<name> instead of <name>_x2")
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
                     help="upscale mode: auto (default), general, anime, dat (Web photo model), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
@@ -1439,9 +1783,7 @@ def main():
                     help="upscale mode: 0-100, how much of the restored face is used (default 50)")
     ap.add_argument("--preview", action="store_true",
                     help="make picture sheets for up to 4 images (original, result, close-ups) and stop")
-    ap.add_argument("--count", type=int, default=0, help="number of images, 0 = all")
-    ap.add_argument("--pick", choices=["spread", "first"], default="spread")
-    ap.add_argument("--same", action="store_true", help="repeat the images used in the last run")
+    ap.add_argument("--same", action="store_true", help="use the images of the last run (blurnomore_last_run.json) instead of the inputs")
     ap.add_argument("--margin", type=float, default=10.0)
     ap.add_argument("--fill", action="store_true", help="fill the page (trims edges) instead of fitting the whole picture")
     ap.add_argument("--dpi", type=int, default=300)
@@ -1454,11 +1796,16 @@ def main():
     ap.add_argument("--model", choices=["general", "anime"], default="general")
     ap.add_argument("--redo", action="store_true")
     a = ap.parse_args()
-    o = Options(folder=a.folder, count=a.count, pick=a.pick, repeat_last=a.same, fit="fill" if a.fill else "whole", margin_mm=a.margin, dpi=a.dpi,
+    if not a.inputs and not a.same:
+        ap.error("give at least one folder or picture (or --same)")
+    if a.name_suffix and a.name_prefix:
+        ap.error("use --name-suffix or --name-prefix, not both")
+    o = Options(inputs=a.inputs, repeat_last=a.same, fit="fill" if a.fill else "whole", margin_mm=a.margin, dpi=a.dpi,
                 autocrop=not a.no_crop, thicken=a.thicken, fade=a.fade, keep_color=not a.grey,
                 color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
                 mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format,
-                faces=a.faces, face_strength=min(100, max(0, a.face_strength)))
+                kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
+                name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)))
     if a.preview:
         items = make_preview(o, print)
         if not items:

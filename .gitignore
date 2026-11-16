@@ -6,3 +6,4 @@ _tracing_work/
 realesrgan/
 models/
 BlurNoMore_A4_*.pdf
+blurnomore_last_run.json

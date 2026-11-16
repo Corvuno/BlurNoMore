@@ -12,9 +12,11 @@ if not exist "%~dp0blurnomore.py" goto noscript
 echo Checking Python packages (first time takes a minute)...
 %PY% -m pip install --quiet --disable-pip-version-check pillow numpy img2pdf
 if errorlevel 1 goto piperr
-rem Optional: the Web photo model (DAT) and face restoration. If this fails the program still starts.
+rem Optional: the Web photo model (DAT) and face restoration, then drag and drop. If these fail the program still starts.
 %PY% -m pip install --quiet --disable-pip-version-check onnxruntime-directml opencv-python-headless
 if errorlevel 1 echo Note: the optional packages onnxruntime-directml and opencv-python-headless were not installed. The Web photo model and face restoration are off; everything else works.
+%PY% -m pip install --quiet --disable-pip-version-check tkinterdnd2
+if errorlevel 1 echo Note: the optional package tkinterdnd2 was not installed. Drag and drop onto the list is off; use the buttons.
 
 echo Opening BlurNoMore...
 %PY% "%~dp0blurnomore.py"
