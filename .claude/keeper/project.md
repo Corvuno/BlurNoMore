@@ -29,4 +29,4 @@ of that file.
 ## The backlog
 
 GitHub issues on Corvuno/BlurNoMore, with the labels `Refine`, `Next`, `Building now` and
-`Parked`. Empty so far.
+`Parked`.
