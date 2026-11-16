@@ -1,0 +1,20 @@
+name: Checks
+
+# Compiles the program and makes a PDF from three made-up drawings without the AI step.
+# Its last run on main is shown at the start of every Keeper session.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet pillow numpy img2pdf
+      - run: python -m py_compile blurnomore.py tests/smoke.py
+      - run: python tests/smoke.py

@@ -1,0 +1,13 @@
+462 CLAUDE.md
+8966 .claude/skills/keeper/SKILL.md
+1748 .claude/skills/keeper/design.md
+2631 .claude/skills/keeper/owner.md
+3298 .claude/skills/keeper/workshop.md
+2097 .claude/keeper/build-rules.md
+1528 .claude/keeper/project.md
+1266 .claude/keeper/state.md
+96 .claude/keeper/upkeep.md
+749 .claude/keeper/vision.md
+1758 .claude/agents/builder.md
+1507 .claude/agents/checker.md
+1498 .claude/agents/searcher.md
