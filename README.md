@@ -57,7 +57,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 |---|---|---|
 | Kind (`--kind`) | Detect for each image | Bigger images. `auto` looks at each picture; `drawing` or `photo` says they are all the same kind |
 | Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `dat`, or the name of an extra model |
-| Use AI upscaler (`--no-ai` turns it off) | on | Tracing PDF (shown in the window). Off = plain resizing, faster but blurrier. The command line applies it to both outputs |
+| Use AI upscaler (`--no-ai` turns it off) | on | Both outputs. Off = plain resizing, faster but blurrier |
 | AI model for coloured art (`--model`) | General | Tracing PDF. General, or Anime |
 
 **Options**

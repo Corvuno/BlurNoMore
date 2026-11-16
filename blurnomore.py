@@ -267,7 +267,11 @@ def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4):
     img.save(tin)
     cmd = [str(exe), "-i", str(tin), "-o", str(tout), "-n", model,
            "-s", str(native), "-m", str(model_dir or exe.parent / "models"), "-f", "png"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:                      # the program is there but cannot start
+        log(f"  Real-ESRGAN could not start: {e}")
+        return None
     if r.returncode != 0 or not tout.exists():
         log("  Real-ESRGAN failed. Output:")
         log("  " + (r.stderr or r.stdout or "(no output)")[-600:].strip().replace("\n", "\n  "))
@@ -890,7 +894,7 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
         L(m)
     numbered = list(enumerate(files, 1))
     try:
-        LAST_RUN_FILE.write_text(json.dumps([str(p) for p in files], indent=1), encoding="utf-8")
+        LAST_RUN_FILE.write_text(json.dumps([str(Path(p).resolve()) for p in files], indent=1), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
     L(f"{len(numbered)} images. Saving in {out}\n")
@@ -1334,7 +1338,7 @@ def build_window():
         return build
 
     # ---- 1. Images
-    inputs, found = list(o.inputs), {}
+    inputs = list(o.inputs)
     g1 = group("1. Images")
     g1.columnconfigure(0, weight=1)
     bar = ttk.Frame(g1)
@@ -1376,20 +1380,23 @@ def build_window():
 
     def refresh_list():
         lb.delete(0, "end")
-        total = 0
+        seen = set()                          # a picture counted once, even if its folder is in the list too
         for p in inputs:
             if os.path.isdir(p):
-                if p not in found:
-                    try:
-                        found[p] = len(list_images(p))
-                    except OSError:
-                        found[p] = 0
-                total += found[p]
-                lb.insert("end", f"{shorten(p)}  (whole folder, {found[p]})")
-            else:
-                total += 1
+                try:
+                    pics = [str(f.resolve()) for f in list_images(p)]
+                except OSError:
+                    pics = []
+                seen.update(pics)
+                lb.insert("end", f"{shorten(p)}  (whole folder, {len(pics)})")
+            elif os.path.isfile(p):
+                seen.add(str(Path(p).resolve()))
                 lb.insert("end", Path(p).name)
-        v_count.set(f"{total} images" if inputs else "No images yet: add a folder or some pictures.")
+            else:
+                lb.insert("end", f"{shorten(p)}  (not found)")
+        n = len(seen)
+        v_count.set((f"{n} image" if n == 1 else f"{n} images") if inputs
+                    else "No images yet: add a folder or some pictures.")
         b_last.configure(state="normal" if read_last_run() else "disabled")
 
     def add_folder():
