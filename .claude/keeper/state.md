@@ -26,10 +26,17 @@ without AI on the work branch. Part B (the window, the preview window) waits on 
 
 ## Open with the owner
 
-- Faces: a face model redraws faces, which clashes with "restored, never redrawn". Off-by-default
-  switch, automatic, or leave out? (asked 2026-11-16)
-- Preview flow: a separate Preview button with "Run all", or Start always previews first?
-- The window sketch: https://claude.ai/artifact/LVvzcW2r57g5V46xfax8rY (not chosen yet).
+Settled 2026-11-16: faces are opt-in with a strength control; two buttons, "Run with preview"
+and "Run"; one flow instead of two modes (add folder or files, with drag and drop; kind: detect
+or choose; model: automatic or pick one; options; output: bigger images or a tracing PDF; name
+suffix/prefix, automatic by default). The owner wants the DAT model, and other models only if
+they are brilliant. Candidate: 4xRealWebPhoto_v4 DAT2 (ONNX, CC-BY-4.0) via onnxruntime, which
+also runs GFPGAN for faces.
+
+Asked 2026-11-16, round 2 sketch https://claude.ai/artifact/W5cm9V3C2isaXjhtJzWGBV :
+- Images and a PDF in one run, or one or the other?
+- Which graphics card (decides whether DAT is the automatic choice for photos)?
+- Drop "How many images" and "Same images as last run" now the list and preview do that job?
 
 ## Noticed, not yet raised or settled
 
