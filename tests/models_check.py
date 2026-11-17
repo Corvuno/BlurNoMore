@@ -1,4 +1,4 @@
-"""Model check: downloads the real DAT, YuNet and GFPGAN models (about 390 MB, into models/ next
+"""Model check: downloads the real DAT, AnimeSharp, HAT-GAN, YuNet, GFPGAN and CodeFormer models (about 960 MB, into models/ next
 to the program) and runs them on made-up pictures, on the CPU. Run by the "Models" workflow, not
 by the normal Checks.   python tests/models_check.py   (needs pillow, numpy, img2pdf, onnxruntime,
 opencv-python-headless). Exits non-zero on failure."""
@@ -45,6 +45,19 @@ def main():
         with Image.open(only_file(out / "dat")) as r:
             assert r.size == (320, 240), f"DAT result is {r.size}, expected 320x240"
 
+        # AnimeSharp (2x model, runs twice for 4x) and HAT-GAN (4x model, 2x result)
+        keep = ROOT / "models_check_output"
+        keep.mkdir(exist_ok=True)
+        log = run_py(d, "--mode", "upscale", "--upscale-model", "animesharp", "--scale", "4", "--save-to", out / "sharp")
+        assert "AI animesharp" in log, "the AnimeSharp model was not used"
+        with Image.open(only_file(out / "sharp")) as r:
+            assert r.size == (640, 480), f"AnimeSharp result is {r.size}, expected 640x480"
+        only_file(out / "sharp").replace(keep / "animesharp_x4.png")
+        log = run_py(d, "--mode", "upscale", "--upscale-model", "hatgan", "--scale", "2", "--save-to", out / "hat")
+        assert "AI hatgan" in log, "the HAT-GAN model was not used"
+        with Image.open(only_file(out / "hat")) as r:
+            assert r.size == (320, 240), f"HAT-GAN result is {r.size}, expected 320x240"
+
         # faces: the made-up picture probably has none; the pipeline must still run and say so
         log = run_py(d, "--mode", "upscale", "--no-ai", "--faces", "--scale", "2", "--save-to", out / "faces")
         assert "faces restored" in log or "face restored" in log, "the log does not say how many faces were restored"
@@ -61,18 +74,22 @@ def main():
         import re
         m = re.search(r"(\d+) faces? restored", log)
         assert m and int(m.group(1)) >= 1, "no face was found and restored in the sample photo"
-        keep = ROOT / "models_check_output"
-        keep.mkdir(exist_ok=True)
         only_file(out / "realface").replace(keep / "face_restored_x2.png")
         Image.open(faces_in / "face.jpg").save(keep / "face_original.png")
+        log = run_py(faces_in, "--mode", "upscale", "--no-ai", "--faces", "--face-model", "codeformer",
+                     "--face-strength", "70", "--scale", "2", "--save-to", out / "codeformer")
+        m = re.search(r"(\d+) faces? restored", log)
+        assert m and int(m.group(1)) >= 1, "CodeFormer: no face was found and restored in the sample photo"
+        only_file(out / "codeformer").replace(keep / "face_codeformer_x2.png")
 
         # the face restorer itself: download, start, one 512x512 forward pass
         import blurnomore as b
         c = b.Context(b.Options(inputs=[str(d)], save_to=str(out / "ctx"), mode="upscale"), print, out / "ctx")
-        sess = b.load_gfpgan(c)
-        assert sess is not None, "GFPGAN could not be loaded"
-        y = sess.run(None, {sess.get_inputs()[0].name: np.zeros((1, 3, 512, 512), np.float32)})[0]
-        assert y.shape == (1, 3, 512, 512), f"GFPGAN gave {y.shape}"
+        for name in ("gfpgan", "codeformer"):
+            sess = b.load_face(c, name)
+            assert sess is not None, f"{name} could not be loaded"
+            y = sess.run(None, b.face_inputs(sess, np.zeros((1, 3, 512, 512), np.float32)))[0]
+            assert y.shape == (1, 3, 512, 512), f"{name} gave {y.shape}"
         print("Model check passed.")
 
 

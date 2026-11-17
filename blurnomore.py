@@ -62,7 +62,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.0"
+VERSION = "4.1"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -78,18 +78,32 @@ ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once, next to the program
 MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pairs
 BIG_RESULT_PIXELS = 100_000_000
 INSTALL_HINT = "Install onnxruntime-directml (and opencv-python-headless for faces) with pip"
-# DAT "Web photo" model by Philip Hofmann (CC-BY-4.0), run through onnxruntime
-DAT_FILE = "4xRealWebPhoto_v4_fp32_opset17.onnx"
-DAT_URL = "https://huggingface.co/Phips/4xRealWebPhoto_v4_dat2/resolve/main/" + DAT_FILE
-# Face restoration: GFPGAN 1.4 (restores) and OpenCV's YuNet (finds faces and their 5 landmarks)
-GFPGAN_FILE = "gfpgan_1.4.onnx"
-GFPGAN_URL = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/" + GFPGAN_FILE
+FACEFUSION = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/"
+# The downloadable ONNX upscalers, run through onnxruntime. key -> file, where from, download size,
+# native enlargement, who made it (and the licence), and whether a 3x/4x result runs it twice.
+UPSCALERS = {
+    "dat": dict(file="4xRealWebPhoto_v4_fp32_opset17.onnx", size="49 MB", native=4, twice=False,
+                url="https://huggingface.co/Phips/4xRealWebPhoto_v4_dat2/resolve/main/4xRealWebPhoto_v4_fp32_opset17.onnx",
+                credit="4xRealWebPhoto_v4 (DAT) by Philip Hofmann, CC-BY-4.0"),
+    "animesharp": dict(file="2x-AnimeSharpV4_RCAN_fp16_op17.onnx", size="31 MB", native=2, twice=True,
+                       url="https://huggingface.co/Kim2091/2x-AnimeSharpV4/resolve/main/2x-AnimeSharpV4_RCAN_fp16_op17.onnx",
+                       credit="2x-AnimeSharpV4 by Kim2091, CC BY-NC-SA 4.0 (personal use)"),
+    "hatgan": dict(file="real_hatgan_x4.onnx", size="160 MB", native=4, twice=False,
+                   url=FACEFUSION + "real_hatgan_x4.onnx",
+                   credit="Real-HAT-GAN (HAT, XPixel), ONNX by FaceFusion"),
+}
+# Face restoration: GFPGAN 1.4 or CodeFormer (restore), and OpenCV's YuNet (finds faces and their 5 landmarks)
+FACE_MODELS = {
+    "gfpgan": dict(file="gfpgan_1.4.onnx", size="340 MB", url=FACEFUSION + "gfpgan_1.4.onnx"),
+    "codeformer": dict(file="codeformer.onnx", size="377 MB", url=FACEFUSION + "codeformer.onnx"),
+}
+CODEFORMER_WEIGHT = 0.6   # CodeFormer's second input: 0 = most repair, 1 = most faithful
 YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/" + YUNET_FILE
 FACE_TEMPLATE = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
                           [201.26117, 371.41043], [313.08905, 371.15118]], dtype=np.float32)  # 512x512 FFHQ
 # model files the program uses itself: they are not offered as extra models
-OWN_MODELS = {DAT_FILE[:-5], GFPGAN_FILE[:-5], YUNET_FILE[:-5]}
+OWN_MODELS = {m["file"][:-5] for m in (*UPSCALERS.values(), *FACE_MODELS.values())} | {YUNET_FILE[:-5]}
 
 
 # ===================================================================== options
@@ -112,12 +126,13 @@ class Options:
     save_to: str = ""            # where results and _blurnomore_work go; empty = the folder of the first input
     scale: int = 2               # upscale mode: 2, 3 or 4 times bigger
     kind: str = "auto"           # upscale mode: "auto" (detect per image), "drawing" or "photo"
-    up_model: str = "auto"       # upscale mode: "auto", "general", "anime", "dat" or an extra model's name
+    up_model: str = "auto"       # upscale mode: "auto", "general", "anime", a key of UPSCALERS or an extra model's name
     name_mode: str = "auto"      # upscale mode: file name "auto" (<name>_x2), "suffix" or "prefix"
     name_text: str = ""          # the suffix or prefix text (empty = auto)
     file_type: str = "png"       # upscale mode: "png" or "jpg"
-    faces: bool = False          # upscale mode: restore faces (GFPGAN)
+    faces: bool = False          # upscale mode: restore faces
     face_strength: int = 50      # 0-100, how much of the restored face is used
+    face_model: str = "gfpgan"   # "gfpgan" (natural) or "codeformer" (strongest repair)
     open_when_done: bool = True  # GUI only
 
 
@@ -286,9 +301,15 @@ class OnnxModel:
     """An upscaling model run with onnxruntime. tile is the fixed tile side of a model that has a
     fixed input size, else None."""
 
-    def __init__(self, sess, native, tile=None):
-        self.sess, self.native, self.tile = sess, native, tile
+    def __init__(self, sess, native, tile=None, twice=False):
+        self.sess, self.native, self.tile, self.twice = sess, native, tile, twice
         self.input = sess.get_inputs()[0].name
+        self.half = "float16" in sess.get_inputs()[0].type   # a model may want float16 instead of float32
+
+    def run(self, t):
+        """One forward pass of a float32 NCHW array; the answer is float32 whatever the model uses."""
+        r = self.sess.run(None, {self.input: np.ascontiguousarray(t, np.float16 if self.half else np.float32)})[0]
+        return r.astype(np.float32, copy=False)
 
 
 def fetch_model(c, name, url, size):
@@ -351,38 +372,38 @@ def run_tiles(model, im, tile=256, over=16):
     for j in range(ny):
         for i in range(nx):
             t = a[j * step:j * step + tile, i * step:i * step + tile].transpose(2, 0, 1)[None]
-            r = model.sess.run(None, {model.input: np.ascontiguousarray(t)})[0][0][:, keep, keep]
+            r = model.run(t)[0][:, keep, keep]
             out[j * step * n:(j + 1) * step * n, i * step * n:(i + 1) * step * n] = (
                 np.clip(r.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
     return Image.fromarray(out[:H * n, :W * n], "RGB")
 
 
 def load_onnx(c, name):
-    """The ONNX model 'dat' or an extra model's name, ready to run; None (after saying why) when not."""
+    """A downloadable model (a key of UPSCALERS) or an extra model's name, ready to run; None (after
+    saying why) when not."""
     if name in c.models:
         return c.models[name]
     c.models[name] = None
-    what = "the DAT model" if name == "dat" else f"the model '{name}'"
+    info = UPSCALERS.get(name)
+    what = f"the model '{name}'"
     if not HAVE_ORT:
         c.once("no-ort-" + name, f"{INSTALL_HINT} to use {what}; using Real-ESRGAN instead")
         return None
-    path = fetch_model(c, DAT_FILE, DAT_URL, "49 MB") if name == "dat" else MODELS_DIR / f"{name}.onnx"
+    path = fetch_model(c, info["file"], info["url"], info["size"]) if info else MODELS_DIR / f"{name}.onnx"
     if path is None:
         return None
     try:
         sess = make_session(c, path)
         shape = sess.get_inputs()[0].shape
         fixed = shape[2] if len(shape) == 4 and isinstance(shape[2], int) and shape[2] == shape[3] else None
-        model = OnnxModel(sess, 4 if name == "dat" else model_scale(name), fixed)
-        if name == "dat":
-            if not c.gpu():
-                c.L("  The DAT model on the CPU is slow (minutes per photo).")
-        else:   # check the scale in the name by one small tile
-            t = model.tile or 64
-            got = model.sess.run(None, {model.input: np.zeros((1, 3, t, t), np.float32)})[0].shape[2] // t
-            if got != model.native:
-                c.L(f"  Model '{name}': the name says {model.native}x but it enlarges {got}x; using {got}x.")
-                model.native = got
+        model = OnnxModel(sess, info["native"] if info else model_scale(name), fixed, bool(info and info["twice"]))
+        if name == "dat" and not c.gpu():
+            c.L("  The DAT model on the CPU is slow (minutes per photo).")
+        t = model.tile or 64    # check the scale by one small tile
+        got = model.run(np.zeros((1, 3, t, t), np.float32)).shape[2] // t
+        if got != model.native:
+            c.L(f"  Model '{name}': it should enlarge {model.native}x but it enlarges {got}x; using {got}x.")
+            model.native = got
     except Exception as e:  # noqa: BLE001
         c.L(f"  Could not start {what}: {e}")
         return None
@@ -404,17 +425,31 @@ def load_detector(c):
     return c.models["detector"]
 
 
-def load_gfpgan(c):
-    """The GFPGAN face restorer (an onnxruntime session), or None."""
-    if "gfpgan" not in c.models:
-        c.models["gfpgan"] = None
-        path = fetch_model(c, GFPGAN_FILE, GFPGAN_URL, "340 MB")
+def load_face(c, name):
+    """The face restorer 'gfpgan' or 'codeformer' (an onnxruntime session), or None."""
+    key = "face_" + name
+    if key not in c.models:
+        c.models[key] = None
+        info = FACE_MODELS[name]
+        path = fetch_model(c, info["file"], info["url"], info["size"])
         if path:
             try:
-                c.models["gfpgan"] = make_session(c, path)
+                c.models[key] = make_session(c, path)
             except Exception as e:  # noqa: BLE001
                 c.L(f"  Could not start the face restorer: {e}")
-    return c.models["gfpgan"]
+    return c.models[key]
+
+
+def face_inputs(sess, x):
+    """What a face restorer is fed: the face picture, plus CodeFormer's fidelity weight when the
+    model has that second input (found by name, else it is the second input)."""
+    ins = sess.get_inputs()
+    feed = {ins[0].name: np.ascontiguousarray(x)}
+    if len(ins) > 1:
+        w = next((i for i in ins[1:] if "weight" in i.name.lower()), ins[1])
+        dt = np.float64 if "double" in w.type else np.float16 if "float16" in w.type else np.float32
+        feed[w.name] = np.full((1,), CODEFORMER_WEIGHT, dt)
+    return feed
 
 
 def detect_faces(detector, a):
@@ -429,7 +464,7 @@ def detect_faces(detector, a):
 
 
 def restore_faces(c, im):
-    """Find the faces in a PIL image and restore each one with GFPGAN. Returns (image, number);
+    """Find the faces in a PIL image and restore each one with the chosen face model. Returns (image, number);
     the number is None when faces were not looked for (said in the log why)."""
     o = c.o
     if o.face_strength <= 0:
@@ -445,7 +480,7 @@ def restore_faces(c, im):
     found = detect_faces(detector, a)
     if not found:
         return im, 0
-    sess = load_gfpgan(c)
+    sess = load_face(c, o.face_model)
     if sess is None:
         return im, None
     s = min(o.face_strength, 100) / 100.0
@@ -459,7 +494,7 @@ def restore_faces(c, im):
             continue
         face = cv2.warpAffine(a, M, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         x = (face.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)[None]
-        y = sess.run(None, {sess.get_inputs()[0].name: np.ascontiguousarray(x)})[0][0].transpose(1, 2, 0)
+        y = sess.run(None, face_inputs(sess, x))[0][0].transpose(1, 2, 0)
         y = np.clip((y + 1.0) * 127.5, 0, 255).astype(np.float32)
         inv = cv2.invertAffineTransform(M)
         pts = cv2.transform(np.array([[[0, 0], [512, 0], [512, 512], [0, 512]]], np.float32), inv)[0]
@@ -687,7 +722,7 @@ class Context:
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
         self.up_model = o.up_model
-        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", "dat") + tuple(extra_models()):
+        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", *UPSCALERS, *extra_models()):
             L(f"Unknown upscale model '{o.up_model}'; choosing automatically.")
             self.up_model = "auto"
 
@@ -804,10 +839,11 @@ def upscale_model(c, cls):
     ncnn = "anime" if cls in ("lineart", "flatcolor") else "general"
     pick = c.up_model
     if pick == "auto":
-        pick = "dat" if cls == "photo" and c.gpu() else ncnn
-    if pick == "dat":
-        if load_onnx(c, "dat"):
-            return "onnx", "dat", None, 4
+        pick = ("dat" if cls == "photo" else "animesharp") if c.gpu() else ncnn
+    if pick in UPSCALERS:
+        model = load_onnx(c, pick)
+        if model:
+            return "onnx", pick, None, model.native
         pick = ncnn
     if pick in ("anime", "general"):
         if c.exe is None:
@@ -831,7 +867,7 @@ def make_upscaled(c, path, src_id, im, store=False):
     label = m[1] if m else "plain"
 
     def cache_file(name):
-        faces = f"_faces{o.face_strength}" if o.faces else ""
+        faces = f"_faces{o.face_strength}_{o.face_model}" if o.faces else ""
         return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_x{o.scale}{faces}.png"
 
     cache = cache_file(label)
@@ -851,7 +887,10 @@ def make_upscaled(c, path, src_id, im, store=False):
                 c.exe = None
         else:
             try:
-                up = run_tiles(c.models[m[1]], im)
+                model = c.models[m[1]]
+                up = run_tiles(model, im)
+                if model.twice and o.scale > model.native:    # 3x and 4x: a second pass on the result
+                    up = run_tiles(model, up)
             except Exception:  # noqa: BLE001
                 L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
                 L(f"  Using plain resizing instead of '{m[1]}' for the rest of this run.")
@@ -1100,17 +1139,27 @@ HELP = {
     "kind": "What the pictures are. 'Detect for each image' looks at each picture and decides: drawing or line art, "
             "or photo. Choose Drawing or Photo when all your pictures are the same kind and the detection "
             "gets some wrong.",
-    "up_model": "Automatic picks the best model for each picture: drawings use the Drawing model; photos use the "
-                "Web photo model (DAT) when your graphics card can run it, otherwise the General model. "
-                "Web photo DAT is the best for compressed web photos but slow without a graphics card (needs "
-                "onnxruntime-directml). Other models you put in the models folder next to the program "
-                "(NAME.param and NAME.bin, or NAME.onnx) are listed here too.",
+    "up_model": "Automatic picks the best model for each picture. Drawings: AnimeSharp V4 when your graphics card "
+                "can run it, otherwise the Drawing model (Real-ESRGAN anime). Photos: the Web photo model (DAT) when "
+                "your graphics card can run it, otherwise the General model. "
+                "Drawing AnimeSharp V4 (faithful, about 31 MB on first use) follows the lines very closely: the "
+                "right pick for drawings you want to trace; its licence is non-commercial. "
+                "Web photo DAT (about 49 MB) is the best for old, compressed or damaged web photos. "
+                "Clean photo Real-HAT-GAN (sharp, about 160 MB) is the pick for clean, sharp photos where you want "
+                "crisp detail; it is never chosen automatically. DAT and HAT-GAN are slow without a graphics "
+                "card (needs onnxruntime-directml). Other models you put in the models folder next to the program "
+                "(NAME.param and NAME.bin, or NAME.onnx) are listed at the end.",
     "scale": "How many times bigger the pictures become: 2, 3 or 4. A 1000 pixel wide picture becomes 2000, 3000 or "
              "4000 pixels wide. Bigger takes longer and makes bigger files; it cannot bring back detail that "
              "is not there.",
-    "faces": "Finds faces in the enlarged picture and restores them with GFPGAN. Needs onnxruntime-directml and "
-             "opencv-python-headless. The first time it downloads about 340 MB. Off = faces are left as the "
-             "enlargement makes them.",
+    "faces": "Finds faces in the enlarged picture and restores them with the face model you pick below. Needs "
+             "onnxruntime-directml and opencv-python-headless. The first time it downloads the face model (about "
+             "340 MB for GFPGAN, 377 MB for CodeFormer). Off = faces are left as the enlargement makes them. Both "
+             "models redraw the face, which is why this is off by default.",
+    "face_model": "Only when 'Restore faces' is on. Natural (GFPGAN, about 340 MB): keeps the face looking like the "
+                  "photo; a good first pick. Strongest repair (CodeFormer, about 377 MB): rebuilds badly damaged, "
+                  "tiny or very blurry faces most, but can change the face more. Only the model you pick is "
+                  "downloaded, and only when a face is found. Face strength below works the same for both.",
     "face_strength": "Only when 'Restore faces' is on. How much of the restored face is used: 0 = none, 50 = half "
                      "(default), 100 = fully restored. Lower looks more like the original, higher is sharper but "
                      "can look smoother or change the face.",
@@ -1208,8 +1257,11 @@ def build_window():
     # words in the window <-> values in Options
     MAKE = {"Bigger images": "upscale", "Tracing PDF": "pdf"}
     KIND = {"Detect for each image": "auto", "Drawing or line art": "drawing", "Photo": "photo"}
-    MODEL = {"Automatic": "auto", "General photo (Real-ESRGAN)": "general", "Web photo DAT (best, slower)": "dat",
-             "Drawing (Real-ESRGAN anime)": "anime", **{n: n for n in extra_models()}}
+    MODEL = {"Automatic": "auto", "Drawing (Real-ESRGAN anime)": "anime",
+             "Drawing AnimeSharp V4 (faithful)": "animesharp", "General photo (Real-ESRGAN)": "general",
+             "Web photo DAT (best, slower)": "dat", "Clean photo Real-HAT-GAN (sharp)": "hatgan",
+             **{n: n for n in extra_models()}}
+    FACE = {"Natural (GFPGAN)": "gfpgan", "Strongest repair (CodeFormer)": "codeformer"}
     NAME = {"Automatic": "auto", "Text after the name": "suffix", "Text before the name": "prefix"}
     SAVE = {"Next to the images": False, "A folder I choose": True}
     COLOR_MODEL = {"General (recommended)": "general", "Anime": "anime"}
@@ -1225,6 +1277,7 @@ def build_window():
     v_scale = tk.StringVar(value=f"{o.scale}x")
     v_faces = tk.BooleanVar(value=o.faces)
     v_strength = tk.StringVar(value=str(o.face_strength))
+    v_face_model = tk.StringVar(value=word(FACE, o.face_model, "Natural (GFPGAN)"))
     v_name = tk.StringVar(value=word(NAME, o.name_mode, "Automatic"))
     v_name_text = tk.StringVar(value=o.name_text)
     v_type = tk.StringVar(value=o.file_type.upper())
@@ -1444,7 +1497,7 @@ def build_window():
     # ---- 2. What kind of images
     g2 = group("2. What kind of images")
     row(g2, "Kind", combo(v_kind, KIND), "kind", "upscale")
-    row(g2, "Model", combo(v_model, MODEL), "up_model", "upscale")
+    row(g2, "Model", combo(v_model, MODEL, 34), "up_model", "upscale")
     row(g2, "Use AI upscaler", check(v_ai, "on  (needs a GPU)"), "ai")
     row(g2, "Model for coloured art", combo(v_color_model, COLOR_MODEL), "model", "pdf")
 
@@ -1452,6 +1505,7 @@ def build_window():
     g3 = group("3. Options")
     row(g3, "Enlarge", combo(v_scale, ["2x", "3x", "4x"], 8), "scale", "upscale")
     row(g3, "Restore faces", check(v_faces, "on"), "faces", "upscale")
+    w_face_model = row(g3, "Face model", combo(v_face_model, FACE), "face_model", "upscale")
     w_strength = row(g3, "Face strength (0-100)", spin(v_strength, 0, 100, 10), "face_strength", "upscale")
     row(g3, "Crop empty paper", check(v_crop, "on"), "crop", "pdf")
     row(g3, "Strengthen thin lines (0-100)", spin(v_thick, 0, 100, 10), "thicken", "pdf")
@@ -1502,6 +1556,7 @@ def build_window():
             for w in widgets:
                 (w.grid if m == mode else w.grid_remove)()
         w_strength.configure(state="normal" if v_faces.get() else "disabled")
+        w_face_model.configure(state="readonly" if v_faces.get() else "disabled")
         auto_name = NAME.get(v_name.get()) == "auto"
         for e in w_name_text.winfo_children():
             e.configure(state="disabled" if auto_name else "normal")
@@ -1568,6 +1623,7 @@ def build_window():
         ob.scale = int(v_scale.get()[0])
         ob.faces = bool(v_faces.get())
         ob.face_strength = min(100, max(0, num(v_strength, "Face strength")))
+        ob.face_model = FACE[v_face_model.get()]
         ob.name_mode = NAME[v_name.get()]
         ob.name_text = v_name_text.get().strip()
         ob.file_type = v_type.get().lower()
@@ -1782,10 +1838,13 @@ def main():
     ap.add_argument("--name-prefix", default="", metavar="TEXT",
                     help="upscale mode: name the files TEXT<name> instead of <name>_x2")
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
-                    help="upscale mode: auto (default), general, anime, dat (Web photo model), or the name of an extra model "
+                    help="upscale mode: auto (default), general, anime, dat (Web photo model), animesharp (drawings), hatgan "
+                         "(clean photos), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
-    ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces (GFPGAN)")
+    ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces")
+    ap.add_argument("--face-model", choices=list(FACE_MODELS), default="gfpgan",
+                    help="upscale mode: gfpgan (natural, default) or codeformer (strongest repair)")
     ap.add_argument("--face-strength", type=int, default=50, metavar="N",
                     help="upscale mode: 0-100, how much of the restored face is used (default 50)")
     ap.add_argument("--preview", action="store_true",
@@ -1812,7 +1871,8 @@ def main():
                 color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
                 mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format,
                 kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
-                name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)))
+                name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
+                face_model=a.face_model)
     if a.preview:
         items = make_preview(o, print)
         if not items:
