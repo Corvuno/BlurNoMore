@@ -9,18 +9,21 @@ The overview every conversation starts from. One screen; what is no longer true 
   (2x to 4x, named automatically or with your own text) or the A4 tracing PDF. "Run with
   preview" shows 4 images first; "Same images as last run" brings back the last list; "Save to"
   picks where results go.
-- Photos get the DAT web-photo model on the owner's Radeon 7800XT (DirectML); drawings keep
-  Real-ESRGAN. Face restoration (GFPGAN) is opt-in with a strength control.
+- 4.1 (landed 2026-11-17): on the owner's Radeon 7800XT (DirectML), Automatic gives photos DAT
+  and drawings AnimeSharp V4 (personal use only, warned in window and log). By hand: Real-HAT-GAN
+  (clean photos), HEART (new, experimental). Faces opt-in: GFPGAN (natural) or CodeFormer
+  (strongest), with strength. "Colour black-and-white photos" (DDColor) is opt-in. The PDF keeps
+  Real-ESRGAN. The GitHub Models check runs every real model, including two real faces.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
 ## Weak, in the owner's words
 
-No complaint heard yet on 4.0; nothing of it has been run on Windows yet.
+No complaint heard yet on 4.0/4.1; nothing of it has been run on Windows yet.
 
 ## What the owner wants next, in their order
 
-1. Try 4.0 on Windows and say what feels off.
+1. Try 4.1 on Windows and say what feels off.
 
 ## Open with the owner
 
