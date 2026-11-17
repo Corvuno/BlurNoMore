@@ -1,4 +1,4 @@
-"""Model check: downloads the real DAT, AnimeSharp, HAT-GAN, YuNet, GFPGAN and CodeFormer models (about 960 MB, into models/ next
+"""Model check: downloads the real DAT, AnimeSharp, HAT-GAN, HEART, YuNet, GFPGAN, CodeFormer and DDColor models (about 2 GB, into models/ next
 to the program) and runs them on made-up pictures, on the CPU. Run by the "Models" workflow, not
 by the normal Checks.   python tests/models_check.py   (needs pillow, numpy, img2pdf, onnxruntime,
 opencv-python-headless). Exits non-zero on failure."""
@@ -58,6 +58,11 @@ def main():
         with Image.open(only_file(out / "hat")) as r:
             assert r.size == (320, 240), f"HAT-GAN result is {r.size}, expected 320x240"
 
+        log = run_py(d, "--mode", "upscale", "--upscale-model", "heart", "--scale", "2", "--save-to", out / "heart")
+        assert "AI heart" in log, "the HEART model was not used"
+        with Image.open(only_file(out / "heart")) as r:
+            assert r.size == (320, 240), f"HEART result is {r.size}, expected 320x240"
+
         # faces: the made-up picture probably has none; the pipeline must still run and say so
         log = run_py(d, "--mode", "upscale", "--no-ai", "--faces", "--scale", "2", "--save-to", out / "faces")
         assert "faces restored" in log or "face restored" in log, "the log does not say how many faces were restored"
@@ -81,6 +86,21 @@ def main():
         m = re.search(r"(\d+) faces? restored", log)
         assert m and int(m.group(1)) >= 1, "CodeFormer: no face was found and restored in the sample photo"
         only_file(out / "codeformer").replace(keep / "face_codeformer_x2.png")
+
+        # colouring: the same photo made black and white must come out coloured (and the same size)
+        grey_in = Path(t) / "grey"
+        grey_in.mkdir()
+        with Image.open(faces_in / "face.jpg") as g:
+            g.convert("L").convert("RGB").save(grey_in / "grey.png")
+            grey_size = g.size
+        log = run_py(grey_in, "--mode", "upscale", "--no-ai", "--colorize", "--scale", "2", "--save-to", out / "colour")
+        assert "coloured" in log, "the black-and-white photo was not coloured"
+        res = only_file(out / "colour")
+        with Image.open(res) as r:
+            assert r.size == (grey_size[0] * 2, grey_size[1] * 2), f"coloured result is {r.size}"
+            sat = float(np.asarray(r.convert("HSV"))[..., 1].mean())
+        assert sat > 10, f"the coloured result is still grey (mean saturation {sat:.1f} of 255)"
+        res.replace(keep / "coloured_x2.png")
 
         # the face restorer itself: download, start, one 512x512 forward pass
         import blurnomore as b

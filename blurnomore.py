@@ -91,7 +91,16 @@ UPSCALERS = {
     "hatgan": dict(file="real_hatgan_x4.onnx", size="160 MB", native=4, twice=False,
                    url=FACEFUSION + "real_hatgan_x4.onnx",
                    credit="Real-HAT-GAN (HAT, XPixel), ONNX by FaceFusion"),
+    "heart": dict(file="heart_4x_otf_gan_fp32_op17.onnx", size="75 MB", native=4, twice=False,
+                  url="https://huggingface.co/Phips/HEART/resolve/main/onnx/heart_4x_otf_gan_fp32_op17.onnx",
+                  credit="HEART by Philip Hofmann, Apache-2.0"),
 }
+ANIMESHARP_WARNING = ("AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). "
+                      "Don't sell or publish results made with it commercially.")
+# Colouring black-and-white photos: DDColor (ONNX by FaceFusion), downloaded only when a black-and-white photo is met
+COLORIZER = dict(file="ddcolor.onnx", size="980 MB", url=FACEFUSION + "ddcolor.onnx",
+                 credit="DDColor (piddnad), ONNX by FaceFusion, Apache-2.0")
+MONO_COLOR_FRAC = 0.03    # a picture with less colour than this (see classify) is black and white
 # Face restoration: GFPGAN 1.4 or CodeFormer (restore), and OpenCV's YuNet (finds faces and their 5 landmarks)
 FACE_MODELS = {
     "gfpgan": dict(file="gfpgan_1.4.onnx", size="340 MB", url=FACEFUSION + "gfpgan_1.4.onnx"),
@@ -103,7 +112,7 @@ YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection
 FACE_TEMPLATE = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
                           [201.26117, 371.41043], [313.08905, 371.15118]], dtype=np.float32)  # 512x512 FFHQ
 # model files the program uses itself: they are not offered as extra models
-OWN_MODELS = {m["file"][:-5] for m in (*UPSCALERS.values(), *FACE_MODELS.values())} | {YUNET_FILE[:-5]}
+OWN_MODELS = {m["file"][:-5] for m in (*UPSCALERS.values(), *FACE_MODELS.values(), COLORIZER)} | {YUNET_FILE[:-5]}
 
 
 # ===================================================================== options
@@ -133,6 +142,7 @@ class Options:
     faces: bool = False          # upscale mode: restore faces
     face_strength: int = 50      # 0-100, how much of the restored face is used
     face_model: str = "gfpgan"   # "gfpgan" (natural) or "codeformer" (strongest repair)
+    colorize: bool = False       # upscale mode: colour black-and-white photos (invented colours)
     open_when_done: bool = True  # GUI only
 
 
@@ -157,7 +167,7 @@ def classify(im):
     g = np.asarray(small.convert("L"))
     mid_frac = float(((g > 70) & (g < 185)).mean())
     stats = {"color_frac": round(color_frac, 3), "mid_frac": round(mid_frac, 3)}
-    if color_frac < 0.03:  # effectively monochrome
+    if color_frac < MONO_COLOR_FRAC:  # effectively monochrome
         return ("lineart" if mid_frac < 0.12 else "shaded"), stats
     q = np.asarray(small).astype(np.uint32) >> 3
     packed = (q[..., 0] << 10) | (q[..., 1] << 5) | q[..., 2]
@@ -512,6 +522,46 @@ def restore_faces(c, im):
     return Image.fromarray(out, "RGB"), n
 
 
+# ============================================================ colouring
+def load_colorizer(c):
+    """The DDColor session, or None (after saying why). Not tried again after a failure."""
+    if "colorizer" not in c.models:
+        c.models["colorizer"] = None
+        if not (HAVE_ORT and HAVE_CV2):
+            c.once("no-colorize", f"{INSTALL_HINT} to colour black-and-white photos; they are left as they are")
+            return None
+        path = fetch_model(c, COLORIZER["file"], COLORIZER["url"], COLORIZER["size"])
+        if path:
+            try:
+                c.models["colorizer"] = make_session(c, path)
+            except Exception as e:  # noqa: BLE001
+                c.L(f"  Could not start the colouring model: {e}")
+    return c.models["colorizer"]
+
+
+def colorize(c, im):
+    """Colour a black-and-white PIL image with DDColor (the colours are a guess). Returns the coloured
+    image of the same size, or the image itself when the model is not available. As FaceFusion does it,
+    in OpenCV's BGR: the grey picture's lightness goes in, the model's colour channels come out and are
+    put on the picture's own lightness."""
+    sess = load_colorizer(c)
+    if sess is None:
+        return im
+    bgr = np.ascontiguousarray(np.asarray(im.convert("RGB"))[..., ::-1])
+    H, W = bgr.shape[:2]
+    grey = cv2.cvtColor(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2RGB)
+    lab = cv2.cvtColor((grey / 255.0).astype(np.float32), cv2.COLOR_RGB2LAB)[:, :, :1]
+    lab = np.concatenate((lab, np.zeros_like(lab), np.zeros_like(lab)), axis=-1)
+    x = cv2.resize(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), (512, 512)).transpose(2, 0, 1)[None]
+    half = "float16" in sess.get_inputs()[0].type
+    y = sess.run(None, {sess.get_inputs()[0].name: np.ascontiguousarray(x, np.float16 if half else np.float32)})[0]
+    ab = cv2.resize(y[0].astype(np.float32).transpose(1, 2, 0), (W, H))
+    light = cv2.cvtColor((bgr / 255.0).astype(np.float32), cv2.COLOR_BGR2LAB)[:, :, :1]
+    out = cv2.cvtColor(np.concatenate((light, ab), axis=-1), cv2.COLOR_LAB2BGR)
+    out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+    return Image.fromarray(np.ascontiguousarray(out[..., ::-1]), "RGB")
+
+
 # ============================================================ tone & line work
 def strengthen_thin(im, amount, k=7):
     """Darken/widen only dark lines narrower than ~k px; thick lines and fills are left alone."""
@@ -839,10 +889,12 @@ def upscale_model(c, cls):
     ncnn = "anime" if cls in ("lineart", "flatcolor") else "general"
     pick = c.up_model
     if pick == "auto":
-        pick = ("dat" if cls == "photo" else "animesharp") if c.gpu() else ncnn
+        pick = ("animesharp" if cls in ("lineart", "flatcolor") else "dat") if c.gpu() else ncnn
     if pick in UPSCALERS:
         model = load_onnx(c, pick)
         if model:
+            if pick == "animesharp":
+                c.once("animesharp-licence", ANIMESHARP_WARNING)
             return "onnx", pick, None, model.native
         pick = ncnn
     if pick in ("anime", "general"):
@@ -860,24 +912,34 @@ def make_upscaled(c, path, src_id, im, store=False):
     with store=True a new result is kept for the run that follows."""
     o, L = c.o, c.L
     w, h = im.size
-    cls = {"drawing": "lineart", "photo": "photo"}.get(o.kind) or classify(im)[0]
+    auto_cls, stats = classify(im)
+    cls = {"drawing": "lineart", "photo": "photo"}.get(o.kind) or auto_cls
     kind = "drawing" if cls in ("lineart", "flatcolor") else "photo"
+    to_colour = o.colorize and kind == "photo" and stats["color_frac"] < MONO_COLOR_FRAC   # a black-and-white photo
     target = (w * o.scale, h * o.scale)
     m = upscale_model(c, cls)
     label = m[1] if m else "plain"
 
     def cache_file(name):
         faces = f"_faces{o.face_strength}_{o.face_model}" if o.faces else ""
-        return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_x{o.scale}{faces}.png"
+        return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_x{o.scale}{faces}{'_coloured' if o.colorize else ''}.png"
 
     cache = cache_file(label)
     if cache.exists() and not o.redo:
         res = Image.open(cache).convert("RGB")
         res.load()
-        method = f"{label} (cached)" if m else "lanczos (cached)"
+        method = (f"{label} (cached)" if m else "lanczos (cached)") + (" + coloured" if to_colour else "")
         return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label}
     res = None
     method = "lanczos"
+    coloured = False
+    if to_colour:       # first, on the original-size picture
+        try:
+            coloured_im = colorize(c, im)
+            coloured, im = coloured_im is not im, coloured_im
+        except Exception:  # noqa: BLE001
+            L("  Colouring failed; the picture is left black and white:\n  " + traceback.format_exc().replace("\n", "\n  "))
+            c.models["colorizer"] = None
     if m:
         up = None
         if m[0] == "ncnn":
@@ -902,6 +964,8 @@ def make_upscaled(c, path, src_id, im, store=False):
             method = f"AI {m[1]}"
     if res is None:
         res = im.resize(target, Image.LANCZOS)
+    if coloured:
+        method += " + coloured"
     if o.faces:
         res, nf = restore_faces(c, res)
         if nf is not None:
@@ -1143,12 +1207,18 @@ HELP = {
                 "can run it, otherwise the Drawing model (Real-ESRGAN anime). Photos: the Web photo model (DAT) when "
                 "your graphics card can run it, otherwise the General model. "
                 "Drawing AnimeSharp V4 (faithful, about 31 MB on first use) follows the lines very closely: the "
-                "right pick for drawings you want to trace; its licence is non-commercial. "
+                "right pick for drawings you want to trace; it is free for personal use only (licence CC BY-NC-SA 4.0): "
+                "don't sell or publish results made with it commercially. "
                 "Web photo DAT (about 49 MB) is the best for old, compressed or damaged web photos. "
                 "Clean photo Real-HAT-GAN (sharp, about 160 MB) is the pick for clean, sharp photos where you want "
-                "crisp detail; it is never chosen automatically. DAT and HAT-GAN are slow without a graphics "
-                "card (needs onnxruntime-directml). Other models you put in the models folder next to the program "
+                "crisp detail; it is never chosen automatically. "
+                "Photo HEART (new, experimental, about 75 MB) is a brand-new photo model from November 2026, less "
+                "proven than the others; it is only used when you pick it. DAT, HAT-GAN and HEART are slow without "
+                "a graphics card (needs onnxruntime-directml). Other models you put in the models folder next to the program "
                 "(NAME.param and NAME.bin, or NAME.onnx) are listed at the end.",
+    "animesharp_warning": "AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). Don't sell or "
+                          "publish results made with it commercially. Automatic uses it for drawings when your "
+                          "graphics card can run it; pick another model to avoid it.",
     "scale": "How many times bigger the pictures become: 2, 3 or 4. A 1000 pixel wide picture becomes 2000, 3000 or "
              "4000 pixels wide. Bigger takes longer and makes bigger files; it cannot bring back detail that "
              "is not there.",
@@ -1160,6 +1230,10 @@ HELP = {
                   "photo; a good first pick. Strongest repair (CodeFormer, about 377 MB): rebuilds badly damaged, "
                   "tiny or very blurry faces most, but can change the face more. Only the model you pick is "
                   "downloaded, and only when a face is found. Face strength below works the same for both.",
+    "colorize": "Gives black-and-white photos colour with the DDColor model. It invents the colours: they are a "
+                "guess, not the real ones. Only photos that are black and white are touched; colour photos and "
+                "drawings are left alone. The first time it downloads the model (about 980 MB). Off by default "
+                "because it redraws the picture's colours. Done before the enlargement.",
     "face_strength": "Only when 'Restore faces' is on. How much of the restored face is used: 0 = none, 50 = half "
                      "(default), 100 = fully restored. Lower looks more like the original, higher is sharper but "
                      "can look smoother or change the face.",
@@ -1260,6 +1334,7 @@ def build_window():
     MODEL = {"Automatic": "auto", "Drawing (Real-ESRGAN anime)": "anime",
              "Drawing AnimeSharp V4 (faithful)": "animesharp", "General photo (Real-ESRGAN)": "general",
              "Web photo DAT (best, slower)": "dat", "Clean photo Real-HAT-GAN (sharp)": "hatgan",
+             "Photo HEART (new, experimental)": "heart",
              **{n: n for n in extra_models()}}
     FACE = {"Natural (GFPGAN)": "gfpgan", "Strongest repair (CodeFormer)": "codeformer"}
     NAME = {"Automatic": "auto", "Text after the name": "suffix", "Text before the name": "prefix"}
@@ -1278,6 +1353,7 @@ def build_window():
     v_faces = tk.BooleanVar(value=o.faces)
     v_strength = tk.StringVar(value=str(o.face_strength))
     v_face_model = tk.StringVar(value=word(FACE, o.face_model, "Natural (GFPGAN)"))
+    v_colorize = tk.BooleanVar(value=o.colorize)
     v_name = tk.StringVar(value=word(NAME, o.name_mode, "Automatic"))
     v_name_text = tk.StringVar(value=o.name_text)
     v_type = tk.StringVar(value=o.file_type.upper())
@@ -1498,6 +1574,9 @@ def build_window():
     g2 = group("2. What kind of images")
     row(g2, "Kind", combo(v_kind, KIND), "kind", "upscale")
     row(g2, "Model", combo(v_model, MODEL, 34), "up_model", "upscale")
+    w_licence = row(g2, "", lambda p: ttk.Label(p, text="Drawings may use AnimeSharp V4: personal use only.",
+                                                foreground="#c25a00", font=small), "animesharp_warning", "upscale")
+    lab_licence = only["upscale"][-2]             # the row's empty label hides and shows with the line
     row(g2, "Use AI upscaler", check(v_ai, "on  (needs a GPU)"), "ai")
     row(g2, "Model for coloured art", combo(v_color_model, COLOR_MODEL), "model", "pdf")
 
@@ -1507,6 +1586,7 @@ def build_window():
     row(g3, "Restore faces", check(v_faces, "on"), "faces", "upscale")
     w_face_model = row(g3, "Face model", combo(v_face_model, FACE), "face_model", "upscale")
     w_strength = row(g3, "Face strength (0-100)", spin(v_strength, 0, 100, 10), "face_strength", "upscale")
+    row(g3, "Colour black-and-white photos", check(v_colorize, "on"), "colorize", "upscale")
     row(g3, "Crop empty paper", check(v_crop, "on"), "crop", "pdf")
     row(g3, "Strengthen thin lines (0-100)", spin(v_thick, 0, 100, 10), "thicken", "pdf")
     row(g3, "Lighten print (0-100)", spin(v_fade, 0, 90, 10), "fade", "pdf")
@@ -1555,6 +1635,13 @@ def build_window():
         for m, widgets in only.items():
             for w in widgets:
                 (w.grid if m == mode else w.grid_remove)()
+        picked = MODEL.get(v_model.get(), "auto")
+        if MAKE.get(v_make.get()) == "upscale" and (picked == "animesharp" or (picked == "auto" and KIND.get(v_kind.get()) != "photo")):
+            w_licence.grid()
+            lab_licence.grid()
+        else:
+            w_licence.grid_remove()
+            lab_licence.grid_remove()
         w_strength.configure(state="normal" if v_faces.get() else "disabled")
         w_face_model.configure(state="readonly" if v_faces.get() else "disabled")
         auto_name = NAME.get(v_name.get()) == "auto"
@@ -1562,7 +1649,7 @@ def build_window():
             e.configure(state="disabled" if auto_name else "normal")
         for e in w_save_to.winfo_children():
             e.configure(state="normal" if SAVE.get(v_save.get()) else "disabled")
-    for var in (v_make, v_faces, v_name, v_save):
+    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind):
         var.trace_add("write", sync)
     sync()
 
@@ -1624,6 +1711,7 @@ def build_window():
         ob.faces = bool(v_faces.get())
         ob.face_strength = min(100, max(0, num(v_strength, "Face strength")))
         ob.face_model = FACE[v_face_model.get()]
+        ob.colorize = bool(v_colorize.get())
         ob.name_mode = NAME[v_name.get()]
         ob.name_text = v_name_text.get().strip()
         ob.file_type = v_type.get().lower()
@@ -1839,12 +1927,14 @@ def main():
                     help="upscale mode: name the files TEXT<name> instead of <name>_x2")
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
                     help="upscale mode: auto (default), general, anime, dat (Web photo model), animesharp (drawings), hatgan "
-                         "(clean photos), or the name of an extra model "
+                         "(clean photos), heart (new, experimental photo model), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
     ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces")
     ap.add_argument("--face-model", choices=list(FACE_MODELS), default="gfpgan",
                     help="upscale mode: gfpgan (natural, default) or codeformer (strongest repair)")
+    ap.add_argument("--colorize", action="store_true",
+                    help="upscale mode: colour black-and-white photos (the colours are invented; downloads about 980 MB)")
     ap.add_argument("--face-strength", type=int, default=50, metavar="N",
                     help="upscale mode: 0-100, how much of the restored face is used (default 50)")
     ap.add_argument("--preview", action="store_true",
@@ -1872,7 +1962,7 @@ def main():
                 mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format,
                 kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
-                face_model=a.face_model)
+                face_model=a.face_model, colorize=a.colorize)
     if a.preview:
         items = make_preview(o, print)
         if not items:

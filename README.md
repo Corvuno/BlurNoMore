@@ -25,17 +25,19 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 ## What it does to every image (Bigger images)
 
 1. **Reads** the image and fixes its rotation. Nothing is cropped, thinned or placed on a page.
-2. **Chooses a model** (Automatic) after deciding what the picture is ("Detect for each image", or you say Drawing or Photo): drawings and flat colour art use the AnimeSharp V4 model when onnxruntime can use your graphics card, otherwise the Anime model; photos use the Web photo model (DAT) when onnxruntime can use your graphics card, otherwise the General model; black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one (including the clean-photo model Real-HAT-GAN, which is never chosen automatically), or use an extra model.
-3. **Enlarges** with the chosen model (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size. Without the AI it resizes plainly. Images that are already big are enlarged too.
-4. **Restores faces** (optional, off by default): finds faces in the enlarged picture and restores each with GFPGAN (natural) or CodeFormer (strongest repair), blended in by a strength from 0 to 100.
-5. **Saves** `<name>_x<scale>.png` (or `.jpg`), or the name with your own text after or before it, into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
+2. **Chooses a model** (Automatic) after deciding what the picture is ("Detect for each image", or you say Drawing or Photo): drawings and flat colour art use the AnimeSharp V4 model when onnxruntime can use your graphics card, otherwise the Anime model; photos use the Web photo model (DAT) when onnxruntime can use your graphics card, otherwise the General model; black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one (including the clean-photo model Real-HAT-GAN and the new, experimental photo model HEART, which are never chosen automatically), or use an extra model.
+3. **Colours black-and-white photos** (optional, off by default): only photos that are black and white get colour, before the enlargement. The colours are invented by the model, a guess and not the real ones. Colour photos and drawings are never touched.
+4. **Enlarges** with the chosen model (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size. Without the AI it resizes plainly. Images that are already big are enlarged too.
+5. **Restores faces** (optional, off by default): finds faces in the enlarged picture and restores each with GFPGAN (natural) or CodeFormer (strongest repair), blended in by a strength from 0 to 100.
+6. **Saves** `<name>_x<scale>.png` (or `.jpg`), or the name with your own text after or before it, into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
 
 **Run with preview** (the window; `--preview` on the command line makes picture sheets instead) works on 4 of your images (spread over the list) before the run: original next to result, plus a close-up of the busiest spot in both. Click a pair to see it big. For the PDF it shows the finished A4 page. "Go on with all" starts the real run, which reuses the preview's work; "Change settings" closes the preview. A preview writes no PDF and no output folder.
 
 ## Why it makes these choices
 
 - **Real-ESRGAN, not a generative upscaler like Krea.** Real-ESRGAN restores what is in the image. A generative upscaler redraws and invents detail, which can change line weight and anatomy. For tracing, you want the artist's drawing, not a reinterpretation.
-- **Models for different pictures.** DAT for old, compressed or damaged photos. Real-HAT-GAN for clean, sharp photos where you want crisp detail. AnimeSharp V4 for drawings, because it is very faithful to the lines. Real-ESRGAN stays as the model that works anywhere without extra downloads. For faces, GFPGAN looks natural and CodeFormer repairs badly damaged faces the most. Both face models redraw the face, which is why faces are opt-in and blended by a strength you choose.
+- **Models for different pictures.** DAT for old, compressed or damaged photos. Real-HAT-GAN for clean, sharp photos where you want crisp detail. AnimeSharp V4 for drawings, because it is very faithful to the lines. Real-ESRGAN stays as the model that works anywhere without extra downloads. For faces, GFPGAN looks natural and CodeFormer repairs badly damaged faces the most. Both face models redraw the face, which is why faces are opt-in and blended by a strength you choose. HEART (November 2026) is brand new and less proven; it is there to try, never chosen automatically.
+- **Colouring is opt-in.** It redraws the colours of a black-and-white photo with a guess, so it is off until you switch it on, and it only touches photos that are black and white.
 - **Two AI models.** Black and white art uses the anime model: crisp lines and flat areas. Coloured art uses the general model by default, because the anime model made painted and shaded art look smooth and plastic. You can switch this in the settings.
 - **The thin-line boost is selective.** It finds dark lines narrower than about 7 px at print size, using a morphological closing, and widens only those. A blanket "make everything darker" would also clog hatching and fills.
 - **The crop looks at paper, not brightness.** The first version cropped by luminance and cut into a yellow full-colour picture. Now it first checks that the border is plain, light, neutral paper. Then it trims 0.5% of the ink mass from each side, which ignores dust, scan edges and stray annotations while keeping thin frame lines.
@@ -57,7 +59,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Setting | Default | What it does |
 |---|---|---|
 | Kind (`--kind`) | Detect for each image | Bigger images. `auto` looks at each picture; `drawing` or `photo` says they are all the same kind |
-| Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use AnimeSharp V4 when a graphics card runs it, else Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `animesharp`, `dat`, `hatgan`, or the name of an extra model |
+| Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use AnimeSharp V4 when a graphics card runs it, else Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `animesharp`, `dat`, `hatgan`, `heart`, or the name of an extra model. AnimeSharp V4 is free for personal use only: don't sell or publish results made with it commercially |
 | Use AI upscaler (`--no-ai` turns it off) | on | Both outputs. Off = plain resizing, faster but blurrier |
 | AI model for coloured art (`--model`) | General | Tracing PDF. General, or Anime |
 
@@ -69,6 +71,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Restore faces (`--faces`) | off | Bigger images. Finds faces and restores them with the face model. Needs onnxruntime and OpenCV (see Requirements) |
 | Face model (`--face-model`) | Natural (GFPGAN) | Bigger images. `gfpgan` = natural, `codeformer` = strongest repair for badly damaged faces. Only the one you pick is downloaded, and only when a face is found. Greyed when faces are off |
 | Face strength (`--face-strength`) | 50 | 0 to 100: how much of the restored face is used. 0 leaves faces as they are. Greyed when faces are off |
+| Colour black-and-white photos (`--colorize`) | off | Bigger images. Colours photos that are black and white with the DDColor model (about 980 MB, downloaded when the first one is met). The colours are a guess, not the real ones. Colour photos and drawings are not touched |
 | Crop empty paper (`--no-crop` turns it off) | on | Tracing PDF. Removes blank paper and scan borders |
 | Strengthen thin lines (`--thicken`) | 70 | Tracing PDF. 0 = off, 100 = strongest |
 | Lighten print (`--fade`) | 0 | Tracing PDF. Fades the print so your pencil stands out |
@@ -118,6 +121,8 @@ Optional, installed by the `.bat` when possible: `tkinterdnd2` (drag and drop of
 - **Web photo model (DAT)**, `4xRealWebPhoto_v4` by Philip Hofmann (CC-BY-4.0), about 49 MB, downloaded on first use from Hugging Face. Made for compressed web photos. Automatic uses it for photos only when a graphics card runs it; `--upscale-model dat` uses it anywhere, but on the CPU it takes minutes per photo.
 - **Drawing model AnimeSharp V4** (`--upscale-model animesharp`), `2x-AnimeSharpV4` by Kim2091 (CC BY-NC-SA 4.0: personal, non-commercial use), about 31 MB, from Hugging Face. Very faithful to the lines. It enlarges 2x; for 3x and 4x it runs twice and resizes to the exact size. Automatic uses it for drawings when a graphics card runs it.
 - **Clean photo model Real-HAT-GAN** (`--upscale-model hatgan`), HAT by XPixel, ONNX by FaceFusion, about 160 MB, from Hugging Face. Sharp on clean photos; used only when you pick it. Slow on the CPU.
+- **Photo model HEART** (`--upscale-model heart`), by Philip Hofmann (Apache-2.0), about 75 MB, from Hugging Face. Brand new (November 2026) and less proven; 4x, used only when you pick it. Slow on the CPU.
+- **Colouring black-and-white photos** (`--colorize`): DDColor (piddnad, Apache-2.0), ONNX by FaceFusion, about 980 MB, downloaded the first time a black-and-white photo is met.
 - **Face restoration**: OpenCV's YuNet face finder (230 KB) and one of two restorers from the facefusion model collection on Hugging Face: GFPGAN 1.4 (about 340 MB, natural) or CodeFormer (about 377 MB, strongest repair; it is run with a fidelity weight of 0.6). Only the one you choose is downloaded, when you first restore a face with it.
 
 The "Models" check on GitHub downloads these and runs them on made-up pictures; the normal Checks never download models.
@@ -132,7 +137,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
-- 4.1: two more upscale models (AnimeSharp V4 for drawings, Real-HAT-GAN for clean photos; Automatic uses AnimeSharp for drawings when a graphics card runs it) and a choice of face model (Natural GFPGAN or Strongest repair CodeFormer). The tracing PDF is unchanged.
+- 4.1: more upscale models (AnimeSharp V4 for drawings, Real-HAT-GAN for clean photos, the new HEART; Automatic uses AnimeSharp for drawings when a graphics card runs it, with a note that it is for personal use only), a choice of face model (Natural GFPGAN or Strongest repair CodeFormer) and optional colouring of black-and-white photos (DDColor). The tracing PDF is unchanged.
 - 4.0: new window in steps (Images, What kind of images, Options, What comes out): add folders and single pictures (buttons or drag and drop), say what they are or let it detect, then make either bigger images or a tracing PDF. "Run with preview" (4 images, click for a big view, then "Go on with all") and "Run". Bigger images: 2x/3x/4x, model per picture (Web photo DAT, extra models), optional face restoration, your own text before or after the file name, PNG or JPG. "Save to" folder, "Last run's images", Real-ESRGAN kept next to the program, default save place is the folder of the first image. Replaces the single folder and "How many images".
 - 3.1: renamed to BlurNoMore; work folder renamed.
 - 3.0: settings window, crop only trims real paper, "Fit on the page", "Same images as last run", unique file names, copyable log.
