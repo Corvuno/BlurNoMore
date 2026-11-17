@@ -111,6 +111,25 @@ def check():
         assert made4 == ["a_lineart_web.jpg", "b_color_web.jpg", "c_tiny_web.jpg"], made4
         assert {p.name for p in d.iterdir()} == before_files, "the images folder gained or lost files"
 
+        # a size in pixels: smaller pictures grow to exactly that wide with the aspect kept; names end _300w
+        # pictures already wider than 300 keep their own size, or are made smaller with --shrink-bigger
+        for extra, expect in (((), {"a_lineart.png": (900, 1200), "b_color.jpg": (1000, 700), "c_tiny.png": (300, 400)}),
+                              (("--shrink-bigger",), {"a_lineart.png": (300, 400), "b_color.jpg": (300, 210), "c_tiny.png": (300, 400)})):
+            out6 = out / f"six{len(extra)}"
+            r6 = run_py(d, "--mode", "upscale", "--no-ai", "--width", "300", *extra, "--save-to", out6)
+            assert ("kept its size" in r6.stdout) == (not extra), "the log note about kept sizes is wrong"
+            made6 = list(next(out6.glob("BlurNoMore_upscaled_*")).iterdir())
+            assert len(made6) == 3 and all(p.stem.endswith("_300w") for p in made6), [p.name for p in made6]
+            for p in made6:
+                src = next(n for n in names if Path(n).stem == p.stem.rsplit("_", 1)[0])
+                with Image.open(p) as im:
+                    assert im.size == expect[src], f"{p.name} is {im.size}, expected {expect[src]}"
+        out7 = out / "seven"
+        run_py(d, "--mode", "upscale", "--no-ai", "--height", "200", "--save-to", out7)
+        sizes7 = {p.name: Image.open(p).size for p in next(out7.glob("BlurNoMore_upscaled_*")).iterdir()}
+        assert sizes7 == {"a_lineart_200h.png": (900, 1200), "b_color_200h.png": (1000, 700), "c_tiny_200h.png": (150, 200)}, sizes7
+        assert {p.name for p in d.iterdir()} == before_files, "the images folder gained or lost files"
+
         # preview: one sheet per image (up to 4), only into the work folder
         run_py(d, "--mode", "upscale", "--no-ai", "--preview", "--save-to", out)
         sheets = list((out / "_blurnomore_work" / "previews").rglob("*.png"))

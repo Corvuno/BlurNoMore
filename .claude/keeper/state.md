@@ -14,16 +14,18 @@ The overview every conversation starts from. One screen; what is no longer true 
   (clean photos), HEART (new, experimental). Faces opt-in: GFPGAN (natural) or CodeFormer
   (strongest), with strength. "Colour black-and-white photos" (DDColor) is opt-in. The PDF keeps
   Real-ESRGAN. The GitHub Models check runs every real model, including two real faces.
+- 4.2 (landed 2026-11-17): Enlarge also to a width or height in pixels ("→ 1920 px wide").
+  Bigger pictures keep their own size unless "Also make bigger pictures smaller" is on.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
 ## Weak, in the owner's words
 
-No complaint heard yet on 4.0/4.1; nothing of it has been run on Windows yet.
+No complaint heard yet on 4.0 to 4.2; nothing of it has been run on Windows yet.
 
 ## What the owner wants next, in their order
 
-1. Try 4.1 on Windows and say what feels off.
+1. Try 4.2 on Windows and say what feels off.
 
 ## Open with the owner
 

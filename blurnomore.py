@@ -62,7 +62,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.1"
+VERSION = "4.2"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -134,6 +134,9 @@ class Options:
     mode: str = "pdf"            # "pdf" = Tracing PDF, "upscale" = Bigger images
     save_to: str = ""            # where results and _blurnomore_work go; empty = the folder of the first input
     scale: int = 2               # upscale mode: 2, 3 or 4 times bigger
+    size_mode: str = "scale"     # upscale mode: "scale" (times bigger), "width" or "height" in pixels
+    size_px: int = 1920          # upscale mode: the pixels for width or height
+    shrink_bigger: bool = False  # upscale mode, width/height: also make pictures that are already bigger smaller
     kind: str = "auto"           # upscale mode: "auto" (detect per image), "drawing" or "photo"
     up_model: str = "auto"       # upscale mode: "auto", "general", "anime", a key of UPSCALERS or an extra model's name
     name_mode: str = "auto"      # upscale mode: file name "auto" (<name>_x2), "suffix" or "prefix"
@@ -685,12 +688,28 @@ def resolve_images(o, L):
     return files
 
 
+def target_size(o, w, h):
+    """(width, height) a w x h picture becomes in Bigger images: times bigger, or the pixels asked for
+    with the aspect ratio kept. A picture already that wide or high keeps its size unless shrink_bigger."""
+    n = max(1, int(o.size_px))
+    if o.size_mode == "width":
+        return (n, max(1, round(h * n / w))) if w < n or o.shrink_bigger else (w, h)
+    if o.size_mode == "height":
+        return (max(1, round(w * n / h)), n) if h < n or o.shrink_bigger else (w, h)
+    return w * o.scale, h * o.scale
+
+
+def size_text(o):
+    """Automatic name ending: _x2, _1920w or _1080h."""
+    return {"width": f"_{o.size_px}w", "height": f"_{o.size_px}h"}.get(o.size_mode, f"_x{o.scale}")
+
+
 def result_name(o, stem, ext, folder):
     """File name of one bigger image: <name>_x2, or the owner's text after or before the name.
     Never a name that is already taken in folder (a second one gets _2)."""
     text = "".join(ch for ch in o.name_text if ch not in '<>:"/\\|?*' and ord(ch) >= 32).strip() \
         if o.name_mode in ("suffix", "prefix") else ""
-    base = (text + stem if o.name_mode == "prefix" else stem + text) if text else f"{stem}_x{o.scale}"
+    base = (text + stem if o.name_mode == "prefix" else stem + text) if text else stem + size_text(o)
     name, k = f"{base}.{ext}", 2
     while (folder / name).exists():
         name, k = f"{base}_{k}.{ext}", k + 1
@@ -908,7 +927,7 @@ def upscale_model(c, cls):
 
 
 def make_upscaled(c, path, src_id, im, store=False):
-    """Enlarge one image to exactly scale x its size. A result made by the preview is reused;
+    """Enlarge (or shrink) one image to exactly the size target_size gives. A result made by the preview is reused;
     with store=True a new result is kept for the run that follows."""
     o, L = c.o, c.L
     w, h = im.size
@@ -916,20 +935,24 @@ def make_upscaled(c, path, src_id, im, store=False):
     cls = {"drawing": "lineart", "photo": "photo"}.get(o.kind) or auto_cls
     kind = "drawing" if cls in ("lineart", "flatcolor") else "photo"
     to_colour = o.colorize and kind == "photo" and stats["color_frac"] < MONO_COLOR_FRAC   # a black-and-white photo
-    target = (w * o.scale, h * o.scale)
-    m = upscale_model(c, cls)
+    target = target_size(o, w, h)
+    f = target[0] / w
+    kept = ""
+    if o.size_mode != "scale" and target == (w, h):
+        kept = f"already {w if o.size_mode == 'width' else h} {'wide' if o.size_mode == 'width' else 'high'}, kept its size"
+    m = upscale_model(c, cls) if f > AI_MIN_SCALE else None     # a picture that stays about the same size needs no AI
     label = m[1] if m else "plain"
 
     def cache_file(name):
         faces = f"_faces{o.face_strength}_{o.face_model}" if o.faces else ""
-        return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_x{o.scale}{faces}{'_coloured' if o.colorize else ''}.png"
+        return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_{target[0]}x{target[1]}{faces}{'_coloured' if o.colorize else ''}.png"
 
     cache = cache_file(label)
     if cache.exists() and not o.redo:
         res = Image.open(cache).convert("RGB")
         res.load()
         method = (f"{label} (cached)" if m else "lanczos (cached)") + (" + coloured" if to_colour else "")
-        return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label}
+        return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label, "target": target, "f": f, "kept": kept}
     res = None
     method = "lanczos"
     coloured = False
@@ -951,7 +974,7 @@ def make_upscaled(c, path, src_id, im, store=False):
             try:
                 model = c.models[m[1]]
                 up = run_tiles(model, im)
-                if model.twice and o.scale > model.native:    # 3x and 4x: a second pass on the result
+                if model.twice and f > model.native:    # more than twice as big: a second pass on the result
                     up = run_tiles(model, up)
             except Exception:  # noqa: BLE001
                 L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
@@ -977,13 +1000,17 @@ def make_upscaled(c, path, src_id, im, store=False):
             res.save(cache_file(label))
         except Exception:  # noqa: BLE001
             pass
-    return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label}
+    return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label, "target": target, "f": f, "kept": kept}
 
 
-def upscaled_line(tag, r, scale, name, t0):
-    big = r["w"] * r["h"] * scale * scale
+def upscaled_line(tag, r, name, t0):
+    big = r["target"][0] * r["target"][1]
     warn = f"  VERY LARGE RESULT ({big / 1e6:.0f} megapixels): big file, slow" if big > BIG_RESULT_PIXELS else ""
-    return (f"{tag}\n    {r['w']}x{r['h']}  {r['kind']}  {r['method']}  x{scale}  -> {name}  "
+    if r["kept"]:
+        warn += "  " + r["kept"]
+    if r["f"] > 6:
+        warn += "  LOW SOURCE RESOLUTION (>6x enlargement, will look soft)"
+    return (f"{tag}\n    {r['w']}x{r['h']}  {r['kind']}  {r['method']}  x{round(r['f'], 2):g}  -> {name}  "
             f"({time.time() - t0:.1f}s){warn}")
 
 
@@ -1026,8 +1053,8 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
                 else:
                     r["result"].save(up_dir / name)
                 pdf_inputs.append(name)
-                L(upscaled_line(tag, r, o.scale, name, t0))
-                report.append([idx, path.name, f"{r['w']}x{r['h']}", r["kind"], o.scale, r["method"], name])
+                L(upscaled_line(tag, r, name, t0))
+                report.append([idx, path.name, f"{r['w']}x{r['h']}", r["kind"], f"{round(r['f'], 2):g}", r["method"], name])
             else:
                 r = make_page(c, path, src_id, im)
                 pdf_inputs.append(str(r["page_path"]))
@@ -1124,9 +1151,9 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
                 r = make_upscaled(c, path, src_id, im, store=True)
                 orig, res = im, r["result"]
                 box = busiest_box(res)
-                fx = fy = float(o.scale)
+                fx = fy = r["f"]
                 dx = dy = 0.0
-                log(upscaled_line(tag, r, o.scale, "(preview)", t0))
+                log(upscaled_line(tag, r, "(preview)", t0))
             else:
                 r = make_page(c, path, src_id, im)
                 orig = r["im"]
@@ -1219,9 +1246,13 @@ HELP = {
     "animesharp_warning": "AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). Don't sell or "
                           "publish results made with it commercially. Automatic uses it for drawings when your "
                           "graphics card can run it; pick another model to avoid it.",
-    "scale": "How many times bigger the pictures become: 2, 3 or 4. A 1000 pixel wide picture becomes 2000, 3000 or "
-             "4000 pixels wide. Bigger takes longer and makes bigger files; it cannot bring back detail that "
-             "is not there.",
+    "scale": "How big the pictures become. 2x, 3x, 4x: that many times bigger (a 1000 pixel wide picture becomes 2000, "
+             "3000 or 4000). Width (pixels): every picture gets exactly that many pixels across. Height (pixels): "
+             "that many pixels high. The other side follows, so nothing is stretched. Pictures that are already that "
+             "wide or high keep their own size, unless you tick 'Also make bigger pictures smaller'. Bigger "
+             "takes longer and makes bigger files; it cannot bring back detail that is not there.",
+    "shrink_bigger": "Only for Width or Height in pixels. Off: a picture that is already that wide or high is left at "
+                     "its own size (it is not made smaller). On: it is made smaller to exactly the size you ask for.",
     "faces": "Finds faces in the enlarged picture and restores them with the face model you pick below. Needs "
              "onnxruntime-directml and opencv-python-headless. The first time it downloads the face model (about "
              "340 MB for GFPGAN, 377 MB for CodeFormer). Off = faces are left as the enlargement makes them. Both "
@@ -1349,7 +1380,11 @@ def build_window():
     v_make = tk.StringVar(value=word(MAKE, o.mode, "Tracing PDF"))
     v_kind = tk.StringVar(value=word(KIND, o.kind, "Detect for each image"))
     v_model = tk.StringVar(value=word(MODEL, o.up_model, "Automatic"))
-    v_scale = tk.StringVar(value=f"{o.scale}x")
+    SIZE = {"2x": ("scale", 2), "3x": ("scale", 3), "4x": ("scale", 4),
+            "Width (pixels)": ("width", 0), "Height (pixels)": ("height", 0)}
+    v_scale = tk.StringVar(value=word(SIZE, (o.size_mode, o.scale if o.size_mode == "scale" else 0), "2x"))
+    v_px = tk.StringVar(value=str(o.size_px))
+    v_shrink = tk.BooleanVar(value=o.shrink_bigger)
     v_faces = tk.BooleanVar(value=o.faces)
     v_strength = tk.StringVar(value=str(o.face_strength))
     v_face_model = tk.StringVar(value=word(FACE, o.face_model, "Natural (GFPGAN)"))
@@ -1582,7 +1617,15 @@ def build_window():
 
     # ---- 3. Options
     g3 = group("3. Options")
-    row(g3, "Enlarge", combo(v_scale, ["2x", "3x", "4x"], 8), "scale", "upscale")
+    def size_row(p):
+        f = ttk.Frame(p)
+        ttk.Combobox(f, textvariable=v_scale, state="readonly", width=11, values=list(SIZE)).pack(side="left")
+        ttk.Spinbox(f, from_=100, to=20000, increment=10, textvariable=v_px, width=5).pack(side="left", padx=(4, 0))
+        ttk.Label(f, textvariable=v_size_note).pack(side="left", padx=(4, 0))
+        return f
+    v_size_note = tk.StringVar()
+    w_size = row(g3, "Enlarge", size_row, "scale", "upscale")
+    w_shrink = row(g3, "Also make bigger pictures smaller", check(v_shrink, "on"), "shrink_bigger", "upscale")
     row(g3, "Restore faces", check(v_faces, "on"), "faces", "upscale")
     w_face_model = row(g3, "Face model", combo(v_face_model, FACE), "face_model", "upscale")
     w_strength = row(g3, "Face strength (0-100)", spin(v_strength, 0, 100, 10), "face_strength", "upscale")
@@ -1642,6 +1685,11 @@ def build_window():
         else:
             w_licence.grid_remove()
             lab_licence.grid_remove()
+        size_mode = SIZE.get(v_scale.get(), ("scale",))[0]
+        w_size.winfo_children()[1].configure(state="disabled" if size_mode == "scale" else "normal")
+        w_shrink.configure(state="disabled" if size_mode == "scale" else "normal")
+        px = v_px.get().strip()
+        v_size_note.set(f"\u2192 {px} px {'wide' if size_mode == 'width' else 'high'}" if size_mode != "scale" and px else "")
         w_strength.configure(state="normal" if v_faces.get() else "disabled")
         w_face_model.configure(state="readonly" if v_faces.get() else "disabled")
         auto_name = NAME.get(v_name.get()) == "auto"
@@ -1649,7 +1697,7 @@ def build_window():
             e.configure(state="disabled" if auto_name else "normal")
         for e in w_save_to.winfo_children():
             e.configure(state="normal" if SAVE.get(v_save.get()) else "disabled")
-    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind):
+    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind, v_scale, v_px):
         var.trace_add("write", sync)
     sync()
 
@@ -1707,7 +1755,12 @@ def build_window():
         ob.mode = MAKE[v_make.get()]
         ob.kind = KIND[v_kind.get()]
         ob.up_model = MODEL.get(v_model.get(), "auto")
-        ob.scale = int(v_scale.get()[0])
+        ob.size_mode, scale = SIZE[v_scale.get()]
+        if ob.size_mode == "scale":
+            ob.scale = scale
+        else:
+            ob.size_px = min(20000, max(100, num(v_px, "Pixels")))
+            ob.shrink_bigger = bool(v_shrink.get())
         ob.faces = bool(v_faces.get())
         ob.face_strength = min(100, max(0, num(v_strength, "Face strength")))
         ob.face_model = FACE[v_face_model.get()]
@@ -1919,6 +1972,11 @@ def main():
     ap.add_argument("--save-to", default="", metavar="FOLDER",
                     help="where the PDF / upscaled folder and _blurnomore_work go (default: the folder of the first input)")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
+    size = ap.add_mutually_exclusive_group()
+    size.add_argument("--width", type=int, metavar="N", help="upscale mode: make every picture N pixels wide (instead of --scale)")
+    size.add_argument("--height", type=int, metavar="N", help="upscale mode: make every picture N pixels high (instead of --scale)")
+    ap.add_argument("--shrink-bigger", action="store_true",
+                    help="upscale mode, with --width/--height: also make pictures that are already bigger smaller (default: they keep their size)")
     ap.add_argument("--kind", choices=["auto", "drawing", "photo"], default="auto",
                     help="upscale mode: auto = detect for each image (default), or say they are all drawings or photos")
     ap.add_argument("--name-suffix", default="", metavar="TEXT",
@@ -1954,12 +2012,15 @@ def main():
     a = ap.parse_args()
     if not a.inputs and not a.same:
         ap.error("give at least one folder or picture (or --same)")
+    size_mode, size_px = next(((m, v) for m, v in (("width", a.width), ("height", a.height)) if v), ("scale", 1920))
+    if not 1 <= size_px <= 20000:
+        ap.error("the size in pixels must be between 1 and 20000")
     if a.name_suffix and a.name_prefix:
         ap.error("use --name-suffix or --name-prefix, not both")
     o = Options(inputs=a.inputs, repeat_last=a.same, fit="fill" if a.fill else "whole", margin_mm=a.margin, dpi=a.dpi,
                 autocrop=not a.no_crop, thicken=a.thicken, fade=a.fade, keep_color=not a.grey,
                 color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
-                mode=a.mode, save_to=a.save_to, scale=a.scale, up_model=a.upscale_model, file_type=a.format,
+                mode=a.mode, save_to=a.save_to, scale=a.scale, size_mode=size_mode, size_px=size_px, shrink_bigger=a.shrink_bigger, up_model=a.upscale_model, file_type=a.format,
                 kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
                 face_model=a.face_model, colorize=a.colorize)

@@ -5,7 +5,7 @@ You add folders or single pictures, say what they are, and choose what comes out
 - **Bigger images**: a new folder of bigger copies (2x, 3x or 4x), restored by AI, for general use. No tracing steps, no A4.
 - **Tracing PDF**: one sharp, print-ready A4 PDF that you can trace through tracing paper.
 
-Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.1.
+Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.2.
 
 ## Why it exists
 
@@ -27,9 +27,9 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 1. **Reads** the image and fixes its rotation. Nothing is cropped, thinned or placed on a page.
 2. **Chooses a model** (Automatic) after deciding what the picture is ("Detect for each image", or you say Drawing or Photo): drawings and flat colour art use the AnimeSharp V4 model when onnxruntime can use your graphics card, otherwise the Anime model; photos use the Web photo model (DAT) when onnxruntime can use your graphics card, otherwise the General model; black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one (including the clean-photo model Real-HAT-GAN and the new, experimental photo model HEART, which are never chosen automatically), or use an extra model.
 3. **Colours black-and-white photos** (optional, off by default): only photos that are black and white get colour, before the enlargement. The colours are invented by the model, a guess and not the real ones. Colour photos and drawings are never touched.
-4. **Enlarges** with the chosen model (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size. Without the AI it resizes plainly. Images that are already big are enlarged too.
+4. **Enlarges** with the chosen model (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size, or to the width or height in pixels you ask for (aspect ratio kept). Without the AI it resizes plainly. Images that are already big are enlarged too, unless you ask for a size in pixels: then pictures already that wide or high keep their own size (colour and faces still apply when on; the log says so), or with "Also make bigger pictures smaller" are made smaller to it (plain resizing, no AI). The AI is only used when the picture grows by more than 1.25 times; a growth over 6 times is flagged in the log as low source resolution.
 5. **Restores faces** (optional, off by default): finds faces in the enlarged picture and restores each with GFPGAN (natural) or CodeFormer (strongest repair), blended in by a strength from 0 to 100.
-6. **Saves** `<name>_x<scale>.png` (or `.jpg`), or the name with your own text after or before it, into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
+6. **Saves** `<name>_x<scale>.png` (`_1920w` or `_1080h` for a size in pixels; or `.jpg`), or the name with your own text after or before it, into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
 
 **Run with preview** (the window; `--preview` on the command line makes picture sheets instead) works on 4 of your images (spread over the list) before the run: original next to result, plus a close-up of the busiest spot in both. Click a pair to see it big. For the PDF it shows the finished A4 page. "Go on with all" starts the real run, which reuses the preview's work; "Change settings" closes the preview. A preview writes no PDF and no output folder.
 
@@ -67,7 +67,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 
 | Setting | Default | What it does |
 |---|---|---|
-| Enlarge (`--scale`) | 2x | Bigger images. 2, 3 or 4 times bigger |
+| Enlarge (`--scale`, `--width N`, `--height N`, `--shrink-bigger`) | 2x | Bigger images. 2, 3 or 4 times bigger, or Width (pixels) / Height (pixels) with the number next to it (default 1920, 100 to 20000): every picture gets exactly that width or height, the other side follows. Pictures already that big keep their size unless "Also make bigger pictures smaller" (`--shrink-bigger`, off by default) is on. `--width` and `--height` exclude each other and win over `--scale` |
 | Restore faces (`--faces`) | off | Bigger images. Finds faces and restores them with the face model. Needs onnxruntime and OpenCV (see Requirements) |
 | Face model (`--face-model`) | Natural (GFPGAN) | Bigger images. `gfpgan` = natural, `codeformer` = strongest repair for badly damaged faces. Only the one you pick is downloaded, and only when a face is found. Greyed when faces are off |
 | Face strength (`--face-strength`) | 50 | 0 to 100: how much of the restored face is used. 0 leaves faces as they are. Greyed when faces are off |
@@ -137,6 +137,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
+- 4.2: Bigger images can be made to a width or height in pixels (for example 1920) instead of 2x/3x/4x; pictures already that big keep their size unless you choose to make them smaller; names end `_1920w` or `_1080h`. The tracing PDF is unchanged.
 - 4.1: more upscale models (AnimeSharp V4 for drawings, Real-HAT-GAN for clean photos, the new HEART; Automatic uses AnimeSharp for drawings when a graphics card runs it, with a note that it is for personal use only), a choice of face model (Natural GFPGAN or Strongest repair CodeFormer) and optional colouring of black-and-white photos (DDColor). The tracing PDF is unchanged.
 - 4.0: new window in steps (Images, What kind of images, Options, What comes out): add folders and single pictures (buttons or drag and drop), say what they are or let it detect, then make either bigger images or a tracing PDF. "Run with preview" (4 images, click for a big view, then "Go on with all") and "Run". Bigger images: 2x/3x/4x, model per picture (Web photo DAT, extra models), optional face restoration, your own text before or after the file name, PNG or JPG. "Save to" folder, "Last run's images", Real-ESRGAN kept next to the program, default save place is the folder of the first image. Replaces the single folder and "How many images".
 - 3.1: renamed to BlurNoMore; work folder renamed.
