@@ -5,7 +5,7 @@ You add folders or single pictures, say what they are, and choose what comes out
 - **Bigger images**: a new folder of bigger copies (2x, 3x or 4x), restored by AI, for general use. No tracing steps, no A4.
 - **Tracing PDF**: one sharp, print-ready A4 PDF that you can trace through tracing paper.
 
-Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.2.
+Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.3.
 
 ## Why it exists
 
@@ -54,6 +54,12 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Images list (`INPUT...` on the command line) | empty | Folders (every picture directly in them, not the folders inside, sorted by name) and/or single picture files, added with "Add folder...", "Add files..." or by dragging onto the list. Duplicates are left out. They are never changed. The list is remembered |
 | Last run's images (`--same`) | | Fills the list with the pictures of the last run (kept in `blurnomore_last_run.json`), so you can compare settings on the same pictures. On the command line it replaces the inputs |
 
+**What to make**
+
+| Setting | Default | What it does |
+|---|---|---|
+| Make (`--mode`) | Tracing PDF | `upscale` = Bigger images, `pdf` = Tracing PDF. One of the two per run. It comes right after the images because it decides which settings below are shown |
+
 **What kind**
 
 | Setting | Default | What it does |
@@ -82,7 +88,6 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 
 | Setting | Default | What it does |
 |---|---|---|
-| Make (`--mode`) | Tracing PDF | `upscale` = Bigger images, `pdf` = Tracing PDF. One of the two per run |
 | Name (`--name-suffix TEXT`, `--name-prefix TEXT`) | Automatic | Bigger images. Automatic: `photo_x2.png`. Or your text after the name (`photo_big.png`) or before it (`big_photo.png`). Characters Windows does not allow are left out; an empty text means automatic |
 | File type (`--format`) | PNG | Bigger images. `png` (exact, big) or `jpg` (quality 95, smaller) |
 | Fit on the page (`--fill`) | Whole picture | Tracing PDF. Whole picture, or fill the page and trim the edges |
@@ -137,6 +142,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
+- 4.3: "Make" (Tracing PDF or Bigger images) moved up to step 2, right under the images, because it decides which settings below it are shown. Nothing else changed.
 - 4.2: Bigger images can be made to a width or height in pixels (for example 1920) instead of 2x/3x/4x; pictures already that big keep their size unless you choose to make them smaller; names end `_1920w` or `_1080h`. The tracing PDF is unchanged.
 - 4.1: more upscale models (AnimeSharp V4 for drawings, Real-HAT-GAN for clean photos, the new HEART; Automatic uses AnimeSharp for drawings when a graphics card runs it, with a note that it is for personal use only), a choice of face model (Natural GFPGAN or Strongest repair CodeFormer) and optional colouring of black-and-white photos (DDColor). The tracing PDF is unchanged.
 - 4.0: new window in steps (Images, What kind of images, Options, What comes out): add folders and single pictures (buttons or drag and drop), say what they are or let it detect, then make either bigger images or a tracing PDF. "Run with preview" (4 images, click for a big view, then "Go on with all") and "Run". Bigger images: 2x/3x/4x, model per picture (Web photo DAT, extra models), optional face restoration, your own text before or after the file name, PNG or JPG. "Save to" folder, "Last run's images", Real-ESRGAN kept next to the program, default save place is the folder of the first image. Replaces the single folder and "How many images".

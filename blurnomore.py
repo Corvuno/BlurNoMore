@@ -62,7 +62,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.2"
+VERSION = "4.3"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -1605,8 +1605,12 @@ def build_window():
         except Exception:  # noqa: BLE001
             dnd = False
 
-    # ---- 2. What kind of images
-    g2 = group("2. What kind of images")
+    # ---- 2. What to make: first, because it decides which settings below are shown
+    g_make = group("2. What to make")
+    row(g_make, "Make", combo(v_make, MAKE), "mode")
+
+    # ---- 3. What kind of images
+    g2 = group("3. What kind of images")
     row(g2, "Kind", combo(v_kind, KIND), "kind", "upscale")
     row(g2, "Model", combo(v_model, MODEL, 34), "up_model", "upscale")
     w_licence = row(g2, "", lambda p: ttk.Label(p, text="Drawings may use AnimeSharp V4: personal use only.",
@@ -1615,8 +1619,8 @@ def build_window():
     row(g2, "Use AI upscaler", check(v_ai, "on  (needs a GPU)"), "ai")
     row(g2, "Model for coloured art", combo(v_color_model, COLOR_MODEL), "model", "pdf")
 
-    # ---- 3. Options
-    g3 = group("3. Options")
+    # ---- 4. Options
+    g3 = group("4. Options")
     def size_row(p):
         f = ttk.Frame(p)
         ttk.Combobox(f, textvariable=v_scale, state="readonly", width=11, values=list(SIZE)).pack(side="left")
@@ -1636,9 +1640,8 @@ def build_window():
     row(g3, "Keep colours", check(v_color, "on  (off = all grey)"), "color", "pdf")
     row(g3, "Colour boost (0-100)", spin(v_boost, 0, 100, 10), "boost", "pdf")
 
-    # ---- 4. What comes out
-    g4 = group("4. What comes out")
-    row(g4, "Make", combo(v_make, MAKE), "mode")
+    # ---- 5. What comes out
+    g4 = group("5. What comes out")
     row(g4, "Name", combo(v_name, NAME), "name", "upscale")
     w_name_text = row(g4, "Text for the name", entry_row(v_name_text), "name_text", "upscale")
     row(g4, "File type", combo(v_type, ["PNG", "JPG"], 8), "file_type", "upscale")
