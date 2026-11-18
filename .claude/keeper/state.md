@@ -16,6 +16,8 @@ The overview every conversation starts from. One screen; what is no longer true 
   Real-ESRGAN. The GitHub Models check runs every real model, including two real faces.
 - 4.2 (landed 2026-11-17): Enlarge also to a width or height in pixels ("→ 1920 px wide").
   Bigger pictures keep their own size unless "Also make bigger pictures smaller" is on.
+- 4.3 (landed 2026-11-18): "Make" moved up to step 2, under the images, as the owner asked;
+  the window now reads Images, What to make, What kind, Options, What comes out.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
@@ -25,7 +27,8 @@ No complaint heard yet on 4.0 to 4.2; nothing of it has been run on Windows yet.
 
 ## What the owner wants next, in their order
 
-1. Try 4.2 on Windows and say what feels off.
+1. Try 4.3 on Windows and say what feels off.
+2. Photo/art to shaded drawing for tracing (#5, Refine): waiting for the owner's examples.
 
 ## Open with the owner
 
