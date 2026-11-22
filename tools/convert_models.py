@@ -40,8 +40,11 @@ for name, url in MODELS.items():
         dst = out_dir / (name + "_fp32_256.onnx")
         with torch.no_grad():
             ref = net(x).numpy()
+            print("   PyTorch ran one tile; exporting", flush=True)
             torch.onnx.export(net, x, str(dst), opset_version=17, input_names=["input"],
                               output_names=["output"], dynamo=False)
+        del net, desc
+        print("   exported; checking with onnxruntime", flush=True)
         sess = ort.InferenceSession(str(dst), providers=["CPUExecutionProvider"])
         t = time.time()
         got = sess.run(None, {"input": x.numpy()})[0]

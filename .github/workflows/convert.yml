@@ -2,21 +2,31 @@ name: Convert models
 
 # Turns upscale models that are published only as PyTorch weights into ONNX (tools/convert_models.py)
 # and attaches them to the release "models-1", where BlurNoMore downloads them from.
+# One job per model, so a model that runs out of memory does not stop the others.
 on:
   workflow_dispatch:
-    inputs:
-      only:
-        description: 'Model names to convert (space separated); empty = all'
-        required: false
-        default: ''
 
 permissions:
   contents: write
 
 jobs:
-  convert:
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view models-1 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create models-1 -R "$GITHUB_REPOSITORY" \
+            --title "Models (converted to ONNX)" \
+            --notes "Upscale models converted to ONNX by the Convert models workflow, for BlurNoMore. Credits and licences are in the README."
+  convert:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [4xBHI_dat2_real, 4xRealWebPhoto_v4_drct-l, 4xRealWebPhoto_v3_atd]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,16 +34,7 @@ jobs:
           python-version: '3.12'
       - run: pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
       - run: pip install --quiet spandrel==0.4.1 onnx onnxruntime numpy safetensors
-      - id: conv
-        run: python tools/convert_models.py converted ${{ inputs.only }}
-        continue-on-error: true
-      - name: Attach to release models-1
-        env:
+      - run: python -u tools/convert_models.py converted ${{ matrix.model }}
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          ls -la converted
-          gh release view models-1 >/dev/null 2>&1 || gh release create models-1 --title "Models (converted to ONNX)" \
-            --notes "Upscale models converted to ONNX by the Convert models workflow, for BlurNoMore. Credits and licences are in the README."
-          for f in converted/*.onnx; do gh release upload models-1 "$f" --clobber; done
-      - if: steps.conv.outcome == 'failure'
-        run: exit 1
+        run: for f in converted/*.onnx; do gh release upload models-1 "$f" --clobber -R "$GITHUB_REPOSITORY"; done
