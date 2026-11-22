@@ -23,6 +23,11 @@ The overview every conversation starts from. One screen; what is no longer true 
   opt-in inventing upscaler (Stable Diffusion x4 ONNX, settings: prompt, negative, noise, steps,
   guidance, seed) and Make "Compare models": shuffled letters, close-up sheets, key.png to open last.
   Automatic is unchanged until the owner picks a winner.
+- 4.5 (landed 2026-11-22, #7): the inventing upscaler is SeedVR2 3B (fp8), replacing Stable Diffusion x4
+  (owner: "Ditch it"). First use sets up `seedvr2/` next to the program: uv, Python 3.12 venv, the pinned
+  numz tool, AMD's PyTorch for Windows (ROCm 7.2.1; NVIDIA cu128; else CPU), then the 3.9 GB model.
+  Settings: seed, colour matching, two noise sliders, save graphics memory. Never run for real by the
+  Keeper (blocked downloads, no AMD card); the owner's first run is the real test.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

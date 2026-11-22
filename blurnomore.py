@@ -543,6 +543,9 @@ def run_streamed(c, argv, keep=None, cwd=None, every=0):
     given; tqdm progress lines at most once every `every` seconds). Returns (exit code, its last lines). Pressing Stop
     ends the program and raises Stopped."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+    # SeedVR2's tool asks PyTorch for the cudaMallocAsync memory allocator unless told otherwise; PyTorch's own
+    # default allocator is the safe choice on AMD's PyTorch for Windows too
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:native")
     p = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace", cwd=cwd, env=env)
     q = queue.Queue()
@@ -672,7 +675,8 @@ def run_seedvr2(c, im, target):
     models_dir = writable_dir(MODELS_DIR, c.work / "models") / "seedvr2"
     if not any(models_dir.rglob(SEEDVR2_DIT)):
         c.L("  SeedVR2 downloads its model files (about 3.9 GB) the first time it runs.")
-    src, dst = c.tmp / "seedvr2_in.png", c.tmp / "seedvr2_out.png"
+    models_dir = models_dir.resolve()    # the tool runs in its own folder, so every path must be absolute
+    src, dst = (c.tmp / "seedvr2_in.png").resolve(), (c.tmp / "seedvr2_out.png").resolve()
     dst.unlink(missing_ok=True)
     im.convert("RGB").save(src)
     cmd = seedvr2_options(o, c.sv_seed, models_dir, src, dst, side)
