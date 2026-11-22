@@ -561,6 +561,10 @@ def diff_window():
     return ramp[:, None] * ramp[None, :]
 
 
+class Stopped(Exception):
+    """The user pressed Stop in the middle of a long picture."""
+
+
 class Diffusion:
     """Stable Diffusion x4 upscaler, as diffusers' StableDiffusionUpscalePipeline, in numpy: a text encoder, the
     unet and the vae decoder (onnxruntime sessions) and the tokenizer."""
@@ -592,7 +596,7 @@ class Diffusion:
         name = self.vae.get_inputs()[0].name
         return self.vae.run(None, ort_feed(self.vae, **{name: lat / 0.08333}))[0][0].astype(np.float32)
 
-    def run(self, im, o, seed, log):
+    def run(self, im, o, seed, log, should_stop=lambda: False):
         """Enlarge a PIL image 4x by tiles of DIFF_TILE pixels (feathered where they overlap)."""
         steps = min(100, max(1, int(o.diff_steps)))
         emb = np.concatenate([self.embed(o.diff_negative), self.embed(o.diff_prompt)])
@@ -603,7 +607,11 @@ class Diffusion:
         tiles = [(y, x) for y in diff_positions(Hp) for x in diff_positions(Wp)]
         acc, wsum, win = np.zeros((3, Hp * 4, Wp * 4), np.float32), np.zeros((Hp * 4, Wp * 4), np.float32), diff_window()
         rng = np.random.default_rng(seed)
+        if len(tiles) > 16:
+            log(f"  {len(tiles)} tiles of {steps} steps each: this picture takes a long time (Stop works between tiles).")
         for k, (y, x) in enumerate(tiles, 1):
+            if should_stop():
+                raise Stopped()
             log(f"  tile {k}/{len(tiles)}")
             r = self.tile(rng, a[y:y + DIFF_TILE, x:x + DIFF_TILE].transpose(2, 0, 1), emb, o, steps)
             ys, xs = slice(y * 4, (y + DIFF_TILE) * 4), slice(x * 4, (x + DIFF_TILE) * 4)
@@ -642,13 +650,11 @@ def load_diffusion(c):
 def run_diffusion(c, im, f):
     """The inventing upscaler on a PIL image: 4x bigger (the caller resizes to the exact size)."""
     o = c.o
-    if c.diff_seed is None:
-        c.diff_seed = int(o.diff_seed) or random.SystemRandom().randrange(1, 2 ** 31)
-        c.L(f"Inventing upscaler: seed {c.diff_seed}" + (" (chosen at random; type it under Seed to get the same result again)"
-                                                         if not o.diff_seed else ""))
+    c.once("diffusion-seed", f"Inventing upscaler: seed {c.diff_seed}" + (
+        " (chosen at random; type it under Seed to get the same result again)" if not o.diff_seed else ""))
     if f > 4:
         c.once("diffusion-4x", "  The inventing upscaler only invents at 4x; for a bigger size the 4x result is resized.")
-    return c.models["diffusion"].run(im, o, c.diff_seed, c.L)
+    return c.models["diffusion"].run(im, o, c.diff_seed, c.L, c.should_stop)
 
 
 # ============================================================ face restoration
@@ -1007,7 +1013,8 @@ class Context:
     def __init__(self, o, L, work):
         self.o, self.L, self.work, self.exe = o, L, work, None
         self.models, self.prov, self.said = {}, None, set()   # ONNX models by name, providers, notes made
-        self.diff_seed = None        # the seed the inventing upscaler uses this run
+        self.diff_seed = int(o.diff_seed) or random.SystemRandom().randrange(1, 2 ** 31)   # the inventing upscaler's seed this run
+        self.should_stop = lambda: False
         key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
                       o.color_boost, o.use_ai, o.color_model)
         key = hashlib.md5(repr(key_fields).encode()).hexdigest()[:8]
@@ -1188,7 +1195,7 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
         faces = f"_faces{o.face_strength}_{o.face_model}" if o.faces else ""
         if name == "diffusion":      # its settings change the picture
             name += "_" + hashlib.md5(repr((o.diff_prompt, o.diff_negative, o.diff_noise, o.diff_steps, o.diff_guidance,
-                                            o.diff_seed)).encode()).hexdigest()[:8]
+                                            c.diff_seed)).encode()).hexdigest()[:8]
         return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_{target[0]}x{target[1]}{faces}{'_coloured' if o.colorize else ''}.png"
 
     cache = cache_file(label)
@@ -1223,6 +1230,8 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
                     up = run_tiles(model, im)
                     if model.twice and f > model.native:    # more than twice as big: a second pass on the result
                         up = run_tiles(model, up)
+            except Stopped:
+                raise
             except Exception as e:  # noqa: BLE001
                 why = f"{type(e).__name__}: {e}"[:200]
                 L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
@@ -1270,6 +1279,7 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
     L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
 
     c = Context(o, L, work)
+    c.should_stop = should_stop
     for m in notes:
         L(m)
     numbered = list(enumerate(files, 1))
@@ -1312,6 +1322,9 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
                 pdf_inputs.append(str(r["page_path"]))
                 L(page_line(tag, r, t0))
                 report.append([idx, path.name, f"{r['w0']}x{r['h0']}", r["cls"], round(r["s"], 2), r["method"], r["note"]])
+        except Stopped:
+            L(f"{tag}\n    stopped in the middle of this picture.\n\nStopped by user.")
+            break
         except Exception:  # noqa: BLE001
             L(f"{tag}\n    ERROR:")
             L("    " + traceback.format_exc().replace("\n", "\n    "))
@@ -1497,6 +1510,8 @@ def run_compare(c, files, stamp, out, should_stop, started):
             try:
                 results[m] = make_upscaled(c, path, src_id, im, force=m)["result"]
                 times.setdefault(m, []).append(time.time() - t1)
+            except Stopped:
+                break
             except Exception as e:  # noqa: BLE001
                 why = str(e) or type(e).__name__
                 if "see the log" in why:       # not started: the reason it gave the first time stands, else the last thing said
@@ -1514,7 +1529,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
             base, k = f"{path.stem[:40]}_{k}", k + 1
         used.add(base)
         ext = "jpg" if o.file_type == "jpg" else "png"
-        for m, res in results.items():
+        for m, res in sorted(results.items(), key=lambda kv: letter_of[kv[0]]):   # letter order: file times tell nothing
             if ext == "jpg":
                 res.save(folder / f"{base}_{letter_of[m]}.jpg", quality=95, subsampling=0)
             else:
@@ -1573,6 +1588,7 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     if work is None:
         return []
     c = Context(o, log, work)
+    c.should_stop = should_stop
     numbered = list(enumerate(files, 1))
     picks = spread(numbered, n)
     log(f"Preview of {len(picks)} of {len(files)} images")
@@ -1608,6 +1624,9 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
             d_orig = orig.resize(size, Image.BICUBIC, box=(sx0, sy0, max(sx1, sx0 + 1), max(sy1, sy0 + 1)))
             items.append({"name": path.name, "kind": r["kind"] if o.mode == "upscale" else r["cls"], "method": r["method"], "original": orig,
                           "result": res, "detail_original": d_orig, "detail_result": res.crop(box)})
+        except Stopped:
+            log("\nStopped by user.")
+            break
         except Exception:  # noqa: BLE001
             log(f"{tag}\n    ERROR:")
             log("    " + traceback.format_exc().replace("\n", "\n    "))

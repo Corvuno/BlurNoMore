@@ -230,6 +230,12 @@ def check():
         _, log = make_run(models, out / "diff_rand", inputs=[str(pics / "small.png")], mode="upscale", up_model="diffusion",
                           diff_steps=5, diff_seed=0, scale=4)
         assert any("chosen at random" in ln for ln in log), "a random seed is not named in the log"
+        # Stop in the middle of a picture: no more tiles, the run ends saying so
+        lines = []
+        stop = lambda: any("tile 2/" in ln for ln in lines)
+        bn.run(bn.Options(save_to=str(out / "diff_stop"), inputs=[str(pics / "bigger.png")], mode="upscale",
+                          up_model="diffusion", scale=4, diff_steps=5, diff_seed=3), lines.append, stop)
+        assert "Stopped by user." in "\n".join(lines) and not any("tile 3/" in ln for ln in lines), lines[-10:]
         print("inventing upscaler ok")
 
         # 3. Compare models: letters, close-ups, key; letters change between runs; nothing names a model outside the key
