@@ -87,15 +87,12 @@ UPSCALERS = {
     "dat": dict(file="4xRealWebPhoto_v4_fp32_opset17.onnx", size="49 MB", native=4, twice=False,
                 url="https://huggingface.co/Phips/4xRealWebPhoto_v4_dat2/resolve/main/4xRealWebPhoto_v4_fp32_opset17.onnx",
                 credit="4xRealWebPhoto_v4 (DAT) by Philip Hofmann, CC-BY-4.0"),
-    "bhi": dict(file="4xBHI_dat2_real_fp32_256.onnx", size="?", native=4, twice=False,
+    "bhi": dict(file="4xBHI_dat2_real_fp32_256.onnx", size="51 MB", native=4, twice=False,
                 url=CONVERTED + "4xBHI_dat2_real_fp32_256.onnx",
                 credit="4xBHI_dat2_real (DAT2) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
-    "drct": dict(file="4xRealWebPhoto_v4_drct-l_fp32_256.onnx", size="?", native=4, twice=False,
-                 url=CONVERTED + "4xRealWebPhoto_v4_drct-l_fp32_256.onnx",
+    "drct": dict(file="4xRealWebPhoto_v4_drct-l_fp32_128.onnx", size="?", native=4, twice=False,   # 128 px tiles: DRCT-L needs much memory
+                 url=CONVERTED + "4xRealWebPhoto_v4_drct-l_fp32_128.onnx",
                  credit="4xRealWebPhoto_v4_drct-l (DRCT) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
-    "atd": dict(file="4xRealWebPhoto_v3_atd_fp32_256.onnx", size="?", native=4, twice=False,
-                url=CONVERTED + "4xRealWebPhoto_v3_atd_fp32_256.onnx",
-                credit="4xRealWebPhoto_v3_atd (ATD) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
     "animesharp": dict(file="2x-AnimeSharpV4_RCAN_fp16_op17.onnx", size="31 MB", native=2, twice=True,
                        url="https://huggingface.co/Kim2091/2x-AnimeSharpV4/resolve/main/2x-AnimeSharpV4_RCAN_fp16_op17.onnx",
                        credit="2x-AnimeSharpV4 by Kim2091, CC BY-NC-SA 4.0 (personal use)"),
@@ -117,7 +114,7 @@ DIFFUSION_CREDIT = "Stable Diffusion x4 upscaler by Stability AI, ONNX by ssube,
 MODEL_LABELS = {
     "anime": "Drawing (Real-ESRGAN anime)", "animesharp": "Drawing AnimeSharp V4 (faithful)",
     "general": "General photo (Real-ESRGAN)", "dat": "Web photo DAT RealWebPhoto v4",
-    "bhi": "Web photo DAT2 BHI (newest DAT, Dec 2024)", "drct": "Web photo DRCT-L", "atd": "Web photo ATD",
+    "bhi": "Web photo DAT2 BHI (newest DAT, Dec 2024)", "drct": "Web photo DRCT-L",
     "hatgan": "Clean photo Real-HAT-GAN (sharp)", "heart": "Photo HEART (new, experimental)",
     "diffusion": "Inventing: Stable Diffusion x4 (makes up detail, slow)",
 }
@@ -173,7 +170,7 @@ class Options:
     face_strength: int = 50      # 0-100, how much of the restored face is used
     face_model: str = "gfpgan"   # "gfpgan" (natural) or "codeformer" (strongest repair)
     colorize: bool = False       # upscale mode: colour black-and-white photos (invented colours)
-    compare_models: list = field(default_factory=lambda: ["dat", "bhi", "drct", "atd", "hatgan", "heart", "general"])  # compare mode
+    compare_models: list = field(default_factory=lambda: ["dat", "bhi", "drct", "hatgan", "heart", "general"])  # compare mode
     diff_prompt: str = "a sharp, detailed, high quality photo"   # inventing upscaler: what to make up
     diff_negative: str = "blurry, noisy, jpeg artifacts, painting, cartoon"
     diff_noise: int = 20         # 0-350, how much it may invent
@@ -444,7 +441,7 @@ def load_onnx(c, name):
         shape = sess.get_inputs()[0].shape
         fixed = shape[2] if len(shape) == 4 and isinstance(shape[2], int) and shape[2] == shape[3] else None
         model = OnnxModel(sess, info["native"] if info else model_scale(name), fixed, bool(info and info["twice"]))
-        if name in ("dat", "bhi", "drct", "atd") and not c.gpu():
+        if name in ("dat", "bhi", "drct") and not c.gpu():
             c.L(f"  The {name.upper()} model on the CPU is slow (minutes per photo).")
         t = model.tile or 64    # check the scale by one small tile
         got = model.run(np.zeros((1, 3, t, t), np.float32)).shape[2] // t
@@ -1699,12 +1696,11 @@ HELP = {
                 "don't sell or publish results made with it commercially. "
                 "Web photo DAT RealWebPhoto v4 (about 49 MB) is made for old, compressed or damaged web photos. "
                 f"Web photo DAT2 BHI (newest DAT, December 2024, about {UPSCALERS['bhi']['size']}) is a newer DAT for real-world photos. "
-                f"Web photo DRCT-L (about {UPSCALERS['drct']['size']}) and Web photo ATD (about {UPSCALERS['atd']['size']}) are two other "
-                "web photo models of the same maker, built differently. "
+                f"Web photo DRCT-L (about {UPSCALERS['drct']['size']}) is another web photo model of the same maker, built differently. "
                 "Clean photo Real-HAT-GAN (sharp, about 160 MB) is for clean, sharp photos where you want "
                 "crisp detail. "
                 "Photo HEART (new, experimental, about 75 MB) is a brand-new photo model from November 2026, less "
-                "proven than the others. These are only used when you pick them; Automatic never picks HAT-GAN, HEART, BHI, DRCT or ATD. "
+                "proven than the others. These are only used when you pick them; Automatic never picks HAT-GAN, HEART, BHI or DRCT. "
                 "The photo models are slow without a graphics card (needs onnxruntime-directml). "
                 "Inventing: Stable Diffusion x4 makes up detail that is not in the picture; see the Inventing upscaler settings. "
                 "Other models you put in the models folder next to the program "
@@ -2514,7 +2510,7 @@ def main():
                     help="upscale mode: name the files TEXT<name> instead of <name>_x2")
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
                     help="upscale mode: auto (default), general, anime, dat (Web photo model), animesharp (drawings), hatgan "
-                         "(clean photos), heart (new, experimental photo model), bhi, drct, atd (more web photo models), "
+                         "(clean photos), heart (new, experimental photo model), bhi, drct (more web photo models), "
                          "diffusion (inventing: makes up detail, very slow), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
     ap.add_argument("--compare", default=None, metavar="MODELS",

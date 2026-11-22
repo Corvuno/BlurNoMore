@@ -1,4 +1,4 @@
-"""Model check: downloads the real DAT, BHI, DRCT, ATD, AnimeSharp, HAT-GAN, HEART, Stable Diffusion x4 (inventing), YuNet, GFPGAN, CodeFormer and DDColor models (about 6 GB, into models/ next
+"""Model check: downloads the real DAT, BHI, DRCT, AnimeSharp, HAT-GAN, HEART, Stable Diffusion x4 (inventing), YuNet, GFPGAN, CodeFormer and DDColor models (about 6 GB, into models/ next
 to the program) and runs them on made-up pictures, on the CPU. Run by the "Models" workflow, not
 by the normal Checks.   python tests/models_check.py   (needs pillow, numpy, img2pdf, onnxruntime,
 opencv-python-headless). Exits non-zero on failure."""
@@ -65,7 +65,7 @@ def main():
             assert r.size == (320, 240), f"HEART result is {r.size}, expected 320x240"
 
         # the three converted photo models (fixed 256 px tiles), exact size at 2x
-        for key in ("bhi", "drct", "atd"):
+        for key in ("bhi", "drct"):
             log = run_py(d, "--mode", "upscale", "--upscale-model", key, "--scale", "2", "--save-to", out / key)
             assert f"AI {key}" in log, f"the {key} model was not used"
             with Image.open(only_file(out / key)) as r:

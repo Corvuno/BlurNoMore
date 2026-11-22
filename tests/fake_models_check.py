@@ -37,11 +37,11 @@ def const(name, arr):
     return nh.from_array(np.asarray(arr), name)
 
 
-def fake_upscaler(path, mode):
-    """Input 'input' 1x3x256x256, output 1x3x1024x1024: the picture enlarged 4x with the given resize mode."""
+def fake_upscaler(path, mode, tile=256):
+    """Input 'input' 1x3xTILExTILE, output 4 times that: the picture enlarged 4x with the given resize mode."""
     save([h.make_node("Resize", ["input", "", "scales"], ["output"], mode=mode)],
-         [h.make_tensor_value_info("input", T.FLOAT, [1, 3, 256, 256])],
-         [h.make_tensor_value_info("output", T.FLOAT, [1, 3, 1024, 1024])],
+         [h.make_tensor_value_info("input", T.FLOAT, [1, 3, tile, tile])],
+         [h.make_tensor_value_info("output", T.FLOAT, [1, 3, tile * 4, tile * 4])],
          [const("scales", np.array([1, 1, 4, 4], np.float32))], path)
 
 
@@ -118,10 +118,10 @@ def fake_tokenizer(folder):
 
 def install_fakes(models, with_diffusion=True, timestep_type=T.INT64, skip=()):
     """Fake models under their real file names in the models folder `models`."""
-    for i, (key, mode) in enumerate((("dat", "nearest"), ("bhi", "linear"), ("drct", "cubic"), ("atd", "nearest"), ("hatgan", "linear"),
+    for i, (key, mode) in enumerate((("dat", "nearest"), ("bhi", "linear"), ("drct", "cubic"), ("hatgan", "linear"),
                                      ("heart", "cubic"))):
         if key not in skip:
-            fake_upscaler(models / bn.UPSCALERS[key]["file"], mode)
+            fake_upscaler(models / bn.UPSCALERS[key]["file"], mode, 128 if key == "drct" else 256)
     if with_diffusion:
         d = models / bn.DIFFUSION_DIR
         fake_text_encoder(d / "text_encoder" / "model.onnx")
@@ -187,7 +187,7 @@ def check():
         before = snapshot(pics)
 
         # 1. the new photo models: exact size at 2x (a 4x model, then resized)
-        for key in ("bhi", "drct", "atd"):
+        for key in ("bhi", "drct"):
             res, log = make_run(models, out / key, inputs=[str(pics / "small.png")], mode="upscale", up_model=key, scale=2)
             assert res and f"AI {key}" in "\n".join(log), f"{key} was not used"
             files = list(Path(res).iterdir())
@@ -196,7 +196,7 @@ def check():
 
         # 2. the inventing upscaler: exact 4x size, close to plain resizing (the fake gives back the picture), a seed, tiles
         for ttype, name in ((T.INT64, "int64 timestep"), (T.FLOAT, "float timestep")):
-            install_fakes(models, timestep_type=ttype, skip=("dat", "bhi", "drct", "atd", "hatgan", "heart"))
+            install_fakes(models, timestep_type=ttype, skip=("dat", "bhi", "drct", "hatgan", "heart"))
             for f in (4, 2, 8):
                 res, log = make_run(models, out / f"diff{ttype}{f}", inputs=[str(pics / "small.png")], mode="upscale",
                                     up_model="diffusion", scale=f if f != 8 else 4, size_mode="scale", diff_steps=5, diff_noise=0, diff_seed=3)
