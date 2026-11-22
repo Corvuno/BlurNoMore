@@ -18,6 +18,11 @@ The overview every conversation starts from. One screen; what is no longer true 
   Bigger pictures keep their own size unless "Also make bigger pictures smaller" is on.
 - 4.3 (landed 2026-11-18): "Make" moved up to step 2, under the images, as the owner asked;
   the window now reads Images, What to make, What kind, Options, What comes out.
+- 4.4 (landed 2026-11-22, #6): more photo models (newest DAT2 BHI, DRCT-L; converted to ONNX by the
+  "Convert models" workflow, hosted on release models-1; ATD left out: its export did not match), an
+  opt-in inventing upscaler (Stable Diffusion x4 ONNX, settings: prompt, negative, noise, steps,
+  guidance, seed) and Make "Compare models": shuffled letters, close-up sheets, key.png to open last.
+  Automatic is unchanged until the owner picks a winner.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
