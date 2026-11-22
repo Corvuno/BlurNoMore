@@ -1,6 +1,7 @@
 name: Checks
 
-# Compiles the program and makes a PDF from three made-up drawings without the AI step.
+# Compiles the program, makes a PDF from three made-up drawings without the AI step, and runs
+# the model plumbing (compare, inventing upscaler, tiles) with tiny fake models.
 # Its last run on main is shown at the start of every Keeper session.
 on:
   push:
@@ -15,6 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install --quiet pillow numpy img2pdf onnxruntime
+      - run: pip install --quiet pillow numpy img2pdf onnxruntime onnx
       - run: python -m py_compile blurnomore.py tests/smoke.py
       - run: python tests/smoke.py
+      - run: python tests/fake_models_check.py

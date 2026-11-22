@@ -90,7 +90,7 @@ UPSCALERS = {
     "bhi": dict(file="4xBHI_dat2_real_fp32_256.onnx", size="51 MB", native=4, twice=False,
                 url=CONVERTED + "4xBHI_dat2_real_fp32_256.onnx",
                 credit="4xBHI_dat2_real (DAT2) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
-    "drct": dict(file="4xRealWebPhoto_v4_drct-l_fp32_128.onnx", size="?", native=4, twice=False,   # 128 px tiles: DRCT-L needs much memory
+    "drct": dict(file="4xRealWebPhoto_v4_drct-l_fp32_128.onnx", size="189 MB", native=4, twice=False,   # 128 px tiles: DRCT-L needs much memory
                  url=CONVERTED + "4xRealWebPhoto_v4_drct-l_fp32_128.onnx",
                  credit="4xRealWebPhoto_v4_drct-l (DRCT) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
     "animesharp": dict(file="2x-AnimeSharpV4_RCAN_fp16_op17.onnx", size="31 MB", native=2, twice=True,
