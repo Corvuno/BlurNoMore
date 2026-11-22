@@ -187,6 +187,34 @@ def check_ai_dir(out):
         text = ai_run(third, blocker / "sub", out)
         assert "cannot be written to" in text, text
         assert (third / "realesrgan").is_dir() and bn.ESRGAN_DIR == third / "realesrgan", "files lost or not used"
+        # refused: inside a folder that is moved; among the pictures; the old place keeps being used
+        text = ai_run(third, third / "models" / "sub", out)
+        assert "inside one of the AI folders" in text and not (third / "models" / "sub").exists(), text
+        assert bn.MODELS_DIR == third / "models"
+        pic_dir = out / "picfolder"
+        pic_dir.mkdir()
+        photo(40, 30).save(pic_dir / "p.png")
+        lines = []
+        bn.run(bn.Options(inputs=[str(pic_dir)], mode="upscale", use_ai=False, save_to=str(out / "ai_out2"), ai_dir=str(pic_dir / "ai")), lines.append)
+        assert "among your pictures" in "\n".join(lines) and not (pic_dir / "ai").exists(), lines
+        try:
+            bn.move_folder(third / "models", third / "models" / "x")
+            raise AssertionError("moved a folder into itself")
+        except RuntimeError:
+            pass
+        # a partly done move: each folder is used where it exists
+        bn.point_where_found(new, third)
+        assert bn.MODELS_DIR == new / "models" and bn.ESRGAN_DIR == third / "realesrgan", (bn.MODELS_DIR, bn.ESRGAN_DIR)
+        # a seedvr2 already in the target is not touched (its venv stays), the one left behind keeps its own
+        with tempfile.TemporaryDirectory() as t_a, tempfile.TemporaryDirectory() as t_b:
+            a_dir, b_dir = Path(t_a), Path(t_b)
+            bn.APP_DIR, bn.SETTINGS_FILE = a_dir, a_dir / "settings.json"
+            for d in (a_dir, b_dir):
+                (d / "seedvr2" / "venv").mkdir(parents=True)
+                (d / "seedvr2" / "ready.json").write_text("{}")
+            text = ai_run(a_dir, b_dir, out)
+            assert "already has a folder seedvr2" in text and (b_dir / "seedvr2" / "venv").is_dir(), text
+            assert "stays behind at" in text
         # uv keeps its Python and cache in seedvr2/uv: present in the environment of the programs the run starts
         bn.point_ai_dirs(third)
 

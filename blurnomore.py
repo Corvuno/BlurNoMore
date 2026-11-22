@@ -345,8 +345,16 @@ def folder_bytes(path):
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def inside(path, folder):
+    """True when `path` is `folder` or lies inside it."""
+    a, b = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(folder))
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep)
+
+
 def move_folder(src, dst):
     """Move a folder to another place (maybe another disk): copied completely first, the old one deleted only after."""
+    if inside(dst, src):
+        raise RuntimeError("the new place is inside the folder that is moved")
     try:
         os.rename(src, dst)                 # the same disk: instant
         return
@@ -363,7 +371,12 @@ def move_folder(src, dst):
     shutil.rmtree(src, ignore_errors=True)
 
 
-def prepare_ai_dir(o, L):
+def point_where_found(new, old):
+    """Point each of the three folders to where it exists: in `new`, else in `old` (after a move that only partly worked)."""
+    point_ai_dirs(new, old, [n for n in AI_FOLDERS if not (new / n).exists() and (old / n).exists()])
+
+
+def prepare_ai_dir(o, L, files=()):
     """At the start of a run: use the AI files folder from the options and, when it is not where the files were last time,
     move realesrgan, models and seedvr2 there. A folder that cannot be moved stays in the old place for this run."""
     new, old = ai_base(o), ai_dir_used()
@@ -371,9 +384,19 @@ def prepare_ai_dir(o, L):
     if same(new, old):
         point_ai_dirs(new)
         return
+    own = [b / n for b in (old, APP_DIR) for n in AI_FOLDERS]
+    pics = {Path(p).parent for p in files} | {Path(t.strip('"')) for t in o.inputs if Path(t.strip('"')).is_dir()}
+    if any(inside(new, f) for f in own):
+        L(f"The AI files folder {new} is inside one of the AI folders that would be moved; choose another one. The AI files stay in {old} for this run.")
+        point_where_found(new, old)
+        return
+    if any(inside(new, f) for f in pics):
+        L(f"The AI files folder {new} is among your pictures; choose another one. The AI files stay in {old} for this run.")
+        point_where_found(new, old)
+        return
     if writable_dir(new, None) is None:
         L(f"The AI files folder {new} cannot be written to; the AI files stay in {old} for this run.")
-        point_ai_dirs(old)
+        point_where_found(new, old)
         return
     failed = []
     for n in AI_FOLDERS:
@@ -381,19 +404,19 @@ def prepare_ai_dir(o, L):
         if not src.is_dir():
             continue
         if dst.exists():
-            L(f"The AI files folder already has a folder {n}; both are left as they are and the one in {new} is used.")
+            L(f"The AI files folder already has a folder {n}; the one in {new} is used. The old one stays behind at {src} and can be deleted by hand.")
             continue
         try:
             L(f"Moving the AI files ({n}) to {new} ({folder_bytes(src) / 1e9:.1f} GB) ...")
+            if n == "seedvr2":       # a Python environment cannot be moved: dropped first, SeedVR2 builds it again when used
+                shutil.rmtree(src / "venv", ignore_errors=True)
+                (src / "ready.json").unlink(missing_ok=True)
             move_folder(src, dst)
-            if n == "seedvr2":       # a Python environment cannot be moved: SeedVR2 builds it again (from the moved cache) when used
-                shutil.rmtree(dst / "venv", ignore_errors=True)
-                (dst / "ready.json").unlink(missing_ok=True)
             L("  done")
         except Exception as e:  # noqa: BLE001
             L(f"  Could not move {n}: {e}\n  It stays in {old} for this run.")
             failed.append(n)
-    point_ai_dirs(new, old, failed)
+    point_where_found(new, old)
     if not failed:
         remember_ai_dir_used(new)
 
@@ -1402,7 +1425,7 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
     L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
     L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
     L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
-    prepare_ai_dir(o, L)
+    prepare_ai_dir(o, L, files)
 
     c = Context(o, L, work)
     c.should_stop = should_stop
@@ -1713,7 +1736,7 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     work = prepare(log, output_dir(o))
     if work is None:
         return []
-    prepare_ai_dir(o, log)
+    prepare_ai_dir(o, log, files)
     c = Context(o, log, work)
     c.should_stop = should_stop
     numbered = list(enumerate(files, 1))
@@ -1917,8 +1940,8 @@ HELP = {
               "PyTorch. Next to the program is the default; choose a folder on another disk to keep the program's disk "
               "free. It needs up to about 8 GB (Real-ESRGAN and the photo models about 0.5 GB, SeedVR2 about 7 GB when "
               "you use it). When you change it, what is already there is moved to the new folder at the next run (a "
-              "folder that already exists there is left alone). SeedVR2 then sets its Python up again once, without "
-              "downloading everything again. Your pictures are never touched.",
+              "folder that already exists there is left alone). SeedVR2 then sets its Python up again once; a set-up made by version 4.5 "
+              "kept its download cache in your user folder, so that first time PyTorch (about 3 GB) is downloaded again. Your pictures are never touched.",
     "redo": "Ignore pages and results made in earlier runs. Changing a setting already makes new ones on its "
             "own; use this for a clean rebuild.",
     "open": "Opens the PDF, or the folder of bigger pictures, when the run is finished.",
@@ -2647,7 +2670,7 @@ def launch_gui():
 
 # ====================================================================== CLI
 def main():
-    point_ai_dirs(ai_dir_used())      # where the AI files are now (for the list of extra models)
+    point_where_found(ai_base(load_settings()), ai_dir_used())      # where the AI files are now (for the list of extra models)
     if len(sys.argv) == 1:
         launch_gui()
         return
