@@ -1106,6 +1106,8 @@ def result_name(o, stem, ext, folder):
 
 def _jpg_bytes(im, q):
     buf = io.BytesIO()
+    if im.mode != "RGB":
+        im = im.convert("RGB")
     im.save(buf, "JPEG", quality=q, subsampling=0)
     return buf.getvalue()
 
@@ -1137,49 +1139,87 @@ def _free_path(base, ext):
     return p
 
 
-def save_result(im, base, o, L):
-    """Save one picture of Bigger images or Compare as base.png / base.jpg and return (path, note).
-    File type JPG: quality o.jpg_quality. With a size limit (o.max_mb > 0) a picture that is too big gets the highest
-    JPG quality that fits (down to 50), then is made smaller; a PNG that is too big is saved as JPG instead.
+def _shrink_fit(im, q0, limit, data):
+    """Too big even at quality 50 (data): make it smaller by about the size ratio (a little more), from the original each
+    time, until it fits at quality 50; then the best quality that fits on the smaller picture. Returns (picture, bytes, quality)."""
+    f, small = 1.0, im
+    for _ in range(8):
+        f *= ((limit / len(data)) ** 0.5) * 0.97
+        small = im.resize((max(1, round(im.width * f)), max(1, round(im.height * f))), Image.LANCZOS)
+        data, q = _fit_jpg(small, q0, limit)
+        if q is not None:
+            return small, data, q
+    return small, data, 50
+
+
+def save_group(items, o, L):
+    """Save pictures [(image, base), ...] as base.png / base.jpg; returns [(path, note), ...]. A group is the letters of
+    one Compare picture: they all get the same file type, JPG quality and size, so the letters do not tell the models apart.
+    File type JPG: quality o.jpg_quality. With a size limit (o.max_mb > 0) a picture that is too big gets the highest JPG
+    quality that fits (down to 50), then is made smaller; a PNG that is too big is saved as JPG instead.
     The note says what the limit did ('' when it did nothing)."""
-    base = str(base)
     limit = int(o.max_mb * 1024 * 1024) if o.max_mb > 0 else 0
-    mb = f"{o.max_mb:g} MB"
     q0 = min(100, max(50, o.jpg_quality))
+    jpg = o.file_type == "jpg"
     if not limit:
-        if o.file_type == "jpg":
-            path = _free_path(base, "jpg")
-            im.save(path, quality=q0, subsampling=0)
-        else:
-            path = _free_path(base, "png")
-            im.save(path)
-        return path, ""
-    note = ""
-    if o.file_type != "jpg":
-        buf = io.BytesIO()
-        im.save(buf, "PNG")
-        if buf.tell() <= limit:
-            path = _free_path(base, "png")
-            path.write_bytes(buf.getvalue())
-            return path, ""
-        note = "PNG too big: "
-    data, q = _fit_jpg(im, q0, limit)
-    if q is not None:
-        note += f"JPG q{q}" if o.file_type != "jpg" else f"JPG q{q} to fit {mb}"
-        if q == q0 and o.file_type == "jpg":
-            note = ""                                   # it fitted at the chosen quality: the limit did nothing
+        out = []
+        for im, base in items:
+            path = _free_path(base, "jpg" if jpg else "png")
+            if jpg:
+                im.convert("RGB").save(path, quality=q0, subsampling=0)
+            else:
+                im.save(path)
+            out.append((path, ""))
+        return out
+    mb = f"{o.max_mb:g} MB"
+    pngs = []
+    if not jpg:                                   # every PNG that fits stays a PNG, unless one of the group does not
+        for im, _ in items:
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            pngs.append(buf.getvalue() if buf.tell() <= limit else None)
+        if all(x is not None for x in pngs):
+            out = []
+            for (im, base), data in zip(items, pngs):
+                path = _free_path(base, "png")
+                path.write_bytes(data)
+                out.append((path, ""))
+            return out
+    plans = []                                    # (q or None, picture) for each
+    for im, _ in items:
+        data, q = _fit_jpg(im, q0, limit)
+        plans.append((im, data, q))
+    shrunk = [x for x in plans if x[2] is None]
+    ims = [im for im, _, _ in plans]
+    if shrunk:
+        sizes = []
+        for im, data, _ in shrunk:
+            small, _d, _q = _shrink_fit(im, q0, limit, data)
+            sizes.append(small.size)
+        w, h = min(sizes, key=lambda z: z[0] * z[1])
+        ims = [im if im.size == (w, h) else im.resize((w, h), Image.LANCZOS) for im in ims]
+        plans = [(im, *_fit_jpg(im, q0, limit)) for im in ims]
+    q = min(50 if pq is None else pq for _, _, pq in plans)
+    datas = [d if pq == q else _jpg_bytes(im, q) for im, d, pq in plans]
+    if shrunk:
+        note = f"JPG q{q}, made smaller to {ims[0].width}x{ims[0].height} to fit {mb}"
+        if any(len(d) > limit for d in datas):
+            L(f"    still over {mb} after making it smaller")
+    elif jpg:
+        note = "" if q == q0 else f"JPG q{q} to fit {mb}"
     else:
-        small, tries = im, 0
-        while len(data) > limit and tries < 6:
-            f = ((limit / len(data)) ** 0.5) * 0.95
-            small = small.resize((max(1, int(small.width * f)), max(1, int(small.height * f))), Image.LANCZOS)
-            data, tries = _jpg_bytes(small, 50), tries + 1
-        note += f"JPG q50, made smaller to {small.width}x{small.height} to fit {mb}"
-        if len(data) > limit:
-            L(f"    still over {mb} after making it smaller {tries} times")
-    path = _free_path(base, "jpg")
-    path.write_bytes(data)
-    return path, note
+        note = f"PNG too big: JPG q{q}"
+    out = []
+    for (_, base), data in zip(items, datas):
+        path = _free_path(base, "jpg")
+        path.write_bytes(data)
+        out.append((path, note))
+    return out
+
+
+def save_result(im, base, o, L):
+    """One picture of Bigger images: save_group with a group of one. Returns (path, note)."""
+    return save_group([(im, base)], o, L)[0]
 
 
 def prepare(L, out):
@@ -1764,8 +1804,9 @@ def run_compare(c, files, stamp, out, should_stop, started):
         while base in used:
             base, k = f"{path.stem[:40]}_{k}", k + 1
         used.add(base)
-        for m, res in sorted(results.items(), key=lambda kv: letter_of[kv[0]]):   # letter order: file times tell nothing
-            _, limit_note = save_result(res, folder / f"{base}_{letter_of[m]}", o, L)
+        order = sorted(results.items(), key=lambda kv: letter_of[kv[0]])     # letter order: file times tell nothing
+        saved = save_group([(res, folder / f"{base}_{letter_of[m]}") for m, res in order], o, L)
+        for (m, _), (_, limit_note) in zip(order, saved):
             if limit_note:
                 limit_notes.append(f"{path.name} {letter_of[m]}: {limit_note}")
             made += 1

@@ -174,6 +174,18 @@ def check():
         (o_c / "n_x2.jpg").write_bytes(b"owner")
         saved, note = bn.save_result(im_n, o_c / "n_x2", bn.Options(max_mb=0.2), lambda *_: None)
         assert saved.name == "n_x2_2.jpg" and (o_c / "n_x2.jpg").read_bytes() == b"owner" and note, (saved, note)
+        # the shrink lands close under the limit, not far below it
+        assert 0.6 * 0.1 * MB < p_tiny.stat().st_size <= 0.1 * MB, p_tiny.stat().st_size
+        # a group (the letters of one Compare picture) gets one type, one quality, one size: a smooth and a noisy letter
+        o_g = out / "limit_group"
+        o_g.mkdir()
+        smooth = Image.new("RGB", im_n.size, (120, 130, 140))
+        for lim, expect in ((0.3, "jpg"), (0.02, "jpg")):
+            res = bn.save_group([(smooth, o_g / f"s{lim}_A"), (im_n, o_g / f"s{lim}_B")], bn.Options(max_mb=lim), lambda *_: None)
+            assert len({r[0].suffix for r in res}) == 1 and res[0][0].suffix == ".jpg", res
+            ims = [Image.open(r[0]) for r in res]
+            assert ims[0].size == ims[1].size and ims[0].quantization[0] == ims[1].quantization[0], "letters differ"
+            assert all(r[0].stat().st_size <= lim * MB for r in res) and res[0][1] == res[1][1] and res[0][1], res
         # Compare: every letter fits
         o_cmp = out / "limit_cmp"
         run_py(dn, "--compare", "general", "--no-ai", "--format", "jpg", "--max-mb", "0.5", "--scale", "2", "--save-to", o_cmp)
