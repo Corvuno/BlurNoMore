@@ -75,7 +75,7 @@ def main():
         tiny = Path(t) / "tiny"
         tiny.mkdir()
         im.resize((48, 48)).save(tiny / "tiny.png")
-        log = run_py(tiny, "--mode", "upscale", "--upscale-model", "diffusion", "--scale", "4", "--diff-steps", "2",
+        log = run_py(tiny, "--mode", "upscale", "--upscale-model", "diffusion", "--scale", "4", "--diff-steps", "5",
                      "--save-to", out / "diffusion")
         assert "AI diffusion" in log, "the inventing upscaler was not used"
         res = only_file(out / "diffusion")
