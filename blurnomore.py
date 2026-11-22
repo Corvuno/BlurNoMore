@@ -504,13 +504,14 @@ class ClipTokenizer:
         return word
 
     def __call__(self, text, length=77):
-        """The token ids of text: start, the words, end, then end again up to length."""
+        """The token ids of text: start, the words, end, then the pad token "!" up to length (the
+        x4 upscaler's tokenizer pads with "!", not with end)."""
         ids = [self.bos]
         for piece in self.PAT.findall(re.sub(r"\s+", " ", text).strip().lower()):
             piece = "".join(self.byte_char[b] for b in piece.encode("utf-8"))
             ids += [self.enc.get(t, self.eos) for t in self.bpe(piece)]
         ids = ids[:length - 1] + [self.eos]
-        return ids + [self.eos] * (length - len(ids))
+        return ids + [self.enc.get("!", self.eos)] * (length - len(ids))
 
 
 ORT_NUMPY = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(double)": np.float64,

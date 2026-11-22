@@ -162,7 +162,7 @@ def check_tokenizer(t):
     ids = tok("  The   cat xyz ")
     ix = {v: i for i, v in enumerate(vocab)}
     assert ids == [ix["<|startoftext|>"], ix["the</w>"], ix["cat</w>"], ix["x"], ix["y"], ix["z</w>"]] \
-        + [ix["<|endoftext|>"]] * 71, ids
+        + [ix["<|endoftext|>"]] + [ix["!"]] * 70, ids
     assert len(tok("word " * 200)) == 77 and tok("word " * 200)[-1] == ix["<|endoftext|>"]
     print("tokenizer ok")
 
