@@ -1,0 +1,39 @@
+name: Convert models
+
+# Turns upscale models that are published only as PyTorch weights into ONNX (tools/convert_models.py)
+# and attaches them to the release "models-1", where BlurNoMore downloads them from.
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Model names to convert (space separated); empty = all'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install --quiet spandrel==0.4.1 onnx onnxruntime numpy safetensors
+      - id: conv
+        run: python tools/convert_models.py converted ${{ inputs.only }}
+        continue-on-error: true
+      - name: Attach to release models-1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la converted
+          gh release view models-1 >/dev/null 2>&1 || gh release create models-1 --title "Models (converted to ONNX)" \
+            --notes "Upscale models converted to ONNX by the Convert models workflow, for BlurNoMore. Credits and licences are in the README."
+          for f in converted/*.onnx; do gh release upload models-1 "$f" --clobber; done
+      - if: steps.conv.outcome == 'failure'
+        run: exit 1
