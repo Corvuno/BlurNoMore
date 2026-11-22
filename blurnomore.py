@@ -20,6 +20,7 @@ never touched. Work files and logs go in <save folder>\\_blurnomore_work.
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import platform
@@ -65,7 +66,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.6"
+VERSION = "4.7"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -177,6 +178,8 @@ class Options:
     name_mode: str = "auto"      # upscale mode: file name "auto" (<name>_x2), "suffix" or "prefix"
     name_text: str = ""          # the suffix or prefix text (empty = auto)
     file_type: str = "png"       # upscale mode: "png" or "jpg"
+    jpg_quality: int = 95        # 50-100, JPG pictures (Bigger images, Compare letters)
+    max_mb: float = 0.0          # 0 = off; else a picture may not be bigger than this many MB (lower JPG quality, else smaller)
     faces: bool = False          # upscale mode: restore faces
     face_strength: int = 50      # 0-100, how much of the restored face is used
     face_model: str = "gfpgan"   # "gfpgan" (natural) or "codeformer" (strongest repair)
@@ -1101,6 +1104,84 @@ def result_name(o, stem, ext, folder):
     return name
 
 
+def _jpg_bytes(im, q):
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=q, subsampling=0)
+    return buf.getvalue()
+
+
+def _fit_jpg(im, q_start, limit):
+    """(bytes, quality) of the highest JPG quality from q_start down to 50 that fits limit, or (lowest-quality bytes, None)."""
+    data = _jpg_bytes(im, q_start)
+    if len(data) <= limit:
+        return data, q_start
+    low = _jpg_bytes(im, 50)
+    if len(low) > limit:
+        return low, None
+    lo, hi, best = 50, q_start, (low, 50)       # lo fits, hi does not
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        data = _jpg_bytes(im, mid)
+        if len(data) <= limit:
+            lo, best = mid, (data, mid)
+        else:
+            hi = mid
+    return best
+
+
+def _free_path(base, ext):
+    """base.ext, or base_2.ext ... when that is taken: nothing the owner may have seen is overwritten."""
+    p, k = Path(f"{base}.{ext}"), 2
+    while p.exists():
+        p, k = Path(f"{base}_{k}.{ext}"), k + 1
+    return p
+
+
+def save_result(im, base, o, L):
+    """Save one picture of Bigger images or Compare as base.png / base.jpg and return (path, note).
+    File type JPG: quality o.jpg_quality. With a size limit (o.max_mb > 0) a picture that is too big gets the highest
+    JPG quality that fits (down to 50), then is made smaller; a PNG that is too big is saved as JPG instead.
+    The note says what the limit did ('' when it did nothing)."""
+    base = str(base)
+    limit = int(o.max_mb * 1024 * 1024) if o.max_mb > 0 else 0
+    mb = f"{o.max_mb:g} MB"
+    q0 = min(100, max(50, o.jpg_quality))
+    if not limit:
+        if o.file_type == "jpg":
+            path = _free_path(base, "jpg")
+            im.save(path, quality=q0, subsampling=0)
+        else:
+            path = _free_path(base, "png")
+            im.save(path)
+        return path, ""
+    note = ""
+    if o.file_type != "jpg":
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        if buf.tell() <= limit:
+            path = _free_path(base, "png")
+            path.write_bytes(buf.getvalue())
+            return path, ""
+        note = "PNG too big: "
+    data, q = _fit_jpg(im, q0, limit)
+    if q is not None:
+        note += f"JPG q{q}" if o.file_type != "jpg" else f"JPG q{q} to fit {mb}"
+        if q == q0 and o.file_type == "jpg":
+            note = ""                                   # it fitted at the chosen quality: the limit did nothing
+    else:
+        small, tries = im, 0
+        while len(data) > limit and tries < 6:
+            f = ((limit / len(data)) ** 0.5) * 0.95
+            small = small.resize((max(1, int(small.width * f)), max(1, int(small.height * f))), Image.LANCZOS)
+            data, tries = _jpg_bytes(small, 50), tries + 1
+        note += f"JPG q50, made smaller to {small.width}x{small.height} to fit {mb}"
+        if len(data) > limit:
+            L(f"    still over {mb} after making it smaller {tries} times")
+    path = _free_path(base, "jpg")
+    path.write_bytes(data)
+    return path, note
+
+
 def prepare(L, out):
     """Work folder, or None (after saying why) when the save folder cannot be made."""
     try:
@@ -1410,11 +1491,13 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
     return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label, "target": target, "f": f, "kept": kept}
 
 
-def upscaled_line(tag, r, name, t0):
+def upscaled_line(tag, r, name, t0, limit_note=""):
     big = r["target"][0] * r["target"][1]
     warn = f"  VERY LARGE RESULT ({big / 1e6:.0f} megapixels): big file, slow" if big > BIG_RESULT_PIXELS else ""
     if r["kept"]:
         warn += "  " + r["kept"]
+    if limit_note:
+        warn += "  " + limit_note
     if r["f"] > 6:
         warn += "  LOW SOURCE RESOLUTION (>6x enlargement, will look soft)"
     return (f"{tag}\n    {r['w']}x{r['h']}  {r['kind']}  {r['method']}  x{round(r['f'], 2):g}  -> {name}  "
@@ -1459,12 +1542,10 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
                 r = make_upscaled(c, path, src_id, im)
                 up_dir.mkdir(parents=True, exist_ok=True)
                 name = result_name(o, path.stem, ext, up_dir)
-                if ext == "jpg":
-                    r["result"].save(up_dir / name, quality=95, subsampling=0)
-                else:
-                    r["result"].save(up_dir / name)
+                saved, limit_note = save_result(r["result"], up_dir / Path(name).stem, o, L)
+                name = saved.name
                 pdf_inputs.append(name)
-                L(upscaled_line(tag, r, name, t0))
+                L(upscaled_line(tag, r, name, t0, limit_note))
                 report.append([idx, path.name, f"{r['w']}x{r['h']}", r["kind"], f"{round(r['f'], 2):g}", r["method"], name])
             else:
                 r = make_page(c, path, src_id, im)
@@ -1576,7 +1657,7 @@ def why_said(heard, default):
     return next((x for x in lines if re.search(r"could not|failed|install", x, re.I)), lines[-1] if lines else default)[:200]
 
 
-def key_lines(o, order, labels, times, fails, pictures):
+def key_lines(o, order, labels, times, fails, pictures, limit_notes=()):
     """The text of key.txt / key.png: which letter is which model (with its time, or why it failed), then the settings."""
     lines = ["Which letter is which model", ""]
     for letter, model in order:
@@ -1593,6 +1674,11 @@ def key_lines(o, order, labels, times, fails, pictures):
               f"Enlarge: {o.size_px} px {o.size_mode}" if o.size_mode != "scale" else f"Enlarge: {o.scale}x",
               f"Restore faces: {'on, ' + o.face_model + ', strength ' + str(o.face_strength) if o.faces else 'off'}",
               f"Colour black-and-white photos: {'on' if o.colorize else 'off'}", f"File type: {o.file_type}"]
+    if o.file_type == "jpg":
+        lines.append(f"JPG quality: {o.jpg_quality}")
+    if o.max_mb > 0:
+        lines.append(f"File size limit: {o.max_mb:g} MB" + ("" if limit_notes else " (no picture needed more)"))
+        lines += [f"    {n}" for n in limit_notes]
     if "seedvr2" in labels:
         lines.append(f"Inventing upscaler: colours {o.sv_color}, input noise {o.sv_input_noise:g}, latent noise {o.sv_latent_noise:g}, "
                      f"seed {o.sv_seed or 'random'}, save graphics memory {'on' if o.sv_low_memory else 'off'}")
@@ -1633,6 +1719,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
         c.start_ai()
     folder = out / f"BlurNoMore_compare_{stamp}"
     times, fails, made, used = {}, {}, 0, set()
+    limit_notes = []
     L(f"Comparing {len(models)} models and plain resizing on {len(pictures)} pictures. Which result is which model is not told here.")
     for n, path in enumerate(pictures, 1):
         if should_stop():
@@ -1677,12 +1764,10 @@ def run_compare(c, files, stamp, out, should_stop, started):
         while base in used:
             base, k = f"{path.stem[:40]}_{k}", k + 1
         used.add(base)
-        ext = "jpg" if o.file_type == "jpg" else "png"
         for m, res in sorted(results.items(), key=lambda kv: letter_of[kv[0]]):   # letter order: file times tell nothing
-            if ext == "jpg":
-                res.save(folder / f"{base}_{letter_of[m]}.jpg", quality=95, subsampling=0)
-            else:
-                res.save(folder / f"{base}_{letter_of[m]}.png")
+            _, limit_note = save_result(res, folder / f"{base}_{letter_of[m]}", o, L)
+            if limit_note:
+                limit_notes.append(f"{path.name} {letter_of[m]}: {limit_note}")
             made += 1
         ref = results.get("plain") or next(iter(results.values()))      # the spot is chosen on the plain enlargement
         box = detailed_box(ref)
@@ -1695,7 +1780,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
     if not made:
         L("Nothing to write.")
         return None
-    lines = key_lines(o, sorted(((letter_of[m], m) for m in contestants)), labels, times, fails, [p.name for p in pictures])
+    lines = key_lines(o, sorted(((letter_of[m], m) for m in contestants)), labels, times, fails, [p.name for p in pictures], limit_notes)
     (folder / "key.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     key_picture(lines).save(folder / "key.png")
     L("Open key.png only after you have chosen.")
@@ -1911,6 +1996,12 @@ HELP = {
     "name_text": "The text added to the name. Characters Windows does not allow in file names are left out.",
     "file_type": "Bigger images only. PNG keeps every pixel exactly (big files). JPG is much smaller "
                  "(top quality, 95) and fine for photos.",
+    "jpg_quality": "JPG only. Higher = bigger file and closer to perfect. 90 to 95 looks the same as the original to "
+                   "the eye; lower is smaller. Greyed out when the file type is PNG.",
+    "max_mb": "Bigger images and Compare models. Tick it to keep every picture under this many MB (a 30 MB picture is "
+              "rarely needed to look at). A JPG that is too big gets the highest quality that fits (not below 50), then "
+              "is made smaller if even that is too big. A PNG that is too big is saved as a JPG instead. The log says "
+              "when it did this. Off = nothing changes. The tracing PDF is not affected.",
     "fit": "Whole picture: nothing is cut off, but a picture with a different shape than A4 leaves "
            "white space at the top/bottom or the sides. Fill the page: enlarges until the page is full "
            "and trims the edges that do not fit.",
@@ -2035,6 +2126,9 @@ def build_window():
     v_name = tk.StringVar(value=word(NAME, o.name_mode, "Automatic"))
     v_name_text = tk.StringVar(value=o.name_text)
     v_type = tk.StringVar(value=o.file_type.upper())
+    v_jpgq = tk.StringVar(value=str(o.jpg_quality))
+    v_limit = tk.BooleanVar(value=o.max_mb > 0)
+    v_mb = tk.StringVar(value=f"{o.max_mb if o.max_mb > 0 else 5:g}")
     v_save = tk.StringVar(value=word(SAVE, bool(o.save_to.strip()), "Next to the images"))
     v_save_to = tk.StringVar(value=o.save_to)
     v_ai_dir = tk.StringVar(value=o.ai_dir)
@@ -2314,6 +2408,16 @@ def build_window():
     row(g4, "Name", combo(v_name, NAME), "name", "upscale")
     w_name_text = row(g4, "Text for the name", entry_row(v_name_text), "name_text", "upscale")
     row(g4, "File type", combo(v_type, ["PNG", "JPG"], 8), "file_type", "upscale compare")
+    w_jpgq = row(g4, "JPG quality (50-100)", spin(v_jpgq, 50, 100, 1), "jpg_quality", "upscale compare")
+
+    def limit_row(p):
+        f = ttk.Frame(p)
+        ttk.Checkbutton(f, text="Limit file size", variable=v_limit).pack(side="left")
+        sp = ttk.Spinbox(f, from_=0.5, to=200, increment=0.5, textvariable=v_mb, width=6)
+        sp.pack(side="left", padx=(8, 4))
+        ttk.Label(f, text="MB").pack(side="left")
+        return f
+    w_limit = row(g4, "File size", limit_row, "max_mb", "upscale compare")
     row(g4, "Fit on the page", combo(v_fit, FIT), "fit", "pdf")
     row(g4, "Page margin (mm)", spin(v_margin, 0, 40, 1), "margin", "pdf")
 
@@ -2382,6 +2486,8 @@ def build_window():
         w_shrink.configure(state="disabled" if size_mode == "scale" else "normal")
         px = v_px.get().strip()
         v_size_note.set(f"\u2192 {px} px {'wide' if size_mode == 'width' else 'high'}" if size_mode != "scale" and px else "")
+        w_jpgq.configure(state="normal" if v_type.get() == "JPG" else "disabled")
+        w_limit.winfo_children()[1].configure(state="normal" if v_limit.get() else "disabled")
         w_strength.configure(state="normal" if v_faces.get() else "disabled")
         w_face_model.configure(state="readonly" if v_faces.get() else "disabled")
         auto_name = NAME.get(v_name.get()) == "auto"
@@ -2389,7 +2495,7 @@ def build_window():
             e.configure(state="disabled" if auto_name else "normal")
         for e in w_save_to.winfo_children():
             e.configure(state="normal" if SAVE.get(v_save.get()) else "disabled")
-    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind, v_scale, v_px, v_cmp["seedvr2"]):
+    for var in (v_make, v_faces, v_type, v_limit, v_name, v_save, v_model, v_kind, v_scale, v_px, v_cmp["seedvr2"]):
         var.trace_add("write", sync)
     sync()
 
@@ -2472,6 +2578,8 @@ def build_window():
         ob.name_mode = NAME[v_name.get()]
         ob.name_text = v_name_text.get().strip()
         ob.file_type = v_type.get().lower()
+        ob.jpg_quality = min(100, max(50, num(v_jpgq, "JPG quality")))
+        ob.max_mb = min(200.0, max(0.5, num(v_mb, "File size limit", float))) if v_limit.get() else 0.0
         ob.save_to = v_save_to.get().strip().strip('"') if SAVE[v_save.get()] else ""
         ob.ai_dir = v_ai_dir.get().strip().strip('"')
         ob.fit = FIT[v_fit.get()]
@@ -2717,6 +2825,11 @@ def main():
     ap.add_argument("--sv-low-memory", action="store_true",
                     help="inventing upscaler: save graphics memory (slower)")
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
+    ap.add_argument("--jpg-quality", type=int, default=Options.jpg_quality, metavar="N",
+                    help="JPG pictures (upscale and compare): quality 50-100 (default %(default)s)")
+    ap.add_argument("--max-mb", type=float, default=Options.max_mb, metavar="N",
+                    help="upscale and compare: keep every picture under N MB (lower JPG quality, a too big PNG becomes a JPG, "
+                         "then made smaller). 0 = off (default)")
     ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces")
     ap.add_argument("--face-model", choices=list(FACE_MODELS), default="gfpgan",
                     help="upscale mode: gfpgan (natural, default) or codeformer (strongest repair)")
@@ -2764,6 +2877,7 @@ def main():
                 autocrop=not a.no_crop, thicken=a.thicken, fade=a.fade, keep_color=not a.grey,
                 color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
                 mode=a.mode, save_to=a.save_to, scale=a.scale, size_mode=size_mode, size_px=size_px, shrink_bigger=a.shrink_bigger, up_model=a.upscale_model, file_type=a.format,
+                jpg_quality=min(100, max(50, a.jpg_quality)), max_mb=max(0.0, a.max_mb),
                 kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
                 face_model=a.face_model, colorize=a.colorize, compare_models=compare, sv_seed=a.sv_seed,

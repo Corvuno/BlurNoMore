@@ -130,6 +130,58 @@ def check():
         assert sizes7 == {"a_lineart_200h.png": (900, 1200), "b_color_200h.png": (1000, 700), "c_tiny_200h.png": (150, 200)}, sizes7
         assert {p.name for p in d.iterdir()} == before_files, "the images folder gained or lost files"
 
+        # file size limit and JPG quality: a noisy made-up photo whose PNG is far over 1 MB
+        import numpy as np
+        dn = out / "noisy"
+        dn.mkdir()
+        rng = np.random.default_rng(1)
+        base = np.kron(rng.integers(0, 256, (30, 45, 3)), np.ones((20, 20, 1)))
+        Image.fromarray(np.clip(base + rng.normal(0, 40, base.shape), 0, 255).astype("uint8")).save(dn / "n.png")
+        MB = 1024 * 1024
+
+        def one(tag, *extra, inp=dn):
+            o_ = out / f"limit_{tag}"
+            r_ = run_py(inp, "--mode", "upscale", "--no-ai", "--scale", "2", *extra, "--save-to", o_)
+            fs = list(next(o_.glob("BlurNoMore_upscaled_*")).iterdir())
+            assert len(fs) == 1, fs
+            return fs[0], r_.stdout
+        p_off, _ = one("off")
+        assert p_off.suffix == ".png" and p_off.stat().st_size > 1.5 * MB, "the made-up photo is not big enough"
+        p_off0, _ = one("off0", "--max-mb", "0")
+        assert p_off0.read_bytes() == p_off.read_bytes(), "limit off changed the PNG"
+        p_png, log_png = one("png", "--max-mb", "1")
+        assert p_png.suffix == ".jpg" and p_png.stat().st_size <= MB and "PNG too big: JPG q" in log_png, (p_png, log_png)
+        p_j95, log_j95 = one("j95", "--format", "jpg")
+        assert p_j95.stat().st_size > MB, "the JPG at 95 should be over 1 MB"
+        p_j70, _ = one("j70", "--format", "jpg", "--jpg-quality", "70")
+        assert p_j70.stat().st_size < p_j95.stat().st_size, "quality 70 is not smaller than 95"
+        p_jl, log_jl = one("jl", "--format", "jpg", "--max-mb", "1")
+        assert p_jl.stat().st_size <= MB and "JPG q" in log_jl and "to fit 1 MB" in log_jl, log_jl
+        q_jl = Image.open(p_jl).quantization[0][0]
+        assert q_jl > Image.open(p_j95).quantization[0][0], "the limit did not lower the quality"
+        assert "made smaller" not in log_jl, "made smaller although a lower quality was enough"
+        p_tiny, log_tiny = one("tiny", "--format", "jpg", "--max-mb", "0.1")
+        assert p_tiny.stat().st_size <= 0.1 * MB and "made smaller to" in log_tiny, (p_tiny.stat().st_size, log_tiny)
+        assert Image.open(p_tiny).width < 1800, "not made smaller"
+        # a roomy limit does nothing: same bytes as without it
+        p_roomy, log_roomy = one("roomy", "--format", "jpg", "--max-mb", "50")
+        assert p_roomy.read_bytes() == p_j95.read_bytes() and "to fit" not in log_roomy
+        # names: a .jpg already there is not overwritten when a PNG turns into a JPG
+        o_c = out / "limit_clash"
+        (o_c).mkdir()
+        sys.path.insert(0, str(ROOT))
+        im_n = Image.open(dn / "n.png").convert("RGB")
+        (o_c / "n_x2.jpg").write_bytes(b"owner")
+        saved, note = bn.save_result(im_n, o_c / "n_x2", bn.Options(max_mb=0.2), lambda *_: None)
+        assert saved.name == "n_x2_2.jpg" and (o_c / "n_x2.jpg").read_bytes() == b"owner" and note, (saved, note)
+        # Compare: every letter fits
+        o_cmp = out / "limit_cmp"
+        run_py(dn, "--compare", "general", "--no-ai", "--format", "jpg", "--max-mb", "0.5", "--scale", "2", "--save-to", o_cmp)
+        fc = next(o_cmp.glob("BlurNoMore_compare_*"))
+        lets = [x for x in fc.glob("n_[AB].*")]
+        assert len(lets) == 1 and all(x.stat().st_size <= 0.5 * MB for x in lets), lets
+        assert "File size limit: 0.5 MB" in (fc / "key.txt").read_text(encoding="utf-8")
+
         # preview: one sheet per image (up to 4), only into the work folder
         run_py(d, "--mode", "upscale", "--no-ai", "--preview", "--save-to", out)
         sheets = list((out / "_blurnomore_work" / "previews").rglob("*.png"))

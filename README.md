@@ -6,7 +6,7 @@ You add folders or single pictures, say what they are, and choose what comes out
 - **Tracing PDF**: one sharp, print-ready A4 PDF that you can trace through tracing paper.
 - **Compare models**: the first 4 pictures made with every model you tick, as unlabelled pictures A, B, C ..., so you can choose a model by eye without bias.
 
-Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.6.
+Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.7.
 
 ## Why it exists
 
@@ -113,7 +113,9 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Setting | Default | What it does |
 |---|---|---|
 | Name (`--name-suffix TEXT`, `--name-prefix TEXT`) | Automatic | Bigger images. Automatic: `photo_x2.png`. Or your text after the name (`photo_big.png`) or before it (`big_photo.png`). Characters Windows does not allow are left out; an empty text means automatic |
-| File type (`--format`) | PNG | Bigger images. `png` (exact, big) or `jpg` (quality 95, smaller) |
+| File type (`--format`) | PNG | Bigger images. `png` (exact, big) or `jpg` (smaller; see JPG quality) |
+| JPG quality (`--jpg-quality N`) | 95 | Bigger images and Compare models, when the file type is JPG (greyed out for PNG). 50 to 100: higher = bigger file and closer to perfect; 90 to 95 looks the same as the original to the eye |
+| Limit file size (`--max-mb N`) | off | Bigger images and Compare models. Tick the box and set the most MB a picture may take (default 5 when switched on, 0.5 to 200; on the command line 0 = off). A JPG that is too big gets the highest quality that fits (down to 50); if even that is too big, the picture is made smaller. A PNG that is too big is saved as a JPG instead (the file ends in `.jpg`). The log says when the limit acted; in Compare the key says it per letter. Off = nothing changes. The tracing PDF is not affected |
 | Fit on the page (`--fill`) | Whole picture | Tracing PDF. Whole picture, or fill the page and trim the edges |
 | Page margin (`--margin`) | 10 | Tracing PDF. White border on the A4 page, in mm |
 | Save to (`--save-to`) | Next to the images | Where the PDF or the upscaled folder and `_blurnomore_work` go. "Next to the images" is the folder of the first folder or picture in the list (the log says where). Missing folders are made |
@@ -169,6 +171,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
+- 4.7: new settings JPG quality (`--jpg-quality`) and Limit file size (`--max-mb`) for Bigger images and the Compare letters: a picture that would be bigger than the limit gets a lower JPG quality (not below 50), then is made smaller; a PNG that is too big becomes a JPG. Off by default: the files are the same as in 4.6. The tracing PDF is unchanged.
 - 4.6: new setting AI files folder (window: More settings; `--ai-dir`): keeps `realesrgan`, `models` and `seedvr2` (Python, PyTorch, uv's Python and cache) on another disk if you want. When you change it, the files are moved there at the next run, and SeedVR2 sets its Python up again once (a set-up made by 4.5 kept its download cache in the user folder, so the first rebuild after moving downloads PyTorch, about 3 GB, again; from 4.6 on the cache moves along). A new folder that is inside the folders being moved or among your pictures is refused. The tracing PDF is unchanged.
 - 4.5: the inventing upscaler is now SeedVR2 3B (restores by making up detail, opt-in, sets itself up the first time in the folder `seedvr2`) instead of Stable Diffusion x4, with its own settings: seed, how it keeps the colours, input noise, latent noise, save graphics memory. Automatic never picks it. The tracing PDF is unchanged.
 - 4.4: two more web photo models (Web photo DAT2 BHI and DRCT-L, converted to ONNX), an inventing upscaler (Stable Diffusion x4, opt-in, with its own settings: description, how much it may invent, steps, guidance, seed), and a new Make choice "Compare models": the first 4 pictures made with every model you tick, plus plain resizing, as shuffled letters A, B, C ... with close-up sheets and a key.png that says which is which, so you can choose without bias. The DAT label no longer says "best". The tracing PDF is unchanged.
