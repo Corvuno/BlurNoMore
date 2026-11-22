@@ -28,6 +28,9 @@ The overview every conversation starts from. One screen; what is no longer true 
   numz tool, AMD's PyTorch for Windows (ROCm 7.2.1; NVIDIA cu128; else CPU), then the 3.9 GB model.
   Settings: seed, colour matching, two noise sliders, save graphics memory. Never run for real by the
   Keeper (blocked downloads, no AMD card); the owner's first run is the real test.
+- 4.6 (landed 2026-11-22, #8): "AI files folder" (More settings / --ai-dir) puts models, realesrgan,
+  seedvr2 and uv's Python + cache on another disk; moved at the next run (copy, then delete); refuses a
+  target inside the moved folders or among the pictures. Not tried on real Windows disks.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
