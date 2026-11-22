@@ -1,4 +1,4 @@
-"""Model check: downloads the real DAT, BHI, DRCT, AnimeSharp, HAT-GAN, HEART, Stable Diffusion x4 (inventing), YuNet, GFPGAN, CodeFormer and DDColor models (about 6 GB, into models/ next
+"""Model check: downloads the real DAT, BHI, DRCT, AnimeSharp, HAT-GAN, HEART, YuNet, GFPGAN, CodeFormer and DDColor models (about 6 GB, into models/ next
 to the program) and runs them on made-up pictures, on the CPU. Run by the "Models" workflow, not
 by the normal Checks.   python tests/models_check.py   (needs pillow, numpy, img2pdf, onnxruntime,
 opencv-python-headless). Exits non-zero on failure."""
@@ -71,19 +71,8 @@ def main():
             with Image.open(only_file(out / key)) as r:
                 assert r.size == (320, 240), f"{key} result is {r.size}, expected 320x240"
 
-        # the inventing upscaler (Stable Diffusion x4) on a tiny photo with 5 steps: exactly 4x, not flat
-        tiny = Path(t) / "tiny"
-        tiny.mkdir()
-        im.resize((48, 48)).save(tiny / "tiny.png")
-        log = run_py(tiny, "--mode", "upscale", "--upscale-model", "diffusion", "--scale", "4", "--diff-steps", "5",
-                     "--save-to", out / "diffusion")
-        assert "AI diffusion" in log, "the inventing upscaler was not used"
-        res = only_file(out / "diffusion")
-        with Image.open(res) as r:
-            assert r.size == (192, 192), f"inventing result is {r.size}, expected 192x192"
-            std = float(np.asarray(r.convert("L")).std())
-        assert std > 5, f"the inventing result is flat grey (std {std:.1f})"
-        res.replace(keep / "diffusion_x4.png")
+        # The inventing upscaler (SeedVR2 3B) is not run here: it needs PyTorch and 3.9 GB of model files, which is not
+        # worth it on a CPU runner. tests/fake_models_check.py runs it with a fake tool; the real one is for Windows.
 
         # Compare models: three models plus plain on two made-up pictures
         cmp_in = Path(t) / "cmp"

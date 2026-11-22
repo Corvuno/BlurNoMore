@@ -19,12 +19,14 @@ never touched. Work files and logs go in <save folder>\\_blurnomore_work.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import platform
 import queue
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -63,7 +65,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.4"
+VERSION = "4.5"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -103,20 +105,28 @@ UPSCALERS = {
                   url="https://huggingface.co/Phips/HEART/resolve/main/onnx/heart_4x_otf_gan_fp32_op17.onnx",
                   credit="HEART by Philip Hofmann, Apache-2.0"),
 }
-# The inventing upscaler (Stable Diffusion x4, ONNX by ssube): several files in models/sd-x4-upscaler/<sub>/,
-# downloaded only when it is used. Run by run_diffusion (numpy, no torch).
-DIFFUSION_URL = "https://huggingface.co/ssube/stable-diffusion-x4-upscaler-onnx/resolve/main/"
-DIFFUSION_DIR = "sd-x4-upscaler"
-DIFFUSION_FILES = (("text_encoder/model.onnx", "1.36 GB"), ("unet/model.onnx", "small"), ("unet/weights.pb", "1.9 GB"),
-                   ("vae/model.onnx", "132 MB"), ("tokenizer/vocab.json", "1 MB"), ("tokenizer/merges.txt", "0.5 MB"))
-DIFFUSION_CREDIT = "Stable Diffusion x4 upscaler by Stability AI, ONNX by ssube, CreativeML Open RAIL++-M"
+# The inventing upscaler: SeedVR2 3B (ByteDance Seed, Apache-2.0), run by numz's inference_cli.py (pinned version) in its
+# own Python environment with PyTorch, set up on first use in seedvr2/ next to the program. It downloads its own model files.
+SEEDVR2_DIR = APP_DIR / "seedvr2"
+SEEDVR2_COMMIT = "4490bd1f482e026674543386bb2a4d176da245b9"      # numz/ComfyUI-SeedVR2_VideoUpscaler, v2.5.24
+SEEDVR2_ZIP = f"https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/{SEEDVR2_COMMIT}.zip"
+SEEDVR2_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+SEEDVR2_COLORS = ("lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none")
+SEEDVR2_KEEP = ("downloading", "installed", "error")              # the set-up output lines that go in the log
+SEEDVR2_CREDIT = "SeedVR2 by ByteDance Seed, Apache-2.0; command line tool by numz, Apache-2.0"
+# PyTorch for the graphics card. AMD's for Windows (ROCm 7.2.1, Python 3.12) is from AMD's own page; keep these easy to update.
+AMD_BASE = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
+AMD_ROCM = ("rocm_sdk_core-7.2.1-py3-none-win_amd64.whl", "rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+            "rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl", "rocm-7.2.1.tar.gz")
+AMD_TORCH = ("torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl", "torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl")
+NVIDIA_TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 # the models a picture can be made bigger with, in the order of the window's list (Automatic is not one of them)
 MODEL_LABELS = {
     "anime": "Drawing (Real-ESRGAN anime)", "animesharp": "Drawing AnimeSharp V4 (faithful)",
     "general": "General photo (Real-ESRGAN)", "dat": "Web photo DAT RealWebPhoto v4",
     "bhi": "Web photo DAT2 BHI (newest DAT, Dec 2024)", "drct": "Web photo DRCT-L",
     "hatgan": "Clean photo Real-HAT-GAN (sharp)", "heart": "Photo HEART (new, experimental)",
-    "diffusion": "Inventing: Stable Diffusion x4 (makes up detail, slow)",
+    "seedvr2": "Inventing: SeedVR2 3B (restores by making up detail, slow)",
 }
 PLAIN_LABEL = "Plain resize (Lanczos, no AI)"
 ANIMESHARP_WARNING = ("AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). "
@@ -171,12 +181,11 @@ class Options:
     face_model: str = "gfpgan"   # "gfpgan" (natural) or "codeformer" (strongest repair)
     colorize: bool = False       # upscale mode: colour black-and-white photos (invented colours)
     compare_models: list = field(default_factory=lambda: ["dat", "bhi", "drct", "hatgan", "heart", "general"])  # compare mode
-    diff_prompt: str = "a sharp, detailed, high quality photo"   # inventing upscaler: what to make up
-    diff_negative: str = "blurry, noisy, jpeg artifacts, painting, cartoon"
-    diff_noise: int = 20         # 0-350, how much it may invent
-    diff_steps: int = 25         # 5-100
-    diff_guidance: float = 7.5   # 1-15, how strongly it follows the prompt
-    diff_seed: int = 1           # 0 = a new random seed each run
+    sv_seed: int = 42            # inventing upscaler (SeedVR2): 0 = a new random seed each run
+    sv_color: str = "lab"        # how it keeps the colours of the picture (SEEDVR2_COLORS)
+    sv_input_noise: float = 0.0  # 0-1, adds variation: higher = it makes up more
+    sv_latent_noise: float = 0.0  # 0-1, the same, later in the process
+    sv_low_memory: bool = False  # saves graphics memory, slower
     open_when_done: bool = True  # GUI only
 
 
@@ -457,203 +466,221 @@ def load_onnx(c, name):
     return model
 
 
-# ================================================= inventing upscaler (Stable Diffusion x4)
-class ClipTokenizer:
-    r"""CLIP's byte-level BPE tokenizer in plain Python (as OpenAI's simple_tokenizer), from the vocab.json and
-    merges.txt files. Letters and digits are matched with [^\W\d_] and \d (Python's re has no \p{L})."""
-    PAT = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d|[^\W\d_]+|\d|(?:[^\s\w]|_)+", re.IGNORECASE)
-
-    def __init__(self, vocab_path, merges_path):
-        self.enc = json.loads(Path(vocab_path).read_text(encoding="utf-8"))
-        lines = Path(merges_path).read_text(encoding="utf-8").split("\n")
-        if lines and lines[0].startswith("#version"):
-            lines = lines[1:]
-        self.ranks = {tuple(ln.split()): i for i, ln in enumerate(l for l in lines if len(l.split()) == 2)}
-        keep = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-        chars, n = keep[:], 0
-        for b in range(256):
-            if b not in keep:
-                keep.append(b)
-                chars.append(256 + n)
-                n += 1
-        self.byte_char = dict(zip(keep, map(chr, chars)))
-        self.bos, self.eos = self.enc["<|startoftext|>"], self.enc["<|endoftext|>"]
-        self.cache = {}
-
-    def bpe(self, token):
-        if token in self.cache:
-            return self.cache[token]
-        word = tuple(token[:-1]) + (token[-1] + "</w>",)
-        while len(word) > 1:
-            pairs = set(zip(word, word[1:]))
-            best = min(pairs, key=lambda p: self.ranks.get(p, float("inf")))
-            if best not in self.ranks:
-                break
-            first, second = best
-            new, i = [], 0
-            while i < len(word):
-                if i < len(word) - 1 and word[i] == first and word[i + 1] == second:
-                    new.append(first + second)
-                    i += 2
-                else:
-                    new.append(word[i])
-                    i += 1
-            word = tuple(new)
-        self.cache[token] = word
-        return word
-
-    def __call__(self, text, length=77):
-        """The token ids of text: start, the words, end, then the pad token "!" up to length (the
-        x4 upscaler's tokenizer pads with "!", not with end)."""
-        ids = [self.bos]
-        for piece in self.PAT.findall(re.sub(r"\s+", " ", text).strip().lower()):
-            piece = "".join(self.byte_char[b] for b in piece.encode("utf-8"))
-            ids += [self.enc.get(t, self.eos) for t in self.bpe(piece)]
-        ids = ids[:length - 1] + [self.eos]
-        return ids + [self.enc.get("!", self.eos)] * (length - len(ids))
-
-
-ORT_NUMPY = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(double)": np.float64,
-             "tensor(int32)": np.int32, "tensor(int64)": np.int64}
-
-
-def ort_feed(sess, **arrays):
-    """The inputs of an onnxruntime session from named arrays, each made the type the model wants."""
-    types = {i.name: i.type for i in sess.get_inputs()}
-    return {k: np.ascontiguousarray(v, ORT_NUMPY.get(types[k], np.float32)) for k, v in arrays.items()}
-
-
-def ddim_alphas():
-    """The cumulative alphas of the scaled_linear noise schedule (1000 steps, betas 0.0001 to 0.02)."""
-    betas = np.linspace(0.0001 ** 0.5, 0.02 ** 0.5, 1000, dtype=np.float64) ** 2
-    return np.cumprod(1.0 - betas)
-
-
-def ddim_timesteps(n):
-    """The n timesteps of a DDIM run, from the noisiest down (steps_offset 1)."""
-    ratio = 1000 // n
-    return (np.arange(n) * ratio).round()[::-1].astype(np.int64) + 1, ratio
-
-
-def ddim_step(latents, v, t, ratio, acp):
-    """One DDIM step (eta 0) of a v-prediction model: the latents a little less noisy."""
-    prev = t - ratio
-    a_t, a_prev = acp[t], (acp[prev] if prev >= 0 else acp[0])   # set_alpha_to_one is False
-    x0 = np.sqrt(a_t) * latents - np.sqrt(1 - a_t) * v
-    eps = np.sqrt(a_t) * v + np.sqrt(1 - a_t) * latents
-    return (np.sqrt(a_prev) * x0 + np.sqrt(1 - a_prev) * eps).astype(np.float32)
-
-
-DIFF_TILE, DIFF_OVER = 128, 16     # low-resolution tile side and overlap (the results are 4x that)
-
-
-def diff_positions(n):
-    """Start of each low-resolution tile along a side of n pixels (n >= DIFF_TILE): every DIFF_TILE - DIFF_OVER, the last one flush."""
-    pos = list(range(0, n - DIFF_TILE + 1, DIFF_TILE - DIFF_OVER))
-    return pos if pos[-1] == n - DIFF_TILE else pos + [n - DIFF_TILE]
-
-
-def diff_window():
-    """The weight of a pixel of a 4x tile: 1 inside, fading out over the overlap at the edges, never 0."""
-    n, ov = DIFF_TILE * 4, DIFF_OVER * 4
-    ramp = np.minimum(np.minimum(np.arange(n) + 1, np.arange(n)[::-1] + 1) / (ov + 1.0), 1.0).astype(np.float32)
-    return ramp[:, None] * ramp[None, :]
-
-
+# ================================================= inventing upscaler (SeedVR2 3B)
 class Stopped(Exception):
     """The user pressed Stop in the middle of a long picture."""
 
 
-class Diffusion:
-    """Stable Diffusion x4 upscaler, as diffusers' StableDiffusionUpscalePipeline, in numpy: a text encoder, the
-    unet and the vae decoder (onnxruntime sessions) and the tokenizer."""
-
-    def __init__(self, tokenizer, encoder, unet, vae):
-        self.tok, self.enc, self.unet, self.vae = tokenizer, encoder, unet, vae
-
-    def embed(self, text):
-        ids = np.array([self.tok(text)])
-        name = self.enc.get_inputs()[0].name
-        return self.enc.run(None, ort_feed(self.enc, **{name: ids}))[0].astype(np.float32)
-
-    def tile(self, rng, low, emb, o, steps):
-        """One low-resolution tile (3 x h x w, -1..1) made 4x bigger: (3 x 4h x 4w, about -1..1)."""
-        acp = ddim_alphas()
-        n = o.diff_noise
-        low = np.sqrt(acp[n]) * low + np.sqrt(1 - acp[n]) * rng.standard_normal(low.shape)
-        low = np.repeat(low[None].astype(np.float32), 2, axis=0)       # for the prompt and for the negative prompt
-        h, w = low.shape[2:]
-        lat = rng.standard_normal((1, 4, h, w)).astype(np.float32)
-        ts, ratio = ddim_timesteps(steps)
-        labels = np.full((2,), n, np.int64)
-        for t in ts:
-            both = np.concatenate([np.repeat(lat, 2, axis=0), low], axis=1)
-            feed = ort_feed(self.unet, sample=both, timestep=np.array([t]), encoder_hidden_states=emb, class_labels=labels)
-            noise = self.unet.run(None, feed)[0].astype(np.float32)
-            v = noise[0:1] + o.diff_guidance * (noise[1:2] - noise[0:1])      # the negative prompt is first
-            lat = ddim_step(lat, v, int(t), ratio, acp)
-        name = self.vae.get_inputs()[0].name
-        return self.vae.run(None, ort_feed(self.vae, **{name: lat / 0.08333}))[0][0].astype(np.float32)
-
-    def run(self, im, o, seed, log, should_stop=lambda: False):
-        """Enlarge a PIL image 4x by tiles of DIFF_TILE pixels (feathered where they overlap)."""
-        steps = min(100, max(1, int(o.diff_steps)))
-        emb = np.concatenate([self.embed(o.diff_negative), self.embed(o.diff_prompt)])
-        a = np.asarray(im.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
-        H, W = a.shape[:2]
-        a = np.pad(a, ((0, max(0, DIFF_TILE - H)), (0, max(0, DIFF_TILE - W)), (0, 0)), mode="edge")
-        Hp, Wp = a.shape[:2]
-        tiles = [(y, x) for y in diff_positions(Hp) for x in diff_positions(Wp)]
-        acc, wsum, win = np.zeros((3, Hp * 4, Wp * 4), np.float32), np.zeros((Hp * 4, Wp * 4), np.float32), diff_window()
-        rng = np.random.default_rng(seed)
-        if len(tiles) > 16:
-            log(f"  {len(tiles)} tiles of {steps} steps each: this picture takes a long time (Stop works between tiles).")
-        for k, (y, x) in enumerate(tiles, 1):
-            if should_stop():
-                raise Stopped()
-            log(f"  tile {k}/{len(tiles)}")
-            r = self.tile(rng, a[y:y + DIFF_TILE, x:x + DIFF_TILE].transpose(2, 0, 1), emb, o, steps)
-            ys, xs = slice(y * 4, (y + DIFF_TILE) * 4), slice(x * 4, (x + DIFF_TILE) * 4)
-            acc[:, ys, xs] += r * win
-            wsum[ys, xs] += win
-        out = np.clip((acc / wsum + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8)
-        return Image.fromarray(out.transpose(1, 2, 0)[:H * 4, :W * 4], "RGB")
+def seedvr2_python():
+    """The Python of SeedVR2's own environment (seedvr2/venv)."""
+    return SEEDVR2_DIR / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def load_diffusion(c):
-    """The inventing upscaler ready to run, downloading its files (about 3.4 GB) on first use; None (after saying why) when not."""
-    if "diffusion" in c.models:
-        return c.models["diffusion"]
-    c.models["diffusion"] = None
-    if not HAVE_ORT:
-        c.once("no-ort-diffusion", f"{INSTALL_HINT} to use the inventing upscaler; using Real-ESRGAN instead")
-        return None
-    if not any(all((base / DIFFUSION_DIR / rel).is_file() for rel, _ in DIFFUSION_FILES) for base in (MODELS_DIR, c.work / "models")):
-        c.L("The inventing upscaler (Stable Diffusion x4) needs about 3.4 GB of downloads the first time.")
-    paths = {}
-    for rel, size in DIFFUSION_FILES:
-        paths[rel] = fetch_model(c, f"{DIFFUSION_DIR}/{rel}", DIFFUSION_URL + rel, size)
-        if paths[rel] is None:
-            return None
+def seedvr2_ready():
+    """True when SeedVR2 was set up completely (ready.json is written last) and its files are still there."""
+    return all(p.is_file() for p in (SEEDVR2_DIR / "ready.json", seedvr2_python(), SEEDVR2_DIR / "src" / "inference_cli.py"))
+
+
+def graphics_card_names():
+    """The names of the graphics cards (Windows only; elsewhere an empty text)."""
+    if os.name != "nt":
+        return ""
     try:
-        tok = ClipTokenizer(paths["tokenizer/vocab.json"], paths["tokenizer/merges.txt"])
-        sessions = [make_session(c, paths[f"{d}/model.onnx"]) for d in ("text_encoder", "unet", "vae")]
-        c.models["diffusion"] = Diffusion(tok, *sessions)
-        c.L("  Inventing upscaler: very slow (minutes per picture even on a graphics card) and it changes the "
-            "picture: faces and text can come out wrong. " + DIFFUSION_CREDIT)
-    except Exception as e:  # noqa: BLE001
-        c.L(f"  Could not start the inventing upscaler: {e}")
-    return c.models["diffusion"]
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"],
+                           capture_output=True, text=True, timeout=60)
+        return r.stdout
+    except Exception:  # noqa: BLE001
+        return ""
 
 
-def run_diffusion(c, im, f):
-    """The inventing upscaler on a PIL image: 4x bigger (the caller resizes to the exact size)."""
+def torch_kind(names):
+    """Which PyTorch fits the graphics card names: "nvidia", "amd" or "cpu" (nothing that fits)."""
+    low = names.lower()
+    if "nvidia" in low or "geforce" in low:
+        return "nvidia"
+    return "amd" if "radeon" in low or "amd" in low else "cpu"
+
+
+def seedvr2_steps(kind):
+    """The steps of the first-use set-up, in order: [(what it does, size, command)]. The command is a list to run, or
+    "source" (download the program files) or "requirements" (see seedvr2_requirements)."""
+    uv = [sys.executable, "-m", "uv"]
+    venv = str(SEEDVR2_DIR / "venv")
+    pip = uv + ["pip", "install", "--python", venv]
+    steps = [("Installing uv (a tool that sets up Python environments)", "small", [sys.executable, "-m", "pip", "install", "uv"]),
+             ("Making SeedVR2's own Python environment (Python 3.12)", "small", uv + ["venv", "--python", "3.12", venv]),
+             ("Downloading SeedVR2's program files", "about 6 MB", "source")]
+    if kind == "amd":
+        steps += [("Installing AMD's ROCm files for Windows", "about 1 GB", pip + [AMD_BASE + w for w in AMD_ROCM]),
+                  ("Installing AMD's PyTorch for Windows", "about 2 GB", pip + [AMD_BASE + w for w in AMD_TORCH])]
+    elif kind == "nvidia":
+        steps.append(("Installing PyTorch for NVIDIA", "about 3 GB", pip + ["torch", "torchvision", "--index-url", NVIDIA_TORCH_INDEX]))
+    else:
+        steps.append(("Installing PyTorch (processor only)", "about 0.2 GB", pip + ["torch", "torchvision"]))
+    steps.append(("Installing SeedVR2's other packages", "a few hundred MB", "requirements"))
+    return steps
+
+
+def seedvr2_requirements(constraints):
+    """The command that installs SeedVR2's other packages; the constraints file keeps the PyTorch that is already there."""
+    return [sys.executable, "-m", "uv", "pip", "install", "--python", str(SEEDVR2_DIR / "venv"),
+            "-r", str(SEEDVR2_DIR / "src" / "requirements.txt"), "-c", str(constraints)]
+
+
+def write_torch_constraints(path):
+    """Write the versions of torch and torchvision installed in SeedVR2's environment (so installing the rest cannot replace them)."""
+    lines = []
+    for pkg in ("torch", "torchvision"):
+        r = subprocess.run([str(seedvr2_python()), "-c", f"import importlib.metadata as m; print(m.version('{pkg}'))"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            lines.append(f"{pkg}=={r.stdout.strip()}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_streamed(c, argv, keep=None, cwd=None, every=0):
+    """Run a program with its output going into the log, line by line (only lines that start with one of `keep`, when
+    given; tqdm progress lines at most once every `every` seconds). Returns (exit code, its last lines). Pressing Stop
+    ends the program and raises Stopped."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+    p = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         encoding="utf-8", errors="replace", cwd=cwd, env=env)
+    q = queue.Queue()
+    threading.Thread(target=lambda: ([q.put(ln) for ln in p.stdout], q.put(None)), daemon=True).start()
+    tail, last_progress, done = [], 0.0, False
+    while not done:
+        try:
+            ln = q.get(timeout=0.3)
+        except queue.Empty:
+            ln = ""
+        if c.should_stop():
+            p.terminate()
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            raise Stopped()
+        if ln is None:
+            done = True
+            continue
+        ln = ln.strip()
+        if not ln:
+            continue
+        tail = (tail + [ln])[-12:]
+        if "%|" in ln:
+            if time.time() - last_progress < every:
+                continue
+            last_progress = time.time()
+        if keep is None or ln.lower().startswith(keep):
+            c.L("    " + ln[:300])
+    return p.wait(), tail
+
+
+def seedvr2_download_source(c):
+    """SeedVR2's program files (the pinned version) into seedvr2/src."""
+    SEEDVR2_DIR.mkdir(parents=True, exist_ok=True)
+    zpath, tmp = SEEDVR2_DIR / "src.zip", SEEDVR2_DIR / "unzipped"
+    part = zpath.with_name("src.zip.part")
+    urllib.request.urlretrieve(SEEDVR2_ZIP, part)
+    os.replace(part, zpath)
+    shutil.rmtree(tmp, ignore_errors=True)
+    with zipfile.ZipFile(zpath) as zf:
+        zf.extractall(tmp)
+    inner = [d for d in tmp.iterdir() if d.is_dir()]         # one folder, named after the repository and the version
+    if len(inner) != 1:
+        raise RuntimeError("the download has an unexpected content")
+    shutil.rmtree(SEEDVR2_DIR / "src", ignore_errors=True)
+    os.replace(inner[0], SEEDVR2_DIR / "src")
+    shutil.rmtree(tmp, ignore_errors=True)
+    zpath.unlink()
+
+
+def seedvr2_setup(c):
+    """Set SeedVR2 up the first time (see the constants at the top): True when it is ready. When a step fails, the log
+    says which and why, and False is returned; the next run tries again."""
+    if seedvr2_ready():
+        return True
+    c.L("SeedVR2 needs to be set up the first time (it needs PyTorch, about 3 GB, and takes a while).")
+    names = graphics_card_names()
+    kind = torch_kind(names)
+    if os.name == "nt":
+        c.L(f"  Graphics card: {names.strip().replace(chr(10), ', ') or 'not found'}")
+    if kind == "amd":
+        c.L("  AMD's PyTorch for Windows needs Windows 11 and AMD graphics driver 26.2.2 or newer.")
+    elif kind == "cpu" and os.name == "nt":
+        c.L("  No AMD or NVIDIA graphics card found: SeedVR2 will use the processor and be extremely slow.")
+    shutil.rmtree(SEEDVR2_DIR / "venv", ignore_errors=True)     # a half-made one from an earlier try
+    steps = seedvr2_steps(kind)
+    for i, (what, size, cmd) in enumerate(steps, 1):
+        if c.should_stop():
+            raise Stopped()
+        c.L(f"SeedVR2 set-up, step {i} of {len(steps)}: {what} ({size}) ...")
+        try:
+            if i == 1 and importlib.util.find_spec("uv") is not None:
+                c.L("    uv is already there.")
+            elif cmd == "source":
+                seedvr2_download_source(c)
+            else:
+                if cmd == "requirements":
+                    write_torch_constraints(SEEDVR2_DIR / "constraints.txt")
+                    cmd = seedvr2_requirements(SEEDVR2_DIR / "constraints.txt")
+                code, tail = run_streamed(c, cmd, SEEDVR2_KEEP)
+                if code != 0:
+                    raise RuntimeError(f"it stopped with exit code {code}:\n    " + "\n    ".join(tail[-6:]))
+        except Stopped:
+            raise
+        except Exception as e:  # noqa: BLE001
+            c.L(f"  This step failed: {what}\n    {e}")
+            c.L("SeedVR2 could not be set up; using plain resizing for it. The next run tries again.")
+            return False
+    (SEEDVR2_DIR / "ready.json").write_text(json.dumps({"commit": SEEDVR2_COMMIT, "torch": kind}), encoding="utf-8")
+    c.L("SeedVR2 is set up.")
+    return True
+
+
+def load_seedvr2(c):
+    """True when SeedVR2 can run (set up on first use); None (after saying why) when not."""
+    if "seedvr2" in c.models:
+        return c.models["seedvr2"]
+    c.models["seedvr2"] = True if seedvr2_setup(c) else None
+    if c.models["seedvr2"]:
+        c.L("  Inventing upscaler SeedVR2: slow (minutes per picture) and it changes the picture: faces and text can come "
+            "out wrong. " + SEEDVR2_CREDIT)
+    return c.models["seedvr2"]
+
+
+def seedvr2_options(o, seed, models_dir, src, dst, resolution):
+    """The command line of SeedVR2's inference_cli.py for one picture."""
+    cmd = [seedvr2_python(), SEEDVR2_DIR / "src" / "inference_cli.py", src, "--output", dst, "--dit_model", SEEDVR2_DIT,
+           "--model_dir", models_dir, "--resolution", resolution, "--batch_size", 1, "--seed", seed,
+           "--color_correction", o.sv_color, "--input_noise_scale", f"{o.sv_input_noise:g}",
+           "--latent_noise_scale", f"{o.sv_latent_noise:g}", "--vae_encode_tiled", "--vae_decode_tiled"]
+    if o.sv_low_memory:
+        cmd += ["--blocks_to_swap", 32, "--swap_io_components", "--dit_offload_device", "cpu", "--vae_offload_device", "cpu"]
+    return [str(a) for a in cmd]
+
+
+def run_seedvr2(c, im, target):
+    """SeedVR2 on a PIL image: restored and enlarged to the short side of `target` (the caller resizes to the exact size)."""
     o = c.o
-    c.once("diffusion-seed", f"Inventing upscaler: seed {c.diff_seed}" + (
-        " (chosen at random; type it under Seed to get the same result again)" if not o.diff_seed else ""))
-    if f > 4:
-        c.once("diffusion-4x", "  The inventing upscaler only invents at 4x; for a bigger size the 4x result is resized.")
-    return c.models["diffusion"].run(im, o, c.diff_seed, c.L, c.should_stop)
+    side = min(target)
+    c.once("seedvr2-seed", f"Inventing upscaler SeedVR2: seed {c.sv_seed}" + (
+        " (chosen at random; type it under Seed to get the same result again)" if not o.sv_seed else ""))
+    if side > 2160:
+        c.once("seedvr2-big", "  SeedVR2 at more than 2160 px is very slow and may run out of graphics memory; "
+                              "turn on Save graphics memory if it fails.")
+    models_dir = writable_dir(MODELS_DIR, c.work / "models") / "seedvr2"
+    if not any(models_dir.rglob(SEEDVR2_DIT)):
+        c.L("  SeedVR2 downloads its model files (about 3.9 GB) the first time it runs.")
+    src, dst = c.tmp / "seedvr2_in.png", c.tmp / "seedvr2_out.png"
+    dst.unlink(missing_ok=True)
+    im.convert("RGB").save(src)
+    cmd = seedvr2_options(o, c.sv_seed, models_dir, src, dst, side)
+    code, tail = run_streamed(c, cmd, None, cwd=SEEDVR2_DIR / "src", every=10)
+    if not dst.is_file():
+        raise RuntimeError(f"SeedVR2 made no picture (exit code {code}): " + " | ".join(tail[-3:]))
+    with Image.open(dst) as r:
+        return r.convert("RGB")
 
 
 # ============================================================ face restoration
@@ -1012,7 +1039,7 @@ class Context:
     def __init__(self, o, L, work):
         self.o, self.L, self.work, self.exe = o, L, work, None
         self.models, self.prov, self.said = {}, None, set()   # ONNX models by name, providers, notes made
-        self.diff_seed = int(o.diff_seed) or random.SystemRandom().randrange(1, 2 ** 31)   # the inventing upscaler's seed this run
+        self.sv_seed = int(o.sv_seed) or random.SystemRandom().randrange(1, 2 ** 31)   # the inventing upscaler's seed this run
         self.should_stop = lambda: False
         key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
                       o.color_boost, o.use_ai, o.color_model)
@@ -1025,7 +1052,7 @@ class Context:
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
         self.up_model = o.up_model
-        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", "diffusion", *UPSCALERS, *extra_models()):
+        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", "seedvr2", *UPSCALERS, *extra_models()):
             L(f"Unknown upscale model '{o.up_model}'; choosing automatically.")
             self.up_model = "auto"
 
@@ -1136,7 +1163,7 @@ def page_to_original(o, w, h):
 # ---- one upscaled image
 def upscale_model(c, cls, force=None):
     """(engine, model name, model folder, native scale) for this kind of picture, or None for plain
-    resizing. The engine is "ncnn" (Real-ESRGAN program), "onnx" (onnxruntime) or "diffusion". With force
+    resizing. The engine is "ncnn" (Real-ESRGAN program), "onnx" (onnxruntime) or "seedvr2". With force
     (Compare models) that model or nothing: no automatic choice and no other model in its place."""
     if not c.o.use_ai:
         return None
@@ -1144,12 +1171,8 @@ def upscale_model(c, cls, force=None):
     pick = force or c.up_model
     if pick == "auto":
         pick = ("animesharp" if cls in ("lineart", "flatcolor") else "dat") if c.gpu() else ncnn
-    if pick == "diffusion":
-        if load_diffusion(c):
-            return "diffusion", pick, None, 4
-        if force:
-            return None
-        pick = ncnn
+    if pick == "seedvr2":
+        return ("seedvr2", pick, None, 1) if load_seedvr2(c) else None      # when it cannot be had: plain resizing
     if pick in UPSCALERS:
         model = load_onnx(c, pick)
         if model:
@@ -1192,9 +1215,9 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
 
     def cache_file(name):
         faces = f"_faces{o.face_strength}_{o.face_model}" if o.faces else ""
-        if name == "diffusion":      # its settings change the picture
-            name += "_" + hashlib.md5(repr((o.diff_prompt, o.diff_negative, o.diff_noise, o.diff_steps, o.diff_guidance,
-                                            c.diff_seed)).encode()).hexdigest()[:8]
+        if name == "seedvr2":        # its settings change the picture
+            name += "_" + hashlib.md5(repr((o.sv_color, o.sv_input_noise, o.sv_latent_noise, o.sv_low_memory,
+                                            c.sv_seed)).encode()).hexdigest()[:8]
         return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_{target[0]}x{target[1]}{faces}{'_coloured' if o.colorize else ''}.png"
 
     cache = cache_file(label)
@@ -1222,8 +1245,8 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
                 c.exe = None
         else:
             try:
-                if m[0] == "diffusion":
-                    up = run_diffusion(c, im, f)
+                if m[0] == "seedvr2":
+                    up = run_seedvr2(c, im, target)
                 else:
                     model = c.models[m[1]]
                     up = run_tiles(model, im)
@@ -1443,9 +1466,9 @@ def key_lines(o, order, labels, times, fails, pictures):
               f"Enlarge: {o.size_px} px {o.size_mode}" if o.size_mode != "scale" else f"Enlarge: {o.scale}x",
               f"Restore faces: {'on, ' + o.face_model + ', strength ' + str(o.face_strength) if o.faces else 'off'}",
               f"Colour black-and-white photos: {'on' if o.colorize else 'off'}", f"File type: {o.file_type}"]
-    if "diffusion" in labels:
-        lines.append(f"Inventing upscaler: prompt '{o.diff_prompt}', negative '{o.diff_negative}', noise {o.diff_noise}, "
-                     f"steps {o.diff_steps}, guidance {o.diff_guidance:g}, seed {o.diff_seed or 'random'}")
+    if "seedvr2" in labels:
+        lines.append(f"Inventing upscaler: colours {o.sv_color}, input noise {o.sv_input_noise:g}, latent noise {o.sv_latent_noise:g}, "
+                     f"seed {o.sv_seed or 'random'}, save graphics memory {'on' if o.sv_low_memory else 'off'}")
     return lines
 
 
@@ -1704,7 +1727,7 @@ HELP = {
                 "Photo HEART (new, experimental, about 75 MB) is a brand-new photo model from November 2026, less "
                 "proven than the others. These are only used when you pick them; Automatic never picks HAT-GAN, HEART, BHI or DRCT. "
                 "The photo models are slow without a graphics card (needs onnxruntime-directml). "
-                "Inventing: Stable Diffusion x4 makes up detail that is not in the picture; see the Inventing upscaler settings. "
+                "Inventing: SeedVR2 3B restores a picture by making up detail that is not in it; see the Inventing upscaler settings. "
                 "Other models you put in the models folder next to the program "
                 "(NAME.param and NAME.bin, or NAME.onnx) are listed at the end.",
     "animesharp_warning": "AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). Don't sell or "
@@ -1741,16 +1764,19 @@ HELP = {
                       "at random for every run. key.png and key.txt in the new folder say which letter is which model: "
                       "open them only after you have chosen. Uses the first 4 pictures. Models that are not downloaded "
                       "yet are downloaded first. The Inventing model is unticked: it takes minutes per picture and makes up detail.",
-    "diff_prompt": "Describe the picture; it steers what gets invented.",
-    "diff_negative": "What it should stay away from.",
-    "diff_noise": "How much it may invent: low keeps close to your picture, high makes up more. 0 to 350.",
-    "diff_steps": "More steps = slower, a bit finer. 5 to 100.",
-    "diff_guidance": "How strongly it follows the prompt. 1 to 15.",
-    "diff_seed": "The starting point of the invention. The same number gives the same result. 0 = a new random number "
-                 "each run; the log says which one was used.",
-    "diff_warning": "The inventing upscaler (Stable Diffusion x4) is very slow: minutes per picture even on a graphics "
-                    "card, much slower on the processor. The first time it downloads 3.4 GB. It changes the picture: "
-                    "faces and text can come out wrong. Only used when you pick it.",
+    "sv_seed": "The starting point of the invention. The same number gives the same result. 0 = a new random number "
+               "each run; the log says which one was used.",
+    "sv_color": "How it keeps the colours of your picture. lab (recommended) matches them closely; wavelet, "
+                "wavelet_adaptive, hsv and adain are other ways; none leaves the colours as SeedVR2 makes them.",
+    "sv_input_noise": "Adds variation before it starts: higher = it makes up more. 0 to 1. 0 keeps closest to your picture.",
+    "sv_latent_noise": "Adds variation while it works: higher = it makes up more. 0 to 1. 0 keeps closest to your picture.",
+    "sv_low_memory": "Moves parts of SeedVR2 out of the graphics memory while it works. Slower, but fits a card with less "
+                     "memory. Turn it on if it runs out of graphics memory.",
+    "sv_warning": "SeedVR2 restores a picture by making up detail (no text needed). It is slow: minutes per picture, and "
+                  "faces and text can come out wrong. The first time it sets itself up: about 3 GB of PyTorch and about "
+                  "3.9 GB of model files are downloaded. On an AMD card it needs Windows 11 and AMD graphics driver "
+                  "26.2.2 or newer. SeedVR2 by ByteDance Seed and the command line tool by numz are both Apache-2.0. "
+                  "Only used when you pick it.",
     "name": "Bigger images only. How the new files are named. Automatic: photo_x2.png. Or add your own text after "
             "the name (photo_big.png) or before it (big_photo.png), so you can find the pictures again. "
             "Two files with the same name get _2.",
@@ -1885,12 +1911,11 @@ def build_window():
     v_redo = tk.BooleanVar(value=o.redo)
     v_open = tk.BooleanVar(value=o.open_when_done)
     v_cmp = {key: tk.BooleanVar(value=key in o.compare_models) for key in compare_choices(o)}
-    v_diff_prompt = tk.StringVar(value=o.diff_prompt)
-    v_diff_negative = tk.StringVar(value=o.diff_negative)
-    v_diff_noise = tk.StringVar(value=str(o.diff_noise))
-    v_diff_steps = tk.StringVar(value=str(o.diff_steps))
-    v_diff_guidance = tk.StringVar(value=f"{o.diff_guidance:g}")
-    v_diff_seed = tk.StringVar(value=str(o.diff_seed))
+    v_sv_seed = tk.StringVar(value=str(o.sv_seed))
+    v_sv_color = tk.StringVar(value=o.sv_color if o.sv_color in SEEDVR2_COLORS else "lab")
+    v_sv_input_noise = tk.StringVar(value=f"{o.sv_input_noise:g}")
+    v_sv_latent_noise = tk.StringVar(value=f"{o.sv_latent_noise:g}")
+    v_sv_low_memory = tk.BooleanVar(value=o.sv_low_memory)
     v_help = tk.StringVar(value=HELP_DEFAULT)
     v_count = tk.StringVar()
 
@@ -2114,15 +2139,14 @@ def build_window():
     row(g2, "Model for coloured art", combo(v_color_model, COLOR_MODEL), "model", "pdf")
 
     # ---- the inventing upscaler's settings: shown when it is the model, or is ticked for Compare models
-    g_diff = group("Inventing upscaler (Stable Diffusion x4)")
-    row(g_diff, "", lambda p: ttk.Label(p, text="Very slow, 3.4 GB on first use, and it makes things up.",
-                                        foreground="#c25a00", font=small, wraplength=300, justify="left"), "diff_warning")
-    row(g_diff, "Describe the picture", entry_row(v_diff_prompt), "diff_prompt")
-    row(g_diff, "Stay away from", entry_row(v_diff_negative), "diff_negative")
-    row(g_diff, "How much it may invent (0-350)", spin(v_diff_noise, 0, 350, 5), "diff_noise")
-    row(g_diff, "Steps (5-100)", spin(v_diff_steps, 5, 100, 5), "diff_steps")
-    row(g_diff, "Follow the description (1-15)", spin(v_diff_guidance, 1, 15, 0.5), "diff_guidance")
-    row(g_diff, "Seed (0 = random each run)", spin(v_diff_seed, 0, 2147483647, 1, 10), "diff_seed")
+    g_sv = group("Inventing upscaler (SeedVR2 3B)")
+    row(g_sv, "", lambda p: ttk.Label(p, text="Slow, about 7 GB of downloads on first use, and it makes things up.",
+                                      foreground="#c25a00", font=small, wraplength=300, justify="left"), "sv_warning")
+    row(g_sv, "Seed (0 = random each run)", spin(v_sv_seed, 0, 2147483647, 1, 10), "sv_seed")
+    row(g_sv, "Keep the colours (how)", combo(v_sv_color, SEEDVR2_COLORS, 16), "sv_color")
+    row(g_sv, "Input noise (0-1)", spin(v_sv_input_noise, 0, 1, 0.1), "sv_input_noise")
+    row(g_sv, "Latent noise (0-1)", spin(v_sv_latent_noise, 0, 1, 0.1), "sv_latent_noise")
+    row(g_sv, "Save graphics memory (slower)", check(v_sv_low_memory, "on"), "sv_low_memory")
 
     # ---- 4. Options
     g3 = group("4. Options")
@@ -2187,8 +2211,8 @@ def build_window():
         for w in {w for widgets in only.values() for w in widgets}:    # a setting can belong to more than one output
             (w.grid if w in shown else w.grid_remove)()
         picked = MODEL.get(v_model.get(), "auto")
-        invents = (mode == "upscale" and picked == "diffusion") or (mode == "compare" and v_cmp["diffusion"].get())
-        (g_diff.grid if invents else g_diff.grid_remove)()
+        invents = (mode == "upscale" and picked == "seedvr2") or (mode == "compare" and v_cmp["seedvr2"].get())
+        (g_sv.grid if invents else g_sv.grid_remove)()
         if MAKE.get(v_make.get()) == "upscale" and (picked == "animesharp" or (picked == "auto" and KIND.get(v_kind.get()) != "photo")):
             w_licence.grid()
             lab_licence.grid()
@@ -2207,7 +2231,7 @@ def build_window():
             e.configure(state="disabled" if auto_name else "normal")
         for e in w_save_to.winfo_children():
             e.configure(state="normal" if SAVE.get(v_save.get()) else "disabled")
-    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind, v_scale, v_px, v_cmp["diffusion"]):
+    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind, v_scale, v_px, v_cmp["seedvr2"]):
         var.trace_add("write", sync)
     sync()
 
@@ -2282,12 +2306,11 @@ def build_window():
         ob.face_model = FACE[v_face_model.get()]
         ob.colorize = bool(v_colorize.get())
         ob.compare_models = [k for k, v in v_cmp.items() if v.get()]
-        ob.diff_prompt = v_diff_prompt.get().strip()
-        ob.diff_negative = v_diff_negative.get().strip()
-        ob.diff_noise = min(350, max(0, num(v_diff_noise, "How much it may invent")))
-        ob.diff_steps = min(100, max(5, num(v_diff_steps, "Steps")))
-        ob.diff_guidance = min(15.0, max(1.0, num(v_diff_guidance, "Follow the description", float)))
-        ob.diff_seed = min(2147483647, max(0, num(v_diff_seed, "Seed")))
+        ob.sv_seed = min(2147483647, max(0, num(v_sv_seed, "Seed")))
+        ob.sv_color = v_sv_color.get() if v_sv_color.get() in SEEDVR2_COLORS else "lab"
+        ob.sv_input_noise = min(1.0, max(0.0, num(v_sv_input_noise, "Input noise", float)))
+        ob.sv_latent_noise = min(1.0, max(0.0, num(v_sv_latent_noise, "Latent noise", float)))
+        ob.sv_low_memory = bool(v_sv_low_memory.get())
         ob.name_mode = NAME[v_name.get()]
         ob.name_text = v_name_text.get().strip()
         ob.file_type = v_type.get().lower()
@@ -2477,7 +2500,7 @@ def build_window():
                            count_text=v_count, vars=SimpleNamespace(make=v_make, save=v_save, save_to=v_save_to,
                                                                     name=v_name, faces=v_faces, ai=v_ai, model=v_model,
                                                                     compare=v_cmp),
-                           group_diff=g_diff, b_prev=b_prev,
+                           group_diff=g_sv, b_prev=b_prev,
                            begin=begin, state=state, log_text=log_text, help_text=v_help, sync=sync,
                            toggle_more=toggle_more, dnd=dnd, left=left)
 
@@ -2513,23 +2536,23 @@ def main():
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
                     help="upscale mode: auto (default), general, anime, dat (Web photo model), animesharp (drawings), hatgan "
                          "(clean photos), heart (new, experimental photo model), bhi, drct (more web photo models), "
-                         "diffusion (inventing: makes up detail, very slow), or the name of an extra model "
+                         "seedvr2 (inventing: restores by making up detail, very slow), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
     ap.add_argument("--compare", default=None, metavar="MODELS",
                     help="Compare models (blind): a comma separated list of upscale models, or all (every model, "
                          "also the inventing one). Makes the first 4 pictures with each, plus plain resizing, as pictures "
                          "A, B, C ... with a key.png saying which is which. Same as --mode compare with a list; "
                          "without a list --mode compare uses " + ",".join(Options().compare_models))
-    ap.add_argument("--diff-prompt", default=Options.diff_prompt, help="inventing upscaler: describe the picture (default: %(default)s)")
-    ap.add_argument("--diff-negative", default=Options.diff_negative, help="inventing upscaler: what to stay away from (default: %(default)s)")
-    ap.add_argument("--diff-noise", type=int, default=Options.diff_noise, metavar="N",
-                    help="inventing upscaler: 0-350, how much it may invent (default %(default)s)")
-    ap.add_argument("--diff-steps", type=int, default=Options.diff_steps, metavar="N",
-                    help="inventing upscaler: 5-100, more is slower and a bit finer (default %(default)s)")
-    ap.add_argument("--diff-guidance", type=float, default=Options.diff_guidance, metavar="N",
-                    help="inventing upscaler: 1-15, how strongly it follows the prompt (default %(default)s)")
-    ap.add_argument("--diff-seed", type=int, default=Options.diff_seed, metavar="N",
+    ap.add_argument("--sv-seed", type=int, default=Options.sv_seed, metavar="N",
                     help="inventing upscaler: the same seed gives the same result; 0 = a new random seed each run (default %(default)s)")
+    ap.add_argument("--sv-color", choices=SEEDVR2_COLORS, default=Options.sv_color,
+                    help="inventing upscaler: how it keeps the colours of your picture (default %(default)s)")
+    ap.add_argument("--sv-input-noise", type=float, default=Options.sv_input_noise, metavar="N",
+                    help="inventing upscaler: 0-1, adds variation: higher = it makes up more (default %(default)s)")
+    ap.add_argument("--sv-latent-noise", type=float, default=Options.sv_latent_noise, metavar="N",
+                    help="inventing upscaler: 0-1, adds variation: higher = it makes up more (default %(default)s)")
+    ap.add_argument("--sv-low-memory", action="store_true",
+                    help="inventing upscaler: save graphics memory (slower)")
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
     ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces")
     ap.add_argument("--face-model", choices=list(FACE_MODELS), default="gfpgan",
@@ -2560,8 +2583,8 @@ def main():
         ap.error("the size in pixels must be between 1 and 20000")
     if a.name_suffix and a.name_prefix:
         ap.error("use --name-suffix or --name-prefix, not both")
-    for name, value, lo, hi in (("--diff-noise", a.diff_noise, 0, 350), ("--diff-steps", a.diff_steps, 5, 100),
-                                ("--diff-guidance", a.diff_guidance, 1, 15), ("--diff-seed", a.diff_seed, 0, 2 ** 31 - 1)):
+    for name, value, lo, hi in (("--sv-seed", a.sv_seed, 0, 2 ** 31 - 1), ("--sv-input-noise", a.sv_input_noise, 0, 1),
+                                ("--sv-latent-noise", a.sv_latent_noise, 0, 1)):
         if not lo <= value <= hi:
             ap.error(f"{name} must be between {lo} and {hi}")
     compare = Options().compare_models
@@ -2580,9 +2603,9 @@ def main():
                 mode=a.mode, save_to=a.save_to, scale=a.scale, size_mode=size_mode, size_px=size_px, shrink_bigger=a.shrink_bigger, up_model=a.upscale_model, file_type=a.format,
                 kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
-                face_model=a.face_model, colorize=a.colorize, compare_models=compare, diff_prompt=a.diff_prompt,
-                diff_negative=a.diff_negative, diff_noise=a.diff_noise, diff_steps=a.diff_steps,
-                diff_guidance=a.diff_guidance, diff_seed=a.diff_seed)
+                face_model=a.face_model, colorize=a.colorize, compare_models=compare, sv_seed=a.sv_seed,
+                sv_color=a.sv_color, sv_input_noise=a.sv_input_noise, sv_latent_noise=a.sv_latent_noise,
+                sv_low_memory=a.sv_low_memory)
     if a.preview:
         items = make_preview(o, print)
         if not items:

@@ -1,6 +1,6 @@
 name: Models
 
-# Downloads the real upscale (DAT, BHI, DRCT, AnimeSharp, HAT-GAN, HEART, Stable Diffusion x4), colouring (DDColor) and face (GFPGAN, CodeFormer) models and runs them on made-up pictures (CPU only, slow).
+# Downloads the real upscale (DAT, BHI, DRCT, AnimeSharp, HAT-GAN, HEART), colouring (DDColor) and face (GFPGAN, CodeFormer) models and runs them on made-up pictures (CPU only, slow).
 # Not part of the normal Checks, which never download models.
 on:
   workflow_dispatch:

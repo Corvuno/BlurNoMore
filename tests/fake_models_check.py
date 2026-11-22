@@ -1,12 +1,15 @@
-"""Fake-model check: runs the new photo models, the inventing (Stable Diffusion) upscaler and Compare models end to
-end with small made-up ONNX models (they do almost nothing, but have the real file names and input names), so no real
-model has to be downloaded. The real models run in the "Models" workflow.
+"""Fake-model check: runs the new photo models, the inventing upscaler (SeedVR2) and Compare models end to
+end with small made-up ONNX models (they do almost nothing, but have the real file names and input names) and a fake
+SeedVR2 tool (a script that takes the same options and only resizes), so no real model has to be downloaded. The real
+photo models run in the "Models" workflow; the real SeedVR2 (PyTorch and 3.9 GB of model files) is never run here.
 Run:  python tests/fake_models_check.py   (needs pillow, numpy, img2pdf, onnxruntime and onnx). Exits non-zero on failure.
 Everything happens in temporary folders; the models folder next to the program is not touched."""
 import hashlib
 import json
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -45,90 +48,57 @@ def fake_upscaler(path, mode, tile=256):
          [const("scales", np.array([1, 1, 4, 4], np.float32))], path)
 
 
-def fake_text_encoder(path):
-    save([h.make_node("Cast", ["input_ids"], ["f"], to=T.FLOAT),
-          h.make_node("Unsqueeze", ["f", "axis"], ["f3"]),
-          h.make_node("Mul", ["f3", "ramp"], ["last_hidden_state"])],
-         [h.make_tensor_value_info("input_ids", T.INT32, ["batch", 77])],
-         [h.make_tensor_value_info("last_hidden_state", T.FLOAT, ["batch", 77, 1024])],
-         [const("axis", np.array([2], np.int64)), const("ramp", (np.arange(1024, dtype=np.float32) / 1024.0)[None, None, :])], path)
-
-
-def fake_unet(path, timestep_type):
-    """Gives the v that makes every DDIM step land on the (noisy) low-resolution picture, so the result is that picture.
-    All four inputs are used, with the names and types of the real unet."""
-    acp = bn.ddim_alphas().astype(np.float32)
-    n = [h.make_node("Slice", ["sample", "s0", "s4", "ax1"], ["lat"]),
-         h.make_node("Slice", ["sample", "s4", "s7", "ax1"], ["rgb"]),
-         h.make_node("Slice", ["sample", "s4", "s5", "ax1"], ["r"]),
-         h.make_node("Mul", ["r", "zero"], ["zeros"]),
-         h.make_node("Concat", ["rgb", "zeros"], ["target"], axis=1),
-         h.make_node("Cast", ["timestep"], ["t64"], to=T.INT64),
-         h.make_node("Gather", ["acp", "t64"], ["a1"]),
-         h.make_node("Reshape", ["a1", "shape4"], ["a"]),
-         h.make_node("Sqrt", ["a"], ["sa"]),
-         h.make_node("Sub", ["one", "a"], ["b"]),
-         h.make_node("Sqrt", ["b"], ["sb"]),
-         h.make_node("Mul", ["sa", "lat"], ["sal"]),
-         h.make_node("Sub", ["sal", "target"], ["num"]),
-         h.make_node("Div", ["num", "sb"], ["v0"]),
-         h.make_node("ReduceMean", ["encoder_hidden_states"], ["m"], keepdims=0),
-         h.make_node("Cast", ["class_labels"], ["cl"], to=T.FLOAT),
-         h.make_node("ReduceMean", ["cl"], ["clm"], keepdims=0),
-         h.make_node("Add", ["m", "clm"], ["mm"]),
-         h.make_node("Mul", ["mm", "zero"], ["noeffect"]),
-         h.make_node("Add", ["v0", "noeffect"], ["out_sample"])]
-    save(n, [h.make_tensor_value_info("sample", T.FLOAT, ["batch", 7, "h", "w"]),
-             h.make_tensor_value_info("timestep", timestep_type, [1]),
-             h.make_tensor_value_info("encoder_hidden_states", T.FLOAT, ["batch", 77, 1024]),
-             h.make_tensor_value_info("class_labels", T.INT64, ["batch"])],
-         [h.make_tensor_value_info("out_sample", T.FLOAT, ["batch", 4, "h", "w"])],
-         [const("s0", np.array([0], np.int64)), const("s4", np.array([4], np.int64)), const("s5", np.array([5], np.int64)),
-          const("s7", np.array([7], np.int64)), const("ax1", np.array([1], np.int64)), const("zero", np.array(0, np.float32)),
-          const("one", np.array(1, np.float32)), const("acp", acp), const("shape4", np.array([1, 1, 1, 1], np.int64))], path)
-
-
-def fake_vae(path):
-    save([h.make_node("Slice", ["latent_sample", "s0", "s3", "ax1"], ["rgb"]),
-          h.make_node("Mul", ["rgb", "k"], ["small"]),
-          h.make_node("Resize", ["small", "", "scales"], ["sample"], mode="linear")],
-         [h.make_tensor_value_info("latent_sample", T.FLOAT, ["batch", 4, "h", "w"])],
-         [h.make_tensor_value_info("sample", T.FLOAT, ["batch", 3, "H", "W"])],
-         [const("s0", np.array([0], np.int64)), const("s3", np.array([3], np.int64)), const("ax1", np.array([1], np.int64)),
-          const("k", np.array(0.08333, np.float32)), const("scales", np.array([1, 1, 4, 4], np.float32))], path)
-
-
-def fake_tokenizer(folder):
-    """A tiny vocab in the real format: the 256 byte characters, the same with </w>, the merges, the two special tokens."""
-    keep = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-    chars, k = keep[:], 0
-    for b in range(256):
-        if b not in keep:
-            keep.append(b)
-            chars.append(256 + k)
-            k += 1
-    letters = [chr(c) for c in chars]
-    merges = ["t h", "th e</w>", "c a", "ca t</w>"]
-    vocab = letters + [c + "</w>" for c in letters] + ["".join(m.split()) for m in merges] + ["<|startoftext|>", "<|endoftext|>"]
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "vocab.json").write_text(json.dumps({t: i for i, t in enumerate(vocab)}), encoding="utf-8")
-    (folder / "merges.txt").write_text("#version: 0.2\n" + "\n".join(merges) + "\n", encoding="utf-8")
-    return vocab
-
-
-def install_fakes(models, with_diffusion=True, timestep_type=T.INT64, skip=()):
+def install_fakes(models, skip=()):
     """Fake models under their real file names in the models folder `models`."""
-    for i, (key, mode) in enumerate((("dat", "nearest"), ("bhi", "linear"), ("drct", "cubic"), ("hatgan", "linear"),
-                                     ("heart", "cubic"))):
+    for key, mode in (("dat", "nearest"), ("bhi", "linear"), ("drct", "cubic"), ("hatgan", "linear"), ("heart", "cubic")):
         if key not in skip:
             fake_upscaler(models / bn.UPSCALERS[key]["file"], mode, 128 if key == "drct" else 256)
-    if with_diffusion:
-        d = models / bn.DIFFUSION_DIR
-        fake_text_encoder(d / "text_encoder" / "model.onnx")
-        fake_unet(d / "unet" / "model.onnx", timestep_type)
-        (d / "unet" / "weights.pb").write_bytes(b"")
-        fake_vae(d / "vae" / "model.onnx")
-        return fake_tokenizer(d / "tokenizer")
+
+
+FAKE_CLI = r'''"""A fake SeedVR2 inference_cli.py: the same options, then only a Lanczos resize to --resolution (short side)."""
+import argparse, json, os, sys, time
+from pathlib import Path
+from PIL import Image
+ap = argparse.ArgumentParser()
+ap.add_argument("input"); ap.add_argument("--output"); ap.add_argument("--dit_model"); ap.add_argument("--model_dir")
+ap.add_argument("--resolution", type=int); ap.add_argument("--batch_size", type=int); ap.add_argument("--seed", type=int)
+ap.add_argument("--color_correction"); ap.add_argument("--input_noise_scale", type=float); ap.add_argument("--latent_noise_scale", type=float)
+ap.add_argument("--vae_encode_tiled", action="store_true"); ap.add_argument("--vae_decode_tiled", action="store_true")
+ap.add_argument("--blocks_to_swap", type=int, default=0); ap.add_argument("--swap_io_components", action="store_true")
+ap.add_argument("--dit_offload_device", default="none"); ap.add_argument("--vae_offload_device", default="none")
+a = ap.parse_args()
+root = Path(__file__).resolve().parent.parent
+with open(root / "calls.jsonl", "a") as f:
+    f.write(json.dumps(vars(a)) + "\n")
+(root / "pid.txt").write_text(str(os.getpid()))
+if os.environ.get("FAKE_SV_FAIL"):
+    print("RuntimeError: out of graphics memory (fake)"); sys.exit(1)
+if os.environ.get("FAKE_SV_SLOW"):
+    for i in range(300):
+        print(f"progress step {i}", flush=True); time.sleep(0.2)
+im = Image.open(a.input).convert("RGB")
+w, h = im.size
+f = a.resolution / min(w, h)
+im.resize((max(1, round(w * f)), max(1, round(h * f))), Image.LANCZOS).save(a.output)
+print("Output saved to:", a.output)
+'''
+
+
+def install_fake_seedvr2(root, ready=True):
+    """A fake seedvr2/ folder: ready.json, a "venv" whose python is this python, and the fake tool."""
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / "src" / "inference_cli.py").write_text(FAKE_CLI, encoding="utf-8")
+    py = root / "venv" / "bin" / "python"
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    py.chmod(0o755)
+    (root / "calls.jsonl").unlink(missing_ok=True)
+    if ready:
+        (root / "ready.json").write_text(json.dumps({"commit": bn.SEEDVR2_COMMIT, "torch": "cpu"}))
+
+
+def last_call(root):
+    return json.loads((root / "calls.jsonl").read_text().splitlines()[-1])
 
 
 # ---------------------------------------------------------------- helpers
@@ -156,17 +126,6 @@ def make_run(models_dir, work, **kw):
     return bn.run(o, lines.append), lines
 
 
-def check_tokenizer(t):
-    vocab = fake_tokenizer(t / "tok")
-    tok = bn.ClipTokenizer(t / "tok" / "vocab.json", t / "tok" / "merges.txt")
-    ids = tok("  The   cat xyz ")
-    ix = {v: i for i, v in enumerate(vocab)}
-    assert ids == [ix["<|startoftext|>"], ix["the</w>"], ix["cat</w>"], ix["x"], ix["y"], ix["z</w>"]] \
-        + [ix["<|endoftext|>"]] + [ix["!"]] * 70, ids
-    assert len(tok("word " * 200)) == 77 and tok("word " * 200)[-1] == ix["<|endoftext|>"]
-    print("tokenizer ok")
-
-
 def main():
     saved_models_dir = bn.MODELS_DIR
     try:
@@ -178,9 +137,10 @@ def main():
 
 def check():
     with tempfile.TemporaryDirectory() as t_models, tempfile.TemporaryDirectory() as t_in, \
-            tempfile.TemporaryDirectory() as t_out, tempfile.TemporaryDirectory() as t_tok:
+            tempfile.TemporaryDirectory() as t_out, tempfile.TemporaryDirectory() as t_sv:
         models, pics, out = Path(t_models), Path(t_in), Path(t_out)
-        check_tokenizer(Path(t_tok))
+        sv = Path(t_sv) / "seedvr2"
+        bn.SEEDVR2_DIR = sv
         install_fakes(models)
         photo(48, 40).save(pics / "small.png")
         photo(200, 150, 2).save(pics / "bigger.png")
@@ -194,49 +154,113 @@ def check():
             assert len(files) == 1 and Image.open(files[0]).size == (96, 80), f"{key}: wrong size"
         print("photo models ok")
 
-        # 2. the inventing upscaler: exact 4x size, close to plain resizing (the fake gives back the picture), a seed, tiles
-        for ttype, name in ((T.INT64, "int64 timestep"), (T.FLOAT, "float timestep")):
-            install_fakes(models, timestep_type=ttype, skip=("dat", "bhi", "drct", "hatgan", "heart"))
-            for f in (4, 2, 8):
-                res, log = make_run(models, out / f"diff{ttype}{f}", inputs=[str(pics / "small.png")], mode="upscale",
-                                    up_model="diffusion", scale=f if f != 8 else 4, size_mode="scale", diff_steps=5, diff_noise=0, diff_seed=3)
-                text = "\n".join(log)
-                assert res and "AI diffusion" in text, f"{name}: the inventing upscaler was not used\n{text[-1500:]}"
-                got = Image.open(next(Path(res).iterdir()))
-                assert got.size == (48 * (f if f != 8 else 4), 40 * (f if f != 8 else 4)), f"{name}: {got.size}"
-        assert "tile 1/1" in text and "seed 3" in text, text[-800:]
-        res, log = make_run(models, out / "diff_big", inputs=[str(pics / "bigger.png")], mode="upscale", up_model="diffusion",
-                            scale=4, diff_steps=5, diff_noise=0, diff_seed=3)
+        # 2. the inventing upscaler (SeedVR2, fake tool): exact size, the options it gets, a seed, Stop, a failure
+        install_fake_seedvr2(sv)
+        for kw, size in (({"scale": 4}, (192, 160)), ({"scale": 3}, (144, 120)), ({"size_mode": "width", "size_px": 100}, (100, 83))):
+            res, log = make_run(models, out / f"sv{len(kw)}{kw.get('scale', 0)}", inputs=[str(pics / "small.png")], mode="upscale",
+                                up_model="seedvr2", sv_seed=3, **kw)
+            text = "\n".join(log)
+            assert res and "AI seedvr2" in text, f"SeedVR2 was not used\n{text[-1500:]}"
+            files = list(Path(res).iterdir())
+            assert len(files) == 1 and Image.open(files[0]).size == size, (Image.open(files[0]).size, size)
+        assert "SeedVR2 set-up" not in text, "it set itself up although ready.json is there"
+        call = last_call(sv)
+        assert call["seed"] == 3 and call["color_correction"] == "lab" and call["input_noise_scale"] == 0.0 \
+            and call["latent_noise_scale"] == 0.0 and call["batch_size"] == 1 and call["resolution"] == 83, call
+        assert call["vae_encode_tiled"] and call["vae_decode_tiled"] and call["blocks_to_swap"] == 0 and not call["swap_io_components"], call
+        assert call["dit_model"] == bn.SEEDVR2_DIT and Path(call["model_dir"]) == models / "seedvr2", call
+        assert call["output"].endswith("seedvr2_out.png") and call["input"].endswith("seedvr2_in.png"), call
+        res, log = make_run(models, out / "sv_opts", inputs=[str(pics / "small.png")], mode="upscale", up_model="seedvr2", scale=2,
+                            sv_seed=7, sv_color="wavelet", sv_input_noise=0.3, sv_latent_noise=0.2, sv_low_memory=True)
+        call = last_call(sv)
+        assert call["seed"] == 7 and call["color_correction"] == "wavelet" and call["input_noise_scale"] == 0.3 \
+            and call["latent_noise_scale"] == 0.2 and call["blocks_to_swap"] == 32 and call["swap_io_components"] \
+            and call["dit_offload_device"] == "cpu" and call["vae_offload_device"] == "cpu" and call["resolution"] == 80, call
+        # a random seed is named in the log and passed on; the same seed gives the same result (and other settings another cache name)
+        _, log = make_run(models, out / "sv_rand", inputs=[str(pics / "small.png")], mode="upscale", up_model="seedvr2", scale=2, sv_seed=0)
+        assert any("chosen at random" in ln for ln in log) and last_call(sv)["seed"] > 0, "a random seed is not named in the log"
+        # a failing tool: the picture is plain resized, the log says why, the run goes on with the next picture
+        os.environ["FAKE_SV_FAIL"] = "1"
+        try:
+            res, log = make_run(models, out / "sv_fail", inputs=[str(pics)], mode="upscale", up_model="seedvr2", scale=2, redo=True)
+        finally:
+            del os.environ["FAKE_SV_FAIL"]
         text = "\n".join(log)
-        assert "tile 4/4" in text, text[-800:]
-        got = np.asarray(Image.open(next(Path(res).iterdir())).convert("RGB")).astype(np.float32)
-        plain = np.asarray(Image.open(pics / "bigger.png").convert("RGB").resize((800, 600), Image.BICUBIC)).astype(np.float32)
-        assert got.shape == (600, 800, 3)
-        diff = np.abs(got - plain).mean()
-        assert diff < 6, f"the inventing result is far from the picture (mean difference {diff:.1f})"
-        assert got.std() > 20, "the result is flat"
-        # no seam: the jump between neighbouring columns / rows at the tile edges is not bigger than elsewhere
-        # (low-resolution tiles start at x 0 and 72, y 0 and 22: their 4x edges are at x 288 and 512, y 88 and 512)
-        for axis, edges in ((1, (288, 512)), (0, (88, 512))):
-            jumps = np.abs(np.diff(got.mean(axis=2), axis=axis)).mean(axis=1 - axis)
-            inside = float(np.median(jumps))
-            for e in edges:
-                worst = float(jumps[e - 3:e + 3].max())
-                assert worst <= max(3 * inside, inside + 6), f"a seam at {e} on axis {axis}: {worst:.1f} against {inside:.1f}"
-        # same seed = same result; a log line names a random seed; the cache key has the settings
-        res2, _ = make_run(models, out / "diff_big2", inputs=[str(pics / "bigger.png")], mode="upscale", up_model="diffusion",
-                           scale=4, diff_steps=5, diff_noise=0, diff_seed=3)
-        assert np.array_equal(got, np.asarray(Image.open(next(Path(res2).iterdir())).convert("RGB")).astype(np.float32)), "same seed, other result"
-        _, log = make_run(models, out / "diff_rand", inputs=[str(pics / "small.png")], mode="upscale", up_model="diffusion",
-                          diff_steps=5, diff_seed=0, scale=4)
-        assert any("chosen at random" in ln for ln in log), "a random seed is not named in the log"
-        # Stop in the middle of a picture: no more tiles, the run ends saying so
+        assert res and "out of graphics memory" in text and "plain resizing" in text, text[-1200:]
+        assert sorted(Image.open(p).size for p in Path(res).iterdir()) == [(96, 80), (400, 300)], "the picture was not made after a failure"
+        n_calls = len((sv / "calls.jsonl").read_text().splitlines())
+        assert "AI seedvr2" not in text.split("out of graphics memory")[-1], "tried again after failing in the same run"
+        # Stop in the middle of a picture ends the tool
+        os.environ["FAKE_SV_SLOW"] = "1"
         lines = []
-        stop = lambda: any("tile 2/" in ln for ln in lines)
-        bn.run(bn.Options(save_to=str(out / "diff_stop"), inputs=[str(pics / "bigger.png")], mode="upscale",
-                          up_model="diffusion", scale=4, diff_steps=5, diff_seed=3), lines.append, stop)
-        assert "Stopped by user." in "\n".join(lines) and not any("tile 3/" in ln for ln in lines), lines[-10:]
+        stop = lambda: any("progress step 2" in ln for ln in lines)
+        t0 = time.time()
+        try:
+            bn.run(bn.Options(save_to=str(out / "sv_stop"), inputs=[str(pics / "small.png")], mode="upscale", up_model="seedvr2",
+                              scale=2, redo=True), lines.append, stop)
+        finally:
+            del os.environ["FAKE_SV_SLOW"]
+        assert "Stopped by user." in "\n".join(lines) and time.time() - t0 < 20, lines[-8:]
+        pid = int((sv / "pid.txt").read_text())
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+            raise AssertionError("the fake tool still runs after Stop")
+        except ProcessLookupError:
+            pass
         print("inventing upscaler ok")
+
+        # the set-up: skipped when ready.json is there; the steps (nothing is run), and a step that fails
+        assert bn.seedvr2_ready()
+        assert bn.torch_kind("Intel(R) UHD\nAMD Radeon RX 7900 XT") == "amd" and bn.torch_kind("NVIDIA GeForce RTX 4070") == "nvidia" \
+            and bn.torch_kind("Intel(R) Arc") == "cpu" and bn.torch_kind("") == "cpu"
+        venv = str(sv / "venv")
+        amd = bn.seedvr2_steps("amd")
+        base = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
+        cmds = [s[2] for s in amd]
+        assert cmds[0] == [sys.executable, "-m", "pip", "install", "uv"]
+        assert cmds[1][1:] == ["-m", "uv", "venv", "--python", "3.12", venv] and cmds[2] == "source" and cmds[-1] == "requirements"
+        pip = [sys.executable, "-m", "uv", "pip", "install", "--python", venv]
+        assert cmds[3] == pip + [base + w for w in ("rocm_sdk_core-7.2.1-py3-none-win_amd64.whl", "rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+                                                    "rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl", "rocm-7.2.1.tar.gz")]
+        assert cmds[4] == pip + [base + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+                                 base + "torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"] and len(cmds) == 6
+        assert [s[2] for s in bn.seedvr2_steps("nvidia")][3:] == [pip + ["torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/cu128"], "requirements"]
+        assert [s[2] for s in bn.seedvr2_steps("cpu")][3:] == [pip + ["torch", "torchvision"], "requirements"]
+        assert bn.seedvr2_requirements(sv / "c.txt")[-4:] == ["-r", str(sv / "src" / "requirements.txt"), "-c", str(sv / "c.txt")]
+
+        ran, saved = [], (bn.run_streamed, bn.seedvr2_download_source, bn.write_torch_constraints, bn.graphics_card_names)
+        try:
+            bn.seedvr2_download_source = lambda c: ran.append("source")
+            bn.write_torch_constraints = lambda path: ran.append("constraints")
+            bn.graphics_card_names = lambda: "AMD Radeon RX 7900 XT"
+
+            def fake_streamed(c, argv, keep=None, cwd=None, every=0):
+                ran.append(list(argv))
+                if "boom" in os.environ.get("FAKE_SETUP", "") and "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl" in " ".join(map(str, argv)):
+                    return 1, ["error: no matching file", "last line"]
+                return 0, []
+            bn.run_streamed = fake_streamed
+            (sv / "ready.json").unlink()
+            lines = []
+            ctx = bn.Context(bn.Options(save_to=str(out / "setup"), mode="upscale"), lines.append, out / "setup_work")
+            os.environ["FAKE_SETUP"] = "boom"
+            assert bn.seedvr2_setup(ctx) is False and not (sv / "ready.json").exists()
+            text = "\n".join(lines)
+            assert "Installing AMD's PyTorch for Windows" in text and "error: no matching file" in text and "last line" in text \
+                and "SeedVR2 could not be set up; using plain resizing for it" in text and "driver 26.2.2" in text, text
+            ran.clear()
+            os.environ["FAKE_SETUP"] = ""
+            assert bn.seedvr2_setup(ctx) is True and (sv / "ready.json").exists()
+            assert json.loads((sv / "ready.json").read_text())["torch"] == "amd" and "source" in ran and "constraints" in ran
+            n_run = len(ran)
+            install_fake_seedvr2(sv, ready=False)      # (the set-up made no real environment; ready.json is from the set-up)
+            assert bn.seedvr2_setup(ctx) is True and len(ran) == n_run, "it set up again although ready.json was there"
+        finally:
+            del os.environ["FAKE_SETUP"]
+            bn.run_streamed, bn.seedvr2_download_source, bn.write_torch_constraints, bn.graphics_card_names = saved
+        install_fake_seedvr2(sv)
+        print("set-up ok")
 
         # 3. Compare models: letters, close-ups, key; letters change between runs; nothing names a model outside the key
         install_fakes(models)
@@ -288,17 +312,25 @@ def check():
         assert len(list(folder.glob("small_?.png"))) == 2 and len(list(folder.glob("bigger_?.png"))) == 2
         print("compare with a missing model ok")
 
-        # the diffusion model inside Compare; and more than 4 pictures use the first 4
+        # SeedVR2 inside Compare (also when it fails); and more than 4 pictures use the first 4
         install_fakes(models)
         for i in range(5):
             photo(40, 40, i).save(pics / f"p{i}.png")
-        res, log = make_run(models, out / "cmp_diff", inputs=[str(pics)], mode="compare", scale=2,
-                            compare_models=["dat", "diffusion"], diff_steps=5)
+        res, log = make_run(models, out / "cmp_sv", inputs=[str(pics)], mode="compare", scale=2, compare_models=["dat", "seedvr2"])
         text = "\n".join(log)
         assert "first 4 of the 7" in text, text[:600]
         folder = Path(res)
-        assert len(list(folder.glob("*_closeups.png"))) == 4 and "Stable Diffusion" in (folder / "key.txt").read_text(encoding="utf-8")
-        assert "inventing upscaler: prompt" in (folder / "key.txt").read_text(encoding="utf-8").lower()
+        key = (folder / "key.txt").read_text(encoding="utf-8")
+        assert len(list(folder.glob("*_closeups.png"))) == 4 and bn.MODEL_LABELS["seedvr2"] in key and "failed" not in key, key
+        assert "inventing upscaler: colours lab" in key.lower(), key
+        os.environ["FAKE_SV_FAIL"] = "1"
+        try:
+            res, log = make_run(models, out / "cmp_sv_fail", inputs=[str(pics)], mode="compare", scale=2, compare_models=["dat", "seedvr2"])
+        finally:
+            del os.environ["FAKE_SV_FAIL"]
+        key = (Path(res) / "key.txt").read_text(encoding="utf-8")
+        assert "failed:" in key and "out of graphics memory" in key, key
+        assert len(list(Path(res).glob("*_?.png"))) == 8, "the letter of the failed model was not left out"
         print("compare with the inventing model ok")
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"

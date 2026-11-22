@@ -6,7 +6,7 @@ You add folders or single pictures, say what they are, and choose what comes out
 - **Tracing PDF**: one sharp, print-ready A4 PDF that you can trace through tracing paper.
 - **Compare models**: the first 4 pictures made with every model you tick, as unlabelled pictures A, B, C ..., so you can choose a model by eye without bias.
 
-Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.4.
+Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.5.
 
 ## Why it exists
 
@@ -47,7 +47,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 ## Why it makes these choices
 
 - **Real-ESRGAN, not a generative upscaler like Krea.** Real-ESRGAN restores what is in the image. A generative upscaler redraws and invents detail, which can change line weight and anatomy. For tracing, you want the artist's drawing, not a reinterpretation.
-- **The inventing upscaler is opt-in.** Stable Diffusion x4 makes up detail that is not in the picture, so faces and text can come out wrong, and it takes minutes per picture. It is only used when you pick "Inventing: Stable Diffusion x4" as the Model (or tick it for Compare models). It is the only diffusion upscaler that runs on an AMD graphics card through onnxruntime-directml without installers; newer ones (SUPIR, SeedVR2) need an NVIDIA card and ComfyUI. Its settings (description, how much it may invent, steps, how closely it follows the description, seed) show only when it is the model.
+- **The inventing upscaler is opt-in.** SeedVR2 3B (ByteDance Seed, 2025) restores and enlarges a picture in one step and makes up detail that is not in it, so faces and text can come out wrong, and it takes minutes per picture. It is only used when you pick "Inventing: SeedVR2 3B" as the Model (or tick it for Compare models); Automatic never picks it. It only restores: it does not make pictures from text (a generating model may come later). It replaces Stable Diffusion x4, which was too old. It is run by numz's command line tool in its own Python environment, because it needs PyTorch. Its settings (seed, how it keeps the colours, input noise, latent noise, save graphics memory) show only when it is the model.
 - **No photo model is crowned best.** "Best" was never checked, so the labels do not say it. Automatic still picks DAT RealWebPhoto v4 for photos when a graphics card runs it, and that does not change until you have compared. Compare models, blind, is how to choose: the letters hide the models until you have chosen.
 - **Models for different pictures.** DAT for old, compressed or damaged photos. Real-HAT-GAN for clean, sharp photos where you want crisp detail. AnimeSharp V4 for drawings, because it is very faithful to the lines. Real-ESRGAN stays as the model that works anywhere without extra downloads. For faces, GFPGAN looks natural and CodeFormer repairs badly damaged faces the most. Both face models redraw the face, which is why faces are opt-in and blended by a strength you choose. HEART (November 2026) is brand new and less proven; it is there to try, never chosen automatically.
 - **Colouring is opt-in.** It redraws the colours of a black-and-white photo with a guess, so it is off until you switch it on, and it only touches photos that are black and white.
@@ -79,7 +79,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Setting | Default | What it does |
 |---|---|---|
 | Kind (`--kind`) | Detect for each image | Bigger images. `auto` looks at each picture; `drawing` or `photo` says they are all the same kind |
-| Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use AnimeSharp V4 when a graphics card runs it, else Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `animesharp`, `dat` (Web photo DAT RealWebPhoto v4), `bhi` (Web photo DAT2 BHI), `drct` (Web photo DRCT-L), `hatgan`, `heart`, `diffusion` (Inventing: Stable Diffusion x4), or the name of an extra model. AnimeSharp V4 is free for personal use only: don't sell or publish results made with it commercially |
+| Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use AnimeSharp V4 when a graphics card runs it, else Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `animesharp`, `dat` (Web photo DAT RealWebPhoto v4), `bhi` (Web photo DAT2 BHI), `drct` (Web photo DRCT-L), `hatgan`, `heart`, `seedvr2` (Inventing: SeedVR2 3B), or the name of an extra model. AnimeSharp V4 is free for personal use only: don't sell or publish results made with it commercially |
 | Use AI upscaler (`--no-ai` turns it off) | on | Both outputs. Off = plain resizing, faster but blurrier |
 | AI model for coloured art (`--model`) | General | Tracing PDF. General, or Anime |
 
@@ -98,16 +98,15 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Keep colours (`--grey` turns it off) | on | Tracing PDF. Off prints everything in grey |
 | Colour boost (`--boost`) | 0 | Tracing PDF. More saturation and contrast for pale art |
 
-**Inventing upscaler** (a group shown only when the Model is "Inventing: Stable Diffusion x4", or it is ticked for Compare models)
+**Inventing upscaler** (a group shown only when the Model is "Inventing: SeedVR2 3B", or it is ticked for Compare models)
 
 | Setting | Default | What it does |
 |---|---|---|
-| Describe the picture (`--diff-prompt`) | a sharp, detailed, high quality photo | Describe the picture; it steers what gets invented |
-| Stay away from (`--diff-negative`) | blurry, noisy, jpeg artifacts, painting, cartoon | What it should stay away from |
-| How much it may invent (`--diff-noise`) | 20 | 0 to 350. Low keeps close to your picture, high makes up more |
-| Steps (`--diff-steps`) | 25 | 5 to 100. More steps = slower, a bit finer |
-| Follow the description (`--diff-guidance`) | 7.5 | 1 to 15. How strongly it follows the description |
-| Seed (`--diff-seed`) | 1 | The same seed gives the same result. 0 = a new random seed each run; the log names the seed used |
+| Seed (`--sv-seed`) | 42 | The same seed gives the same result. 0 = a new random seed each run; the log names the seed used |
+| Keep the colours (`--sv-color`) | lab | How it keeps the colours of your picture: lab (recommended), wavelet, wavelet_adaptive, hsv, adain or none |
+| Input noise (`--sv-input-noise`) | 0 | 0 to 1. Adds variation before it starts: higher = it makes up more |
+| Latent noise (`--sv-latent-noise`) | 0 | 0 to 1. Adds variation while it works: higher = it makes up more |
+| Save graphics memory (`--sv-low-memory`) | off | Slower, but fits a card with less memory. Turn it on if it runs out of graphics memory |
 
 **What comes out**
 
@@ -152,7 +151,7 @@ Optional, installed by the `.bat` when possible: `tkinterdnd2` (drag and drop of
 - **Drawing model AnimeSharp V4** (`--upscale-model animesharp`), `2x-AnimeSharpV4` by Kim2091 (CC BY-NC-SA 4.0: personal, non-commercial use), about 31 MB, from Hugging Face. Very faithful to the lines. It enlarges 2x; for 3x and 4x it runs twice and resizes to the exact size. Automatic uses it for drawings when a graphics card runs it.
 - **Clean photo model Real-HAT-GAN** (`--upscale-model hatgan`), HAT by XPixel, ONNX by FaceFusion, about 160 MB, from Hugging Face. Sharp on clean photos; used only when you pick it. Slow on the CPU.
 - **Web photo models BHI and DRCT-L** (`--upscale-model bhi`, `drct`): `4xBHI_dat2_real` (DAT2) and `4xRealWebPhoto_v4_drct-l` (DRCT) by Philip Hofmann (CC-BY-4.0), converted to ONNX by `tools/convert_models.py` (the "Convert models" workflow, which checks each converted file against the original) and downloaded on first use from the GitHub release `models-1` (sizes: BHI about 51 MB, DRCT-L about 189 MB). 4x; BHI works in 256 px tiles, DRCT-L in 128 px tiles (it needs much memory). Used only when you pick them (or in Compare models). Slow on the CPU. His ATD model (4xRealWebPhoto_v3_atd) was tried too, but its converted file did not give the same picture as the original, so it is left out.
-- **Inventing upscaler** (`--upscale-model diffusion`): Stable Diffusion x4 upscaler by Stability AI, ONNX by ssube (CreativeML Open RAIL++-M), about 3.4 GB in total (text encoder 1.36 GB, unet 1.9 GB, vae 132 MB, tokenizer), downloaded on first use only, from Hugging Face into `models/sd-x4-upscaler`. It runs in the program itself (numpy and onnxruntime, no torch). It makes up detail, is very slow (minutes per picture even on a graphics card, much slower on the CPU), changes the picture (faces and text can come out wrong), and only invents at 4x (a bigger size is resized from the 4x result). The licence (CreativeML Open RAIL++-M) has use restrictions: read it before sharing results.
+- **Inventing upscaler** (`--upscale-model seedvr2`): SeedVR2 3B by ByteDance Seed (Apache-2.0), run by `inference_cli.py` of numz's ComfyUI-SeedVR2_VideoUpscaler (Apache-2.0, pinned to version 2.5.24, commit `4490bd1`). Only when you first use it, the program sets it up in the folder `seedvr2` next to the program (nothing else on your computer is changed): the `uv` package goes into the program's own Python, `uv` makes a separate Python 3.12 environment, the tool's files are downloaded from GitHub, and PyTorch is installed for your graphics card (about 3 GB; AMD's PyTorch for Windows, ROCm 7.2.1, needs Windows 11 and AMD graphics driver 26.2.2 or newer; NVIDIA: PyTorch for CUDA 12.8; otherwise PyTorch for the processor only, which is extremely slow). Then the tool downloads its own model files from Hugging Face into `models/seedvr2` (about 3.9 GB: the 3B model 3.4 GB and the VAE 0.5 GB). The log shows each step. If a step fails the log says which, that picture is only resized, and the next run tries again. It restores by making up detail, is slow (minutes per picture), and changes the picture (faces and text can come out wrong). It makes the short side of the picture the size you asked for directly; above 2160 px it is very slow and may run out of graphics memory (turn on Save graphics memory). Delete the folder `seedvr2` to remove it. It does not make pictures from text.
 - **Photo model HEART** (`--upscale-model heart`), by Philip Hofmann (Apache-2.0), about 75 MB, from Hugging Face. Brand new (November 2026) and less proven; 4x, used only when you pick it. Slow on the CPU.
 - **Colouring black-and-white photos** (`--colorize`): DDColor (piddnad, Apache-2.0), ONNX by FaceFusion, about 980 MB, downloaded the first time a black-and-white photo is met.
 - **Face restoration**: OpenCV's YuNet face finder (230 KB) and one of two restorers from the facefusion model collection on Hugging Face: GFPGAN 1.4 (about 340 MB, natural) or CodeFormer (about 377 MB, strongest repair; it is run with a fidelity weight of 0.6). Only the one you choose is downloaded, when you first restore a face with it.
@@ -169,6 +168,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
+- 4.5: the inventing upscaler is now SeedVR2 3B (restores by making up detail, opt-in, sets itself up the first time in the folder `seedvr2`) instead of Stable Diffusion x4, with its own settings: seed, how it keeps the colours, input noise, latent noise, save graphics memory. Automatic never picks it. The tracing PDF is unchanged.
 - 4.4: two more web photo models (Web photo DAT2 BHI and DRCT-L, converted to ONNX), an inventing upscaler (Stable Diffusion x4, opt-in, with its own settings: description, how much it may invent, steps, guidance, seed), and a new Make choice "Compare models": the first 4 pictures made with every model you tick, plus plain resizing, as shuffled letters A, B, C ... with close-up sheets and a key.png that says which is which, so you can choose without bias. The DAT label no longer says "best". The tracing PDF is unchanged.
 - 4.3: "Make" (Tracing PDF or Bigger images) moved up to step 2, right under the images, because it decides which settings below it are shown. Nothing else changed.
 - 4.2: Bigger images can be made to a width or height in pixels (for example 1920) instead of 2x/3x/4x; pictures already that big keep their size unless you choose to make them smaller; names end `_1920w` or `_1080h`. The tracing PDF is unchanged.
