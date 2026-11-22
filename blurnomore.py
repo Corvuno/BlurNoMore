@@ -388,6 +388,8 @@ def make_session(c, path):
     if "DmlExecutionProvider" in prov:
         opts.enable_mem_pattern = False       # DirectML needs these two
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    else:
+        opts.enable_cpu_mem_arena = False     # the big models (DRCT-L) otherwise keep too much memory on the CPU
     try:
         sess = ort.InferenceSession(str(path), opts, providers=prov)
     except Exception as e:  # noqa: BLE001

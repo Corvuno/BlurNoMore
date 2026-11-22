@@ -71,7 +71,7 @@ def main():
             with Image.open(only_file(out / key)) as r:
                 assert r.size == (320, 240), f"{key} result is {r.size}, expected 320x240"
 
-        # the inventing upscaler (Stable Diffusion x4) on a tiny photo with 2 steps: exactly 4x, not flat
+        # the inventing upscaler (Stable Diffusion x4) on a tiny photo with 5 steps: exactly 4x, not flat
         tiny = Path(t) / "tiny"
         tiny.mkdir()
         im.resize((48, 48)).save(tiny / "tiny.png")
