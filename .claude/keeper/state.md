@@ -31,6 +31,8 @@ The overview every conversation starts from. One screen; what is no longer true 
 - 4.6 (landed 2026-11-22, #8): "AI files folder" (More settings / --ai-dir) puts models, realesrgan,
   seedvr2 and uv's Python + cache on another disk; moved at the next run (copy, then delete); refuses a
   target inside the moved folders or among the pictures. Not tried on real Windows disks.
+- 4.7 (landed 2026-11-22, #9): JPG quality setting and opt-in "Limit file size" (MB): lower JPG quality
+  first, a PNG over the limit becomes JPG, smaller picture only as last resort; Compare decides per picture.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
