@@ -1,6 +1,6 @@
 name: Models
 
-# Downloads the real upscale (DAT, AnimeSharp, HAT-GAN, HEART), colouring (DDColor) and face (GFPGAN, CodeFormer) models and runs them on made-up pictures (CPU only, slow).
+# Downloads the real upscale (DAT, BHI, DRCT, ATD, AnimeSharp, HAT-GAN, HEART, Stable Diffusion x4), colouring (DDColor) and face (GFPGAN, CodeFormer) models and runs them on made-up pictures (CPU only, slow).
 # Not part of the normal Checks, which never download models.
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ on:
 jobs:
   models:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

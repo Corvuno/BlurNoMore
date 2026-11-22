@@ -1,6 +1,6 @@
 """Smoke check: builds a PDF from three made-up drawings without the AI step, then an upscaled
 copy of each into another folder (from a folder, from a file plus a folder, and from the last run's list),
-then the preview sheets.
+then the preview sheets and a Compare models run without the AI.
 Run:  python tests/smoke.py   (needs pillow, numpy, img2pdf). Exits non-zero on failure.
 Leaves nothing behind: everything happens in a temporary folder."""
 import hashlib
@@ -138,6 +138,24 @@ def check():
         run_py(d, "--no-ai", "--dpi", "150", "--preview", "--save-to", out2)
         assert 1 <= len(list((out2 / "_blurnomore_work" / "previews").rglob("*.png"))) <= 3, "no PDF preview sheets"
         assert not list(out2.glob("*.pdf")), "the preview made a PDF"
+
+        # Compare models without the AI: the folder, one shuffled letter per picture (the plain resize), close-up sheets and the
+        # key (which says the model could not be used); the log does not say which letter is which. (tests/fake_models_check.py
+        # does this with fake models.)
+        out8 = out / "eight"
+        r8 = run_py(d, "--compare", "general", "--no-ai", "--save-to", out8)
+        folder8 = next(out8.glob("BlurNoMore_compare_*"))
+        letter_files = sorted(p.name for p in folder8.iterdir() if p.stem[-2:-1] == "_" and p.stem[-1] in "AB")
+        assert len(letter_files) == 3 and len({p[-5] for p in letter_files}) == 1, letter_files
+        assert len(list(folder8.glob("*_closeups.png"))) == 3 and (folder8 / "key.png").is_file(), "closeups or key.png missing"
+        key8 = (folder8 / "key.txt").read_text(encoding="utf-8")
+        assert "General photo (Real-ESRGAN): failed:" in key8 and "Plain resize" in key8, key8
+        assert "General photo" not in r8.stdout and "Open key.png only after you have chosen." in r8.stdout, "the log names a model"
+        for p in folder8.glob("*_[AB].png"):
+            with Image.open(p) as im:
+                assert im.size == tuple(2 * v for v in names[next(n for n in names if Path(n).stem == p.stem[:-2])]), p.name
+                assert not im.info, "extra data in a compare picture"
+        assert {p.name for p in d.iterdir()} == before_files, "the images folder gained or lost files"
 
         # the originals are untouched by all runs (the first PDF run only added its PDF and work folder)
         after = snapshot(d)

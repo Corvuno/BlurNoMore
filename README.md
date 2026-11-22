@@ -1,11 +1,12 @@
 # BlurNoMore
 
-You add folders or single pictures, say what they are, and choose what comes out. One of two things per run:
+You add folders or single pictures, say what they are, and choose what comes out. One of three things per run:
 
 - **Bigger images**: a new folder of bigger copies (2x, 3x or 4x), restored by AI, for general use. No tracing steps, no A4.
 - **Tracing PDF**: one sharp, print-ready A4 PDF that you can trace through tracing paper.
+- **Compare models**: the first 4 pictures made with every model you tick, as unlabelled pictures A, B, C ..., so you can choose a model by eye without bias.
 
-Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.3.
+Windows, Python 3, one `.py` file, a settings window with the steps top to bottom: Images, What to make, What kind of images, Options, What comes out. Built in conversation with Claude, version 4.4.
 
 ## Why it exists
 
@@ -25,17 +26,29 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 ## What it does to every image (Bigger images)
 
 1. **Reads** the image and fixes its rotation. Nothing is cropped, thinned or placed on a page.
-2. **Chooses a model** (Automatic) after deciding what the picture is ("Detect for each image", or you say Drawing or Photo): drawings and flat colour art use the AnimeSharp V4 model when onnxruntime can use your graphics card, otherwise the Anime model; photos use the Web photo model (DAT) when onnxruntime can use your graphics card, otherwise the General model; black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one (including the clean-photo model Real-HAT-GAN and the new, experimental photo model HEART, which are never chosen automatically), or use an extra model.
+2. **Chooses a model** (Automatic) after deciding what the picture is ("Detect for each image", or you say Drawing or Photo): drawings and flat colour art use the AnimeSharp V4 model when onnxruntime can use your graphics card, otherwise the Anime model; photos use the Web photo model (DAT) when onnxruntime can use your graphics card, otherwise the General model; black and white photos use the General model. The General model is safe on anything; the Anime model is used only where it clearly helps. You can force one (including the other photo models Web photo DAT2 BHI, DRCT-L and ATD, the clean-photo model Real-HAT-GAN and the new, experimental photo model HEART, which are never chosen automatically; and the inventing model, see below), or use an extra model.
 3. **Colours black-and-white photos** (optional, off by default): only photos that are black and white get colour, before the enlargement. The colours are invented by the model, a guess and not the real ones. Colour photos and drawings are never touched.
 4. **Enlarges** with the chosen model (4x, or the native size of an extra model), then resizes to exactly 2x, 3x or 4x the original size, or to the width or height in pixels you ask for (aspect ratio kept). Without the AI it resizes plainly. Images that are already big are enlarged too, unless you ask for a size in pixels: then pictures already that wide or high keep their own size (colour and faces still apply when on; the log says so), or with "Also make bigger pictures smaller" are made smaller to it (plain resizing, no AI). The AI is only used when the picture grows by more than 1.25 times; a growth over 6 times is flagged in the log as low source resolution.
 5. **Restores faces** (optional, off by default): finds faces in the enlarged picture and restores each with GFPGAN (natural) or CodeFormer (strongest repair), blended in by a strength from 0 to 100.
 6. **Saves** `<name>_x<scale>.png` (`_1920w` or `_1080h` for a size in pixels; or `.jpg`), or the name with your own text after or before it, into a new folder `BlurNoMore_upscaled_<date>_<time>`. Two images with the same name get `_2` on the second. A result over 100 megapixels is flagged in the log: very large file, slow.
+
+## What it does (Compare models)
+
+1. Takes the first 4 pictures of the list (the log says so when there are more).
+2. Makes each one with every model you tick, exactly as Bigger images would with that model forced (same size, faces, colour and file type), plus plain resizing (Lanczos) as an extra contestant, so you see what the AI adds. Models that are not downloaded yet are downloaded first.
+3. Saves them into a new folder `BlurNoMore_compare_<date>_<time>` as `<picture>_A.png`, `<picture>_B.png` ... The letters are shuffled at random for every run (the same letter is the same model for every picture of that run). No model name is in these files or their names.
+4. `<picture>_closeups.png` shows the same 256 x 256 close-up (the most detailed spot of the picture) for every letter side by side, labelled with the letter only, next to the original's crop enlarged and labelled "Original".
+5. `key.png` and `key.txt` say which letter is which model, how long it took, and the settings. The log never says which letter is which model: "Open key.png only after you have chosen." A model that fails for a picture leaves its letter out for that picture; the key says why and the run goes on.
+
+"Run with preview" is not offered for Compare models: it already is a look-first run.
 
 **Run with preview** (the window; `--preview` on the command line makes picture sheets instead) works on 4 of your images (spread over the list) before the run: original next to result, plus a close-up of the busiest spot in both. Click a pair to see it big. For the PDF it shows the finished A4 page. "Go on with all" starts the real run, which reuses the preview's work; "Change settings" closes the preview. A preview writes no PDF and no output folder.
 
 ## Why it makes these choices
 
 - **Real-ESRGAN, not a generative upscaler like Krea.** Real-ESRGAN restores what is in the image. A generative upscaler redraws and invents detail, which can change line weight and anatomy. For tracing, you want the artist's drawing, not a reinterpretation.
+- **The inventing upscaler is opt-in.** Stable Diffusion x4 makes up detail that is not in the picture, so faces and text can come out wrong, and it takes minutes per picture. It is only used when you pick "Inventing: Stable Diffusion x4" as the Model (or tick it for Compare models). It is the only diffusion upscaler that runs on an AMD graphics card through onnxruntime-directml without installers; newer ones (SUPIR, SeedVR2) need an NVIDIA card and ComfyUI. Its settings (description, how much it may invent, steps, how closely it follows the description, seed) show only when it is the model.
+- **No photo model is crowned best.** "Best" was never checked, so the labels do not say it. Automatic still picks DAT RealWebPhoto v4 for photos when a graphics card runs it, and that does not change until you have compared. Compare models, blind, is how to choose: the letters hide the models until you have chosen.
 - **Models for different pictures.** DAT for old, compressed or damaged photos. Real-HAT-GAN for clean, sharp photos where you want crisp detail. AnimeSharp V4 for drawings, because it is very faithful to the lines. Real-ESRGAN stays as the model that works anywhere without extra downloads. For faces, GFPGAN looks natural and CodeFormer repairs badly damaged faces the most. Both face models redraw the face, which is why faces are opt-in and blended by a strength you choose. HEART (November 2026) is brand new and less proven; it is there to try, never chosen automatically.
 - **Colouring is opt-in.** It redraws the colours of a black-and-white photo with a guess, so it is off until you switch it on, and it only touches photos that are black and white.
 - **Two AI models.** Black and white art uses the anime model: crisp lines and flat areas. Coloured art uses the general model by default, because the anime model made painted and shaded art look smooth and plastic. You can switch this in the settings.
@@ -58,14 +71,15 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 
 | Setting | Default | What it does |
 |---|---|---|
-| Make (`--mode`) | Tracing PDF | `upscale` = Bigger images, `pdf` = Tracing PDF. One of the two per run. It comes right after the images because it decides which settings below are shown |
+| Make (`--mode`, `--compare`) | Tracing PDF | `upscale` = Bigger images, `pdf` = Tracing PDF, `compare` = Compare models. One of the three per run. It comes right after the images because it decides which settings below are shown |
+| Models to compare (`--compare MODEL,MODEL,...`) | dat, bhi, drct, atd, hatgan, heart, general | Compare models. One checkbox per model of the Model list (not Automatic); the inventing model is unticked. On the command line `--compare dat,bhi,...` sets the mode to compare, `--compare all` means every model (also the inventing one and your extra models); `--mode compare` alone uses the default list. Only models that exist are used. Enlarge, faces, colour and file type apply to every model alike. Kind, Model and name are not used |
 
 **What kind**
 
 | Setting | Default | What it does |
 |---|---|---|
 | Kind (`--kind`) | Detect for each image | Bigger images. `auto` looks at each picture; `drawing` or `photo` says they are all the same kind |
-| Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use AnimeSharp V4 when a graphics card runs it, else Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `animesharp`, `dat`, `hatgan`, `heart`, or the name of an extra model. AnimeSharp V4 is free for personal use only: don't sell or publish results made with it commercially |
+| Model (`--upscale-model`) | Automatic | Bigger images. Automatic follows the kind: drawings use AnimeSharp V4 when a graphics card runs it, else Anime; photos use the Web photo model (DAT) when a graphics card runs it, else General. Or `general`, `anime`, `animesharp`, `dat` (Web photo DAT RealWebPhoto v4), `bhi` (Web photo DAT2 BHI), `drct` (Web photo DRCT-L), `atd` (Web photo ATD), `hatgan`, `heart`, `diffusion` (Inventing: Stable Diffusion x4), or the name of an extra model. AnimeSharp V4 is free for personal use only: don't sell or publish results made with it commercially |
 | Use AI upscaler (`--no-ai` turns it off) | on | Both outputs. Off = plain resizing, faster but blurrier |
 | AI model for coloured art (`--model`) | General | Tracing PDF. General, or Anime |
 
@@ -83,6 +97,17 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Lighten print (`--fade`) | 0 | Tracing PDF. Fades the print so your pencil stands out |
 | Keep colours (`--grey` turns it off) | on | Tracing PDF. Off prints everything in grey |
 | Colour boost (`--boost`) | 0 | Tracing PDF. More saturation and contrast for pale art |
+
+**Inventing upscaler** (a group shown only when the Model is "Inventing: Stable Diffusion x4", or it is ticked for Compare models)
+
+| Setting | Default | What it does |
+|---|---|---|
+| Describe the picture (`--diff-prompt`) | a sharp, detailed, high quality photo | Describe the picture; it steers what gets invented |
+| Stay away from (`--diff-negative`) | blurry, noisy, jpeg artifacts, painting, cartoon | What it should stay away from |
+| How much it may invent (`--diff-noise`) | 20 | 0 to 350. Low keeps close to your picture, high makes up more |
+| Steps (`--diff-steps`) | 25 | 5 to 100. More steps = slower, a bit finer |
+| Follow the description (`--diff-guidance`) | 7.5 | 1 to 15. How strongly it follows the description |
+| Seed (`--diff-seed`) | 1 | The same seed gives the same result. 0 = a new random seed each run; the log names the seed used |
 
 **What comes out**
 
@@ -113,7 +138,7 @@ The same settings exist as command-line options. Run `python blurnomore.py --hel
 - `BlurNoMore.bat` checks for Python, installs `pillow`, `numpy` and `img2pdf` (and, if it can, the optional `onnxruntime-directml`, `opencv-python-headless` and `tkinterdnd2`), and opens the window. Keep it next to the `.py`.
 - In the folder you choose under "Save to" (by default the folder of the first image you added) it creates `BlurNoMore_A4_<date>_<time>_<n>p.pdf`, or for Bigger images a new folder `BlurNoMore_upscaled_<date>_<time>`, and a `_blurnomore_work` folder with caches, previews and a log of every run. An older `_tracing_work` folder is renamed automatically.
 - `realesrgan` next to the program holds the downloaded Real-ESRGAN, so it is downloaded once (an older copy inside a `_blurnomore_work` folder is still found and used).
-- `models` next to the program: the downloaded DAT and face models go here (first use only: the log says the size first). You can also put extra models there as `NAME.param` plus `NAME.bin` (ncnn format, as Real-ESRGAN ncnn uses) or as `NAME.onnx` (RGB 0..1 in and out). They show up as upscale models. A name with `2x`/`x2` or `3x`/`x3` is a 2x or 3x model; otherwise 4x (an `.onnx` model's size is checked with one small test picture, and the measured size is used if the name was wrong).
+- `models` next to the program: the downloaded photo models, face models and (in `models/sd-x4-upscaler`) the inventing model go here (first use only: the log says the size first). You can also put extra models there as `NAME.param` plus `NAME.bin` (ncnn format, as Real-ESRGAN ncnn uses) or as `NAME.onnx` (RGB 0..1 in and out). They show up as upscale models. A name with `2x`/`x2` or `3x`/`x3` is a 2x or 3x model; otherwise 4x (an `.onnx` model's size is checked with one small test picture, and the measured size is used if the name was wrong).
 - `blurnomore_settings.json` next to the program remembers your last settings, including the list of images.
 - `blurnomore_last_run.json` next to the program holds the images of your last run (for "Last run's images").
 
@@ -126,6 +151,8 @@ Optional, installed by the `.bat` when possible: `tkinterdnd2` (drag and drop of
 - **Web photo model (DAT)**, `4xRealWebPhoto_v4` by Philip Hofmann (CC-BY-4.0), about 49 MB, downloaded on first use from Hugging Face. Made for compressed web photos. Automatic uses it for photos only when a graphics card runs it; `--upscale-model dat` uses it anywhere, but on the CPU it takes minutes per photo.
 - **Drawing model AnimeSharp V4** (`--upscale-model animesharp`), `2x-AnimeSharpV4` by Kim2091 (CC BY-NC-SA 4.0: personal, non-commercial use), about 31 MB, from Hugging Face. Very faithful to the lines. It enlarges 2x; for 3x and 4x it runs twice and resizes to the exact size. Automatic uses it for drawings when a graphics card runs it.
 - **Clean photo model Real-HAT-GAN** (`--upscale-model hatgan`), HAT by XPixel, ONNX by FaceFusion, about 160 MB, from Hugging Face. Sharp on clean photos; used only when you pick it. Slow on the CPU.
+- **Web photo models BHI, DRCT-L and ATD** (`--upscale-model bhi`, `drct`, `atd`): `4xBHI_dat2_real` (DAT2), `4xRealWebPhoto_v4_drct-l` (DRCT) and `4xRealWebPhoto_v3_atd` (ATD) by Philip Hofmann (CC-BY-4.0), converted to ONNX by `tools/convert_models.py` (the "Convert models" workflow) and downloaded on first use from the GitHub release `models-1` (sizes: BHI about SIZE_BHI, DRCT-L about SIZE_DRCT, ATD about SIZE_ATD). 4x, fixed 256 px tiles; used only when you pick them (or in Compare models). Slow on the CPU.
+- **Inventing upscaler** (`--upscale-model diffusion`): Stable Diffusion x4 upscaler by Stability AI, ONNX by ssube (CreativeML Open RAIL++-M), about 3.4 GB in total (text encoder 1.36 GB, unet 1.9 GB, vae 132 MB, tokenizer), downloaded on first use only, from Hugging Face into `models/sd-x4-upscaler`. It runs in the program itself (numpy and onnxruntime, no torch). It makes up detail, is very slow (minutes per picture even on a graphics card, much slower on the CPU), changes the picture (faces and text can come out wrong), and only invents at 4x (a bigger size is resized from the 4x result). The licence (CreativeML Open RAIL++-M) has use restrictions: read it before sharing results.
 - **Photo model HEART** (`--upscale-model heart`), by Philip Hofmann (Apache-2.0), about 75 MB, from Hugging Face. Brand new (November 2026) and less proven; 4x, used only when you pick it. Slow on the CPU.
 - **Colouring black-and-white photos** (`--colorize`): DDColor (piddnad, Apache-2.0), ONNX by FaceFusion, about 980 MB, downloaded the first time a black-and-white photo is met.
 - **Face restoration**: OpenCV's YuNet face finder (230 KB) and one of two restorers from the facefusion model collection on Hugging Face: GFPGAN 1.4 (about 340 MB, natural) or CodeFormer (about 377 MB, strongest repair; it is run with a fidelity weight of 0.6). Only the one you choose is downloaded, when you first restore a face with it.
@@ -142,6 +169,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
+- 4.4: three more web photo models (Web photo DAT2 BHI, DRCT-L, ATD, converted to ONNX), an inventing upscaler (Stable Diffusion x4, opt-in, with its own settings: description, how much it may invent, steps, guidance, seed), and a new Make choice "Compare models": the first 4 pictures made with every model you tick, plus plain resizing, as shuffled letters A, B, C ... with close-up sheets and a key.png that says which is which, so you can choose without bias. The DAT label no longer says "best". The tracing PDF is unchanged.
 - 4.3: "Make" (Tracing PDF or Bigger images) moved up to step 2, right under the images, because it decides which settings below it are shown. Nothing else changed.
 - 4.2: Bigger images can be made to a width or height in pixels (for example 1920) instead of 2x/3x/4x; pictures already that big keep their size unless you choose to make them smaller; names end `_1920w` or `_1080h`. The tracing PDF is unchanged.
 - 4.1: more upscale models (AnimeSharp V4 for drawings, Real-HAT-GAN for clean photos, the new HEART; Automatic uses AnimeSharp for drawings when a graphics card runs it, with a note that it is for personal use only), a choice of face model (Natural GFPGAN or Strongest repair CodeFormer) and optional colouring of black-and-white photos (DDColor). The tracing PDF is unchanged.

@@ -1,4 +1,4 @@
-"""Model check: downloads the real DAT, AnimeSharp, HAT-GAN, HEART, YuNet, GFPGAN, CodeFormer and DDColor models (about 2 GB, into models/ next
+"""Model check: downloads the real DAT, BHI, DRCT, ATD, AnimeSharp, HAT-GAN, HEART, Stable Diffusion x4 (inventing), YuNet, GFPGAN, CodeFormer and DDColor models (about 6 GB, into models/ next
 to the program) and runs them on made-up pictures, on the CPU. Run by the "Models" workflow, not
 by the normal Checks.   python tests/models_check.py   (needs pillow, numpy, img2pdf, onnxruntime,
 opencv-python-headless). Exits non-zero on failure."""
@@ -39,6 +39,9 @@ def main():
         d, out = Path(t), Path(t_out)
         im.save(d / "photo.png")
 
+        keep = ROOT / "models_check_output"
+        keep.mkdir(exist_ok=True)
+
         # DAT model: downloaded on first use, 2x output
         log = run_py(d, "--mode", "upscale", "--upscale-model", "dat", "--scale", "2", "--save-to", out / "dat")
         assert "AI dat" in log, "the DAT model was not used"
@@ -46,8 +49,6 @@ def main():
             assert r.size == (320, 240), f"DAT result is {r.size}, expected 320x240"
 
         # AnimeSharp (2x model, runs twice for 4x) and HAT-GAN (4x model, 2x result)
-        keep = ROOT / "models_check_output"
-        keep.mkdir(exist_ok=True)
         log = run_py(d, "--mode", "upscale", "--upscale-model", "animesharp", "--scale", "4", "--save-to", out / "sharp")
         assert "AI animesharp" in log, "the AnimeSharp model was not used"
         with Image.open(only_file(out / "sharp")) as r:
@@ -62,6 +63,45 @@ def main():
         assert "AI heart" in log, "the HEART model was not used"
         with Image.open(only_file(out / "heart")) as r:
             assert r.size == (320, 240), f"HEART result is {r.size}, expected 320x240"
+
+        # the three converted photo models (fixed 256 px tiles), exact size at 2x
+        for key in ("bhi", "drct", "atd"):
+            log = run_py(d, "--mode", "upscale", "--upscale-model", key, "--scale", "2", "--save-to", out / key)
+            assert f"AI {key}" in log, f"the {key} model was not used"
+            with Image.open(only_file(out / key)) as r:
+                assert r.size == (320, 240), f"{key} result is {r.size}, expected 320x240"
+
+        # the inventing upscaler (Stable Diffusion x4) on a tiny photo with 2 steps: exactly 4x, not flat
+        tiny = Path(t) / "tiny"
+        tiny.mkdir()
+        im.resize((48, 48)).save(tiny / "tiny.png")
+        log = run_py(tiny, "--mode", "upscale", "--upscale-model", "diffusion", "--scale", "4", "--diff-steps", "2",
+                     "--save-to", out / "diffusion")
+        assert "AI diffusion" in log, "the inventing upscaler was not used"
+        res = only_file(out / "diffusion")
+        with Image.open(res) as r:
+            assert r.size == (192, 192), f"inventing result is {r.size}, expected 192x192"
+            std = float(np.asarray(r.convert("L")).std())
+        assert std > 5, f"the inventing result is flat grey (std {std:.1f})"
+        res.replace(keep / "diffusion_x4.png")
+
+        # Compare models: three models plus plain on two made-up pictures
+        cmp_in = Path(t) / "cmp"
+        cmp_in.mkdir()
+        im.save(cmp_in / "one.png")
+        im.transpose(Image.FLIP_LEFT_RIGHT).save(cmp_in / "two.png")
+        log = run_py(cmp_in, "--compare", "dat,bhi,hatgan", "--scale", "2", "--save-to", out / "compare")
+        folder = next((out / "compare").glob("BlurNoMore_compare_*"))
+        names = sorted(p.name for p in folder.iterdir())
+        want = sorted([f"{pic}_{ch}.png" for pic in ("one", "two") for ch in "ABCD"]
+                      + ["one_closeups.png", "two_closeups.png", "key.png", "key.txt"])
+        assert names == want, f"compare folder has {names}"
+        key = (folder / "key.txt").read_text(encoding="utf-8")
+        for label in ("Web photo DAT RealWebPhoto v4", "Web photo DAT2 BHI", "Clean photo Real-HAT-GAN", "Plain resize"):
+            assert key.count(label) == 1, f"the key names '{label}' {key.count(label)} times"
+        assert "failed" not in key, f"a model failed in the compare run:\n{key}"
+        import shutil
+        shutil.copytree(folder, keep / "compare", dirs_exist_ok=True)
 
         # faces: the made-up picture probably has none; the pipeline must still run and say so
         log = run_py(d, "--mode", "upscale", "--no-ai", "--faces", "--scale", "2", "--save-to", out / "faces")

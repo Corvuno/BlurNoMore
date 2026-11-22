@@ -23,6 +23,7 @@ import json
 import os
 import platform
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -62,7 +63,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.3"
+VERSION = "4.4"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -79,12 +80,22 @@ MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pair
 BIG_RESULT_PIXELS = 100_000_000
 INSTALL_HINT = "Install onnxruntime-directml (and opencv-python-headless for faces) with pip"
 FACEFUSION = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/"
+CONVERTED = "https://github.com/corvuno/blurnomore/releases/download/models-1/"   # models converted to ONNX by tools/convert_models.py
 # The downloadable ONNX upscalers, run through onnxruntime. key -> file, where from, download size,
 # native enlargement, who made it (and the licence), and whether a 3x/4x result runs it twice.
 UPSCALERS = {
     "dat": dict(file="4xRealWebPhoto_v4_fp32_opset17.onnx", size="49 MB", native=4, twice=False,
                 url="https://huggingface.co/Phips/4xRealWebPhoto_v4_dat2/resolve/main/4xRealWebPhoto_v4_fp32_opset17.onnx",
                 credit="4xRealWebPhoto_v4 (DAT) by Philip Hofmann, CC-BY-4.0"),
+    "bhi": dict(file="4xBHI_dat2_real_fp32_256.onnx", size="?", native=4, twice=False,
+                url=CONVERTED + "4xBHI_dat2_real_fp32_256.onnx",
+                credit="4xBHI_dat2_real (DAT2) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
+    "drct": dict(file="4xRealWebPhoto_v4_drct-l_fp32_256.onnx", size="?", native=4, twice=False,
+                 url=CONVERTED + "4xRealWebPhoto_v4_drct-l_fp32_256.onnx",
+                 credit="4xRealWebPhoto_v4_drct-l (DRCT) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
+    "atd": dict(file="4xRealWebPhoto_v3_atd_fp32_256.onnx", size="?", native=4, twice=False,
+                url=CONVERTED + "4xRealWebPhoto_v3_atd_fp32_256.onnx",
+                credit="4xRealWebPhoto_v3_atd (ATD) by Philip Hofmann, CC-BY-4.0, converted to ONNX"),
     "animesharp": dict(file="2x-AnimeSharpV4_RCAN_fp16_op17.onnx", size="31 MB", native=2, twice=True,
                        url="https://huggingface.co/Kim2091/2x-AnimeSharpV4/resolve/main/2x-AnimeSharpV4_RCAN_fp16_op17.onnx",
                        credit="2x-AnimeSharpV4 by Kim2091, CC BY-NC-SA 4.0 (personal use)"),
@@ -95,6 +106,22 @@ UPSCALERS = {
                   url="https://huggingface.co/Phips/HEART/resolve/main/onnx/heart_4x_otf_gan_fp32_op17.onnx",
                   credit="HEART by Philip Hofmann, Apache-2.0"),
 }
+# The inventing upscaler (Stable Diffusion x4, ONNX by ssube): several files in models/sd-x4-upscaler/<sub>/,
+# downloaded only when it is used. Run by run_diffusion (numpy, no torch).
+DIFFUSION_URL = "https://huggingface.co/ssube/stable-diffusion-x4-upscaler-onnx/resolve/main/"
+DIFFUSION_DIR = "sd-x4-upscaler"
+DIFFUSION_FILES = (("text_encoder/model.onnx", "1.36 GB"), ("unet/model.onnx", "small"), ("unet/weights.pb", "1.9 GB"),
+                   ("vae/model.onnx", "132 MB"), ("tokenizer/vocab.json", "1 MB"), ("tokenizer/merges.txt", "0.5 MB"))
+DIFFUSION_CREDIT = "Stable Diffusion x4 upscaler by Stability AI, ONNX by ssube, CreativeML Open RAIL++-M"
+# the models a picture can be made bigger with, in the order of the window's list (Automatic is not one of them)
+MODEL_LABELS = {
+    "anime": "Drawing (Real-ESRGAN anime)", "animesharp": "Drawing AnimeSharp V4 (faithful)",
+    "general": "General photo (Real-ESRGAN)", "dat": "Web photo DAT RealWebPhoto v4",
+    "bhi": "Web photo DAT2 BHI (newest DAT, Dec 2024)", "drct": "Web photo DRCT-L", "atd": "Web photo ATD",
+    "hatgan": "Clean photo Real-HAT-GAN (sharp)", "heart": "Photo HEART (new, experimental)",
+    "diffusion": "Inventing: Stable Diffusion x4 (makes up detail, slow)",
+}
+PLAIN_LABEL = "Plain resize (Lanczos, no AI)"
 ANIMESHARP_WARNING = ("AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). "
                       "Don't sell or publish results made with it commercially.")
 # Colouring black-and-white photos: DDColor (ONNX by FaceFusion), downloaded only when a black-and-white photo is met
@@ -131,7 +158,7 @@ class Options:
     use_ai: bool = True          # Real-ESRGAN upscaling
     color_model: str = "general"  # "general" or "anime" (coloured art only)
     redo: bool = False           # ignore pages made in earlier runs
-    mode: str = "pdf"            # "pdf" = Tracing PDF, "upscale" = Bigger images
+    mode: str = "pdf"            # "pdf" = Tracing PDF, "upscale" = Bigger images, "compare" = Compare models (blind)
     save_to: str = ""            # where results and _blurnomore_work go; empty = the folder of the first input
     scale: int = 2               # upscale mode: 2, 3 or 4 times bigger
     size_mode: str = "scale"     # upscale mode: "scale" (times bigger), "width" or "height" in pixels
@@ -146,6 +173,13 @@ class Options:
     face_strength: int = 50      # 0-100, how much of the restored face is used
     face_model: str = "gfpgan"   # "gfpgan" (natural) or "codeformer" (strongest repair)
     colorize: bool = False       # upscale mode: colour black-and-white photos (invented colours)
+    compare_models: list = field(default_factory=lambda: ["dat", "bhi", "drct", "atd", "hatgan", "heart", "general"])  # compare mode
+    diff_prompt: str = "a sharp, detailed, high quality photo"   # inventing upscaler: what to make up
+    diff_negative: str = "blurry, noisy, jpeg artifacts, painting, cartoon"
+    diff_noise: int = 20         # 0-350, how much it may invent
+    diff_steps: int = 25         # 5-100
+    diff_guidance: float = 7.5   # 1-15, how strongly it follows the prompt
+    diff_seed: int = 1           # 0 = a new random seed each run
     open_when_done: bool = True  # GUI only
 
 
@@ -335,7 +369,7 @@ def fetch_model(c, name, url, size):
     part = d / (name + ".part")
     try:
         c.L(f"Downloading {name} (about {size}) ...")
-        d.mkdir(parents=True, exist_ok=True)
+        part.parent.mkdir(parents=True, exist_ok=True)    # a name may have a sub folder
         urllib.request.urlretrieve(url, part)
         os.replace(part, d / name)
         return d / name
@@ -410,8 +444,8 @@ def load_onnx(c, name):
         shape = sess.get_inputs()[0].shape
         fixed = shape[2] if len(shape) == 4 and isinstance(shape[2], int) and shape[2] == shape[3] else None
         model = OnnxModel(sess, info["native"] if info else model_scale(name), fixed, bool(info and info["twice"]))
-        if name == "dat" and not c.gpu():
-            c.L("  The DAT model on the CPU is slow (minutes per photo).")
+        if name in ("dat", "bhi", "drct", "atd") and not c.gpu():
+            c.L(f"  The {name.upper()} model on the CPU is slow (minutes per photo).")
         t = model.tile or 64    # check the scale by one small tile
         got = model.run(np.zeros((1, 3, t, t), np.float32)).shape[2] // t
         if got != model.native:
@@ -422,6 +456,198 @@ def load_onnx(c, name):
         return None
     c.models[name] = model
     return model
+
+
+# ================================================= inventing upscaler (Stable Diffusion x4)
+class ClipTokenizer:
+    r"""CLIP's byte-level BPE tokenizer in plain Python (as OpenAI's simple_tokenizer), from the vocab.json and
+    merges.txt files. Letters and digits are matched with [^\W\d_] and \d (Python's re has no \p{L})."""
+    PAT = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d|[^\W\d_]+|\d|(?:[^\s\w]|_)+", re.IGNORECASE)
+
+    def __init__(self, vocab_path, merges_path):
+        self.enc = json.loads(Path(vocab_path).read_text(encoding="utf-8"))
+        lines = Path(merges_path).read_text(encoding="utf-8").split("\n")
+        if lines and lines[0].startswith("#version"):
+            lines = lines[1:]
+        self.ranks = {tuple(ln.split()): i for i, ln in enumerate(l for l in lines if len(l.split()) == 2)}
+        keep = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+        chars, n = keep[:], 0
+        for b in range(256):
+            if b not in keep:
+                keep.append(b)
+                chars.append(256 + n)
+                n += 1
+        self.byte_char = dict(zip(keep, map(chr, chars)))
+        self.bos, self.eos = self.enc["<|startoftext|>"], self.enc["<|endoftext|>"]
+        self.cache = {}
+
+    def bpe(self, token):
+        if token in self.cache:
+            return self.cache[token]
+        word = tuple(token[:-1]) + (token[-1] + "</w>",)
+        while len(word) > 1:
+            pairs = set(zip(word, word[1:]))
+            best = min(pairs, key=lambda p: self.ranks.get(p, float("inf")))
+            if best not in self.ranks:
+                break
+            first, second = best
+            new, i = [], 0
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == first and word[i + 1] == second:
+                    new.append(first + second)
+                    i += 2
+                else:
+                    new.append(word[i])
+                    i += 1
+            word = tuple(new)
+        self.cache[token] = word
+        return word
+
+    def __call__(self, text, length=77):
+        """The token ids of text: start, the words, end, then end again up to length."""
+        ids = [self.bos]
+        for piece in self.PAT.findall(re.sub(r"\s+", " ", text).strip().lower()):
+            piece = "".join(self.byte_char[b] for b in piece.encode("utf-8"))
+            ids += [self.enc.get(t, self.eos) for t in self.bpe(piece)]
+        ids = ids[:length - 1] + [self.eos]
+        return ids + [self.eos] * (length - len(ids))
+
+
+ORT_NUMPY = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(double)": np.float64,
+             "tensor(int32)": np.int32, "tensor(int64)": np.int64}
+
+
+def ort_feed(sess, **arrays):
+    """The inputs of an onnxruntime session from named arrays, each made the type the model wants."""
+    types = {i.name: i.type for i in sess.get_inputs()}
+    return {k: np.ascontiguousarray(v, ORT_NUMPY.get(types[k], np.float32)) for k, v in arrays.items()}
+
+
+def ddim_alphas():
+    """The cumulative alphas of the scaled_linear noise schedule (1000 steps, betas 0.0001 to 0.02)."""
+    betas = np.linspace(0.0001 ** 0.5, 0.02 ** 0.5, 1000, dtype=np.float64) ** 2
+    return np.cumprod(1.0 - betas)
+
+
+def ddim_timesteps(n):
+    """The n timesteps of a DDIM run, from the noisiest down (steps_offset 1)."""
+    ratio = 1000 // n
+    return (np.arange(n) * ratio).round()[::-1].astype(np.int64) + 1, ratio
+
+
+def ddim_step(latents, v, t, ratio, acp):
+    """One DDIM step (eta 0) of a v-prediction model: the latents a little less noisy."""
+    prev = t - ratio
+    a_t, a_prev = acp[t], (acp[prev] if prev >= 0 else acp[0])   # set_alpha_to_one is False
+    x0 = np.sqrt(a_t) * latents - np.sqrt(1 - a_t) * v
+    eps = np.sqrt(a_t) * v + np.sqrt(1 - a_t) * latents
+    return (np.sqrt(a_prev) * x0 + np.sqrt(1 - a_prev) * eps).astype(np.float32)
+
+
+DIFF_TILE, DIFF_OVER = 128, 16     # low-resolution tile side and overlap (the results are 4x that)
+
+
+def diff_positions(n):
+    """Start of each low-resolution tile along a side of n pixels (n >= DIFF_TILE): every DIFF_TILE - DIFF_OVER, the last one flush."""
+    pos = list(range(0, n - DIFF_TILE + 1, DIFF_TILE - DIFF_OVER))
+    return pos if pos[-1] == n - DIFF_TILE else pos + [n - DIFF_TILE]
+
+
+def diff_window():
+    """The weight of a pixel of a 4x tile: 1 inside, fading out over the overlap at the edges, never 0."""
+    n, ov = DIFF_TILE * 4, DIFF_OVER * 4
+    ramp = np.minimum(np.minimum(np.arange(n) + 1, np.arange(n)[::-1] + 1) / (ov + 1.0), 1.0).astype(np.float32)
+    return ramp[:, None] * ramp[None, :]
+
+
+class Diffusion:
+    """Stable Diffusion x4 upscaler, as diffusers' StableDiffusionUpscalePipeline, in numpy: a text encoder, the
+    unet and the vae decoder (onnxruntime sessions) and the tokenizer."""
+
+    def __init__(self, tokenizer, encoder, unet, vae):
+        self.tok, self.enc, self.unet, self.vae = tokenizer, encoder, unet, vae
+
+    def embed(self, text):
+        ids = np.array([self.tok(text)])
+        name = self.enc.get_inputs()[0].name
+        return self.enc.run(None, ort_feed(self.enc, **{name: ids}))[0].astype(np.float32)
+
+    def tile(self, rng, low, emb, o, steps):
+        """One low-resolution tile (3 x h x w, -1..1) made 4x bigger: (3 x 4h x 4w, about -1..1)."""
+        acp = ddim_alphas()
+        n = o.diff_noise
+        low = np.sqrt(acp[n]) * low + np.sqrt(1 - acp[n]) * rng.standard_normal(low.shape)
+        low = np.repeat(low[None].astype(np.float32), 2, axis=0)       # for the prompt and for the negative prompt
+        h, w = low.shape[2:]
+        lat = rng.standard_normal((1, 4, h, w)).astype(np.float32)
+        ts, ratio = ddim_timesteps(steps)
+        labels = np.full((2,), n, np.int64)
+        for t in ts:
+            both = np.concatenate([np.repeat(lat, 2, axis=0), low], axis=1)
+            feed = ort_feed(self.unet, sample=both, timestep=np.array([t]), encoder_hidden_states=emb, class_labels=labels)
+            noise = self.unet.run(None, feed)[0].astype(np.float32)
+            v = noise[0:1] + o.diff_guidance * (noise[1:2] - noise[0:1])      # the negative prompt is first
+            lat = ddim_step(lat, v, int(t), ratio, acp)
+        name = self.vae.get_inputs()[0].name
+        return self.vae.run(None, ort_feed(self.vae, **{name: lat / 0.08333}))[0][0].astype(np.float32)
+
+    def run(self, im, o, seed, log):
+        """Enlarge a PIL image 4x by tiles of DIFF_TILE pixels (feathered where they overlap)."""
+        steps = min(100, max(1, int(o.diff_steps)))
+        emb = np.concatenate([self.embed(o.diff_negative), self.embed(o.diff_prompt)])
+        a = np.asarray(im.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
+        H, W = a.shape[:2]
+        a = np.pad(a, ((0, max(0, DIFF_TILE - H)), (0, max(0, DIFF_TILE - W)), (0, 0)), mode="edge")
+        Hp, Wp = a.shape[:2]
+        tiles = [(y, x) for y in diff_positions(Hp) for x in diff_positions(Wp)]
+        acc, wsum, win = np.zeros((3, Hp * 4, Wp * 4), np.float32), np.zeros((Hp * 4, Wp * 4), np.float32), diff_window()
+        rng = np.random.default_rng(seed)
+        for k, (y, x) in enumerate(tiles, 1):
+            log(f"  tile {k}/{len(tiles)}")
+            r = self.tile(rng, a[y:y + DIFF_TILE, x:x + DIFF_TILE].transpose(2, 0, 1), emb, o, steps)
+            ys, xs = slice(y * 4, (y + DIFF_TILE) * 4), slice(x * 4, (x + DIFF_TILE) * 4)
+            acc[:, ys, xs] += r * win
+            wsum[ys, xs] += win
+        out = np.clip((acc / wsum + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8)
+        return Image.fromarray(out.transpose(1, 2, 0)[:H * 4, :W * 4], "RGB")
+
+
+def load_diffusion(c):
+    """The inventing upscaler ready to run, downloading its files (about 3.4 GB) on first use; None (after saying why) when not."""
+    if "diffusion" in c.models:
+        return c.models["diffusion"]
+    c.models["diffusion"] = None
+    if not HAVE_ORT:
+        c.once("no-ort-diffusion", f"{INSTALL_HINT} to use the inventing upscaler; using Real-ESRGAN instead")
+        return None
+    if not any(all((base / DIFFUSION_DIR / rel).is_file() for rel, _ in DIFFUSION_FILES) for base in (MODELS_DIR, c.work / "models")):
+        c.L("The inventing upscaler (Stable Diffusion x4) needs about 3.4 GB of downloads the first time.")
+    paths = {}
+    for rel, size in DIFFUSION_FILES:
+        paths[rel] = fetch_model(c, f"{DIFFUSION_DIR}/{rel}", DIFFUSION_URL + rel, size)
+        if paths[rel] is None:
+            return None
+    try:
+        tok = ClipTokenizer(paths["tokenizer/vocab.json"], paths["tokenizer/merges.txt"])
+        sessions = [make_session(c, paths[f"{d}/model.onnx"]) for d in ("text_encoder", "unet", "vae")]
+        c.models["diffusion"] = Diffusion(tok, *sessions)
+        c.L("  Inventing upscaler: very slow (minutes per picture even on a graphics card) and it changes the "
+            "picture: faces and text can come out wrong. " + DIFFUSION_CREDIT)
+    except Exception as e:  # noqa: BLE001
+        c.L(f"  Could not start the inventing upscaler: {e}")
+    return c.models["diffusion"]
+
+
+def run_diffusion(c, im, f):
+    """The inventing upscaler on a PIL image: 4x bigger (the caller resizes to the exact size)."""
+    o = c.o
+    if c.diff_seed is None:
+        c.diff_seed = int(o.diff_seed) or random.SystemRandom().randrange(1, 2 ** 31)
+        c.L(f"Inventing upscaler: seed {c.diff_seed}" + (" (chosen at random; type it under Seed to get the same result again)"
+                                                         if not o.diff_seed else ""))
+    if f > 4:
+        c.once("diffusion-4x", "  The inventing upscaler only invents at 4x; for a bigger size the 4x result is resized.")
+    return c.models["diffusion"].run(im, o, c.diff_seed, c.L)
 
 
 # ============================================================ face restoration
@@ -780,6 +1006,7 @@ class Context:
     def __init__(self, o, L, work):
         self.o, self.L, self.work, self.exe = o, L, work, None
         self.models, self.prov, self.said = {}, None, set()   # ONNX models by name, providers, notes made
+        self.diff_seed = None        # the seed the inventing upscaler uses this run
         key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
                       o.color_boost, o.use_ai, o.color_model)
         key = hashlib.md5(repr(key_fields).encode()).hexdigest()[:8]
@@ -791,7 +1018,7 @@ class Context:
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
         self.up_model = o.up_model
-        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", *UPSCALERS, *extra_models()):
+        if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", "diffusion", *UPSCALERS, *extra_models()):
             L(f"Unknown upscale model '{o.up_model}'; choosing automatically.")
             self.up_model = "auto"
 
@@ -900,21 +1127,30 @@ def page_to_original(o, w, h):
 
 
 # ---- one upscaled image
-def upscale_model(c, cls):
+def upscale_model(c, cls, force=None):
     """(engine, model name, model folder, native scale) for this kind of picture, or None for plain
-    resizing. The engine is "ncnn" (Real-ESRGAN program) or "onnx" (onnxruntime)."""
+    resizing. The engine is "ncnn" (Real-ESRGAN program), "onnx" (onnxruntime) or "diffusion". With force
+    (Compare models) that model or nothing: no automatic choice and no other model in its place."""
     if not c.o.use_ai:
         return None
     ncnn = "anime" if cls in ("lineart", "flatcolor") else "general"
-    pick = c.up_model
+    pick = force or c.up_model
     if pick == "auto":
         pick = ("animesharp" if cls in ("lineart", "flatcolor") else "dat") if c.gpu() else ncnn
+    if pick == "diffusion":
+        if load_diffusion(c):
+            return "diffusion", pick, None, 4
+        if force:
+            return None
+        pick = ncnn
     if pick in UPSCALERS:
         model = load_onnx(c, pick)
         if model:
             if pick == "animesharp":
                 c.once("animesharp-licence", ANIMESHARP_WARNING)
             return "onnx", pick, None, model.native
+        if force:
+            return None
         pick = ncnn
     if pick in ("anime", "general"):
         if c.exe is None:
@@ -926,9 +1162,11 @@ def upscale_model(c, cls):
     return ("onnx", pick, None, model.native) if model else None
 
 
-def make_upscaled(c, path, src_id, im, store=False):
+def make_upscaled(c, path, src_id, im, store=False, force=None):
     """Enlarge (or shrink) one image to exactly the size target_size gives. A result made by the preview is reused;
-    with store=True a new result is kept for the run that follows."""
+    with store=True a new result is kept for the run that follows. With force (Compare models) it is made with that
+    model, or plain with force="plain", never with another model and never from the cache; when that model cannot
+    do it, RuntimeError says why."""
     o, L = c.o, c.L
     w, h = im.size
     auto_cls, stats = classify(im)
@@ -940,15 +1178,20 @@ def make_upscaled(c, path, src_id, im, store=False):
     kept = ""
     if o.size_mode != "scale" and target == (w, h):
         kept = f"already {w if o.size_mode == 'width' else h} {'wide' if o.size_mode == 'width' else 'high'}, kept its size"
-    m = upscale_model(c, cls) if f > AI_MIN_SCALE else None     # a picture that stays about the same size needs no AI
+    m = upscale_model(c, cls, force) if f > AI_MIN_SCALE and force != "plain" else None   # a picture that stays about the same size needs no AI
+    if force and force != "plain" and f > AI_MIN_SCALE and m is None:
+        raise RuntimeError("the AI upscaler is switched off" if not o.use_ai else "it could not be started (see the log)")
     label = m[1] if m else "plain"
 
     def cache_file(name):
         faces = f"_faces{o.face_strength}_{o.face_model}" if o.faces else ""
+        if name == "diffusion":      # its settings change the picture
+            name += "_" + hashlib.md5(repr((o.diff_prompt, o.diff_negative, o.diff_noise, o.diff_steps, o.diff_guidance,
+                                            o.diff_seed)).encode()).hexdigest()[:8]
         return c.cache_dir / f"{path.stem[:40]}_{src_id}_{name}_{target[0]}x{target[1]}{faces}{'_coloured' if o.colorize else ''}.png"
 
     cache = cache_file(label)
-    if cache.exists() and not o.redo:
+    if cache.exists() and not o.redo and not force:
         res = Image.open(cache).convert("RGB")
         res.load()
         method = (f"{label} (cached)" if m else "lanczos (cached)") + (" + coloured" if to_colour else "")
@@ -964,7 +1207,7 @@ def make_upscaled(c, path, src_id, im, store=False):
             L("  Colouring failed; the picture is left black and white:\n  " + traceback.format_exc().replace("\n", "\n  "))
             c.models["colorizer"] = None
     if m:
-        up = None
+        up, why = None, "Real-ESRGAN did not work"
         if m[0] == "ncnn":
             up = run_esrgan(im, m[1], c.exe, c.tmp, L, m[2], m[3])
             if up is None:
@@ -972,14 +1215,20 @@ def make_upscaled(c, path, src_id, im, store=False):
                 c.exe = None
         else:
             try:
-                model = c.models[m[1]]
-                up = run_tiles(model, im)
-                if model.twice and f > model.native:    # more than twice as big: a second pass on the result
-                    up = run_tiles(model, up)
-            except Exception:  # noqa: BLE001
+                if m[0] == "diffusion":
+                    up = run_diffusion(c, im, f)
+                else:
+                    model = c.models[m[1]]
+                    up = run_tiles(model, im)
+                    if model.twice and f > model.native:    # more than twice as big: a second pass on the result
+                        up = run_tiles(model, up)
+            except Exception as e:  # noqa: BLE001
+                why = f"{type(e).__name__}: {e}"[:200]
                 L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
                 L(f"  Using plain resizing instead of '{m[1]}' for the rest of this run.")
                 c.models[m[1]] = None
+        if up is None and force:
+            raise RuntimeError(why)
         if up is None:
             method, label = "lanczos (AI failed)", "plain"
         else:
@@ -1029,6 +1278,8 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
         pass
     L(f"{len(numbered)} images. Saving in {out}\n")
 
+    if o.mode == "compare":
+        return run_compare(c, files, stamp, out, should_stop, started)
     c.start_ai()
     upscale = o.mode == "upscale"
     pdf_inputs, report = [], []
@@ -1097,6 +1348,194 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
         L(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} pages)")
         L("Print at 100% / 'Actual size', not 'Fit to page'.")
     return result
+
+
+# ================================================================== compare models
+COMPARE_PICTURES = 4     # Compare models uses this many of the pictures
+CLOSEUP = 256            # side of the close-up crops
+COMPARE_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def compare_choices(o=None):
+    """The models Compare models can use: every model of the Model list except Automatic."""
+    return [*MODEL_LABELS, *extra_models()]
+
+
+def detailed_box(im, size=CLOSEUP):
+    """Box (x0, y0, x1, y1) of at most size x size pixels where the picture has the most local variance (the most detail)."""
+    W, H = im.size
+    bw, bh = min(size, W), min(size, H)
+    f = min(1.0, 800.0 / max(W, H))
+    g = im.convert("L")
+    if f < 1.0:
+        g = g.resize((max(1, round(W * f)), max(1, round(H * f))), Image.BILINEAR)
+    a = np.asarray(g).astype(np.float64)
+    sw, sh = max(1, round(bw * f)), max(1, round(bh * f))
+    ii = np.pad(a, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    i2 = np.pad(a * a, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    box = lambda t: t[sh:, sw:] - t[:-sh, sw:] - t[sh:, :-sw] + t[:-sh, :-sw]
+    var = box(i2) / (sw * sh) - (box(ii) / (sw * sh)) ** 2
+    y, x = np.unravel_index(int(np.argmax(var)), var.shape)
+    x0 = min(max(0, int(round(x / f))), W - bw)
+    y0 = min(max(0, int(round(y / f))), H - bh)
+    return (x0, y0, x0 + bw, y0 + bh)
+
+
+def label_font(size):
+    from PIL import ImageFont
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:  # noqa: BLE001  (an old Pillow has one fixed size)
+        return ImageFont.load_default()
+
+
+def closeup_sheet(original_crop, crops):
+    """The close-ups side by side: the original's (enlarged, labelled Original), then each letter's, labelled with the
+    letter only. crops = [(letter, image)] in letter order."""
+    from PIL import ImageDraw
+    pad, cap, font = 10, 36, label_font(26)
+    cells = [("Original", original_crop)] + list(crops)
+    cw, ch = max(i.size[0] for _, i in cells), max(i.size[1] for _, i in cells)
+    cols = min(len(cells), 4)
+    rows = -(-len(cells) // cols)
+    sheet = Image.new("RGB", (pad + cols * (cw + pad), pad + rows * (cap + ch + pad)), (235, 235, 235))
+    d = ImageDraw.Draw(sheet)
+    for k, (name, im) in enumerate(cells):
+        x, y = pad + (k % cols) * (cw + pad), pad + (k // cols) * (cap + ch + pad)
+        d.text((x, y), name, fill=(0, 0, 0), font=font)
+        sheet.paste(im.convert("RGB"), (x, y + cap))
+    return sheet
+
+
+def why_said(heard, default):
+    """The line of what was just said that tells why a model could not be used (the first that says could not / failed), else the last."""
+    lines = [x.strip() for x in heard if x.strip()]
+    return next((x for x in lines if re.search(r"could not|failed|install", x, re.I)), lines[-1] if lines else default)[:200]
+
+
+def key_lines(o, order, labels, times, fails, pictures):
+    """The text of key.txt / key.png: which letter is which model (with its time, or why it failed), then the settings."""
+    lines = ["Which letter is which model", ""]
+    for letter, model in order:
+        name = labels[model]
+        if model in fails and len(fails[model]) == len(pictures):
+            lines.append(f"{letter} = {name}: failed: {next(iter(fails[model].values()))}")
+            continue
+        t = times.get(model, [])
+        line = f"{letter} = {name} ({sum(t) / len(t):.1f} s{' per picture' if len(pictures) > 1 else ''})"
+        for pic, why in fails.get(model, {}).items():
+            line += f"; failed for {pic}: {why}"
+        lines.append(line)
+    lines += ["", "Pictures: " + ", ".join(pictures),
+              f"Enlarge: {o.size_px} px {o.size_mode}" if o.size_mode != "scale" else f"Enlarge: {o.scale}x",
+              f"Restore faces: {'on, ' + o.face_model + ', strength ' + str(o.face_strength) if o.faces else 'off'}",
+              f"Colour black-and-white photos: {'on' if o.colorize else 'off'}", f"File type: {o.file_type}"]
+    if "diffusion" in labels:
+        lines.append(f"Inventing upscaler: prompt '{o.diff_prompt}', negative '{o.diff_negative}', noise {o.diff_noise}, "
+                     f"steps {o.diff_steps}, guidance {o.diff_guidance:g}, seed {o.diff_seed or 'random'}")
+    return lines
+
+
+def key_picture(lines):
+    from PIL import ImageDraw
+    font = label_font(18)
+    pad, step = 16, 28
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    width = max(int(probe.textlength(ln, font=font)) for ln in lines) + 2 * pad
+    sheet = Image.new("RGB", (width, 2 * pad + step * len(lines)), (255, 255, 255))
+    d = ImageDraw.Draw(sheet)
+    for k, ln in enumerate(lines):
+        d.text((pad, pad + k * step), ln, fill=(0, 0, 0), font=font)
+    return sheet
+
+
+def run_compare(c, files, stamp, out, should_stop, started):
+    """Compare models, blind: each of the first pictures is made with each ticked model (and plain resizing) at the
+    same size and options. The results get shuffled letters; the key says which letter is which model. Returns the folder."""
+    o, L = c.o, c.L
+    valid = compare_choices(o)
+    models = [m for m in dict.fromkeys(o.compare_models) if m in valid]
+    if len(models) + 1 > len(COMPARE_LETTERS):
+        L(f"Only the first {len(COMPARE_LETTERS) - 1} models are compared.")
+        models = models[:len(COMPARE_LETTERS) - 1]
+    if len(files) > COMPARE_PICTURES:
+        L(f"Compare models uses the first {COMPARE_PICTURES} of the {len(files)} pictures.")
+    pictures = files[:COMPARE_PICTURES]
+    contestants = [*models, "plain"]
+    shuffled = list(contestants)
+    random.SystemRandom().shuffle(shuffled)      # the letters: new for every run, the same for every picture of it
+    letter_of = {m: COMPARE_LETTERS[i] for i, m in enumerate(shuffled)}
+    labels = {m: MODEL_LABELS.get(m, m) for m in models} | {"plain": PLAIN_LABEL}
+    if any(m in ("general", "anime") or (MODELS_DIR / f"{m}.param").is_file() for m in models):
+        c.start_ai()
+    folder = out / f"BlurNoMore_compare_{stamp}"
+    times, fails, made, used = {}, {}, 0, set()
+    L(f"Comparing {len(models)} models and plain resizing on {len(pictures)} pictures. Which result is which model is not told here.")
+    for n, path in enumerate(pictures, 1):
+        if should_stop():
+            L("\nStopped by user.")
+            break
+        t0 = time.time()
+        L(f"[{n}/{len(pictures)}] {path.name[:50]}")
+        results = {}
+        try:
+            src_id, im = source_id(path), load_rgb(path)
+        except Exception:  # noqa: BLE001
+            L("    ERROR:\n    " + traceback.format_exc().replace("\n", "\n    "))
+            continue
+        if target_size(o, *im.size)[0] / im.size[0] <= AI_MIN_SCALE:
+            L("    This picture hardly grows, so every model gives plain resizing for it.")
+        for m in contestants:                        # always in this order, so the log tells nothing about the letters
+            heard, real = [], c.L
+
+            def hear(msg="", heard=heard, real=real):
+                heard.append(msg)
+                real(msg)
+            c.L = hear
+            t1 = time.time()
+            try:
+                results[m] = make_upscaled(c, path, src_id, im, force=m)["result"]
+                times.setdefault(m, []).append(time.time() - t1)
+            except Exception as e:  # noqa: BLE001
+                why = str(e) or type(e).__name__
+                if "see the log" in why:       # not started: the reason it gave the first time stands, else the last thing said
+                    why = next(iter(fails.get(m, {}).values()), None) or why_said(heard, why)
+                fails.setdefault(m, {})[path.name] = why
+                L("    a model could not make this picture (the key says which)")
+            finally:
+                c.L = real
+        if not results:
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        base = path.stem[:40]
+        k = 2
+        while base in used:
+            base, k = f"{path.stem[:40]}_{k}", k + 1
+        used.add(base)
+        ext = "jpg" if o.file_type == "jpg" else "png"
+        for m, res in results.items():
+            if ext == "jpg":
+                res.save(folder / f"{base}_{letter_of[m]}.jpg", quality=95, subsampling=0)
+            else:
+                res.save(folder / f"{base}_{letter_of[m]}.png")
+            made += 1
+        ref = results.get("plain") or next(iter(results.values()))      # the spot is chosen on the plain enlargement
+        box = detailed_box(ref)
+        sx, sy = im.size[0] / ref.size[0], im.size[1] / ref.size[1]
+        size = (box[2] - box[0], box[3] - box[1])
+        zoom = im.resize(size, Image.NEAREST, box=(box[0] * sx, box[1] * sy, max(box[2] * sx, box[0] * sx + 1), max(box[3] * sy, box[1] * sy + 1)))
+        crops = [(letter_of[m], results[m].crop(box)) for m in sorted(results, key=letter_of.get)]
+        closeup_sheet(zoom, crops).save(folder / f"{base}_closeups.png")
+        L(f"    done ({time.time() - t0:.1f}s)")
+    if not made:
+        L("Nothing to write.")
+        return None
+    lines = key_lines(o, sorted(((letter_of[m], m) for m in contestants)), labels, times, fails, [p.name for p in pictures])
+    (folder / "key.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    key_picture(lines).save(folder / "key.png")
+    L("Open key.png only after you have chosen.")
+    L(f"\nDONE in {time.time() - started:.0f}s: {folder}  ({made} pictures to compare)")
+    return folder
 
 
 # ================================================================== preview
@@ -1230,18 +1669,25 @@ HELP = {
     "kind": "What the pictures are. 'Detect for each image' looks at each picture and decides: drawing or line art, "
             "or photo. Choose Drawing or Photo when all your pictures are the same kind and the detection "
             "gets some wrong.",
-    "up_model": "Automatic picks the best model for each picture. Drawings: AnimeSharp V4 when your graphics card "
+    "up_model": "Automatic picks a model for each picture. Drawings: AnimeSharp V4 when your graphics card "
                 "can run it, otherwise the Drawing model (Real-ESRGAN anime). Photos: the Web photo model (DAT) when "
                 "your graphics card can run it, otherwise the General model. "
+                "Nobody has crowned a best photo model: use Make > Compare models to see them side by side, unlabelled, "
+                "and choose by eye. "
                 "Drawing AnimeSharp V4 (faithful, about 31 MB on first use) follows the lines very closely: the "
                 "right pick for drawings you want to trace; it is free for personal use only (licence CC BY-NC-SA 4.0): "
                 "don't sell or publish results made with it commercially. "
-                "Web photo DAT (about 49 MB) is the best for old, compressed or damaged web photos. "
-                "Clean photo Real-HAT-GAN (sharp, about 160 MB) is the pick for clean, sharp photos where you want "
-                "crisp detail; it is never chosen automatically. "
+                "Web photo DAT RealWebPhoto v4 (about 49 MB) is made for old, compressed or damaged web photos. "
+                f"Web photo DAT2 BHI (newest DAT, December 2024, about {UPSCALERS['bhi']['size']}) is a newer DAT for real-world photos. "
+                f"Web photo DRCT-L (about {UPSCALERS['drct']['size']}) and Web photo ATD (about {UPSCALERS['atd']['size']}) are two other "
+                "web photo models of the same maker, built differently. "
+                "Clean photo Real-HAT-GAN (sharp, about 160 MB) is for clean, sharp photos where you want "
+                "crisp detail. "
                 "Photo HEART (new, experimental, about 75 MB) is a brand-new photo model from November 2026, less "
-                "proven than the others; it is only used when you pick it. DAT, HAT-GAN and HEART are slow without "
-                "a graphics card (needs onnxruntime-directml). Other models you put in the models folder next to the program "
+                "proven than the others. These are only used when you pick them; Automatic never picks HAT-GAN, HEART, BHI, DRCT or ATD. "
+                "The photo models are slow without a graphics card (needs onnxruntime-directml). "
+                "Inventing: Stable Diffusion x4 makes up detail that is not in the picture; see the Inventing upscaler settings. "
+                "Other models you put in the models folder next to the program "
                 "(NAME.param and NAME.bin, or NAME.onnx) are listed at the end.",
     "animesharp_warning": "AnimeSharp V4 is free for personal use only (licence CC BY-NC-SA 4.0). Don't sell or "
                           "publish results made with it commercially. Automatic uses it for drawings when your "
@@ -1269,7 +1715,24 @@ HELP = {
                      "(default), 100 = fully restored. Lower looks more like the original, higher is sharper but "
                      "can look smoother or change the face.",
     "mode": "What comes out. Bigger images: each picture becomes a new, bigger picture file. Tracing PDF: crops, "
-            "enlarges and fits every picture on an A4 page in one PDF, for tracing. One of the two per run.",
+            "enlarges and fits every picture on an A4 page in one PDF, for tracing. Compare models: makes the first 4 "
+            "pictures with every model you tick, plus plain resizing, as unlabelled pictures A, B, C ... in a new folder, "
+            "so you can choose without bias. One of the three per run.",
+    "compare_models": "Compare models. Every ticked model makes the same bigger picture (same size, faces, colour and "
+                      "file type); plain resizing is always added so you see what the AI adds. The letters are shuffled "
+                      "at random for every run. key.png and key.txt in the new folder say which letter is which model: "
+                      "open them only after you have chosen. Uses the first 4 pictures. Models that are not downloaded "
+                      "yet are downloaded first. The Inventing model is unticked: it takes minutes per picture and makes up detail.",
+    "diff_prompt": "Describe the picture; it steers what gets invented.",
+    "diff_negative": "What it should stay away from.",
+    "diff_noise": "How much it may invent: low keeps close to your picture, high makes up more. 0 to 350.",
+    "diff_steps": "More steps = slower, a bit finer. 5 to 100.",
+    "diff_guidance": "How strongly it follows the prompt. 1 to 15.",
+    "diff_seed": "The starting point of the invention. The same number gives the same result. 0 = a new random number "
+                 "each run; the log says which one was used.",
+    "diff_warning": "The inventing upscaler (Stable Diffusion x4) is very slow: minutes per picture even on a graphics "
+                    "card, much slower on the processor. The first time it downloads 3.4 GB. It changes the picture: "
+                    "faces and text can come out wrong. Only used when you pick it.",
     "name": "Bigger images only. How the new files are named. Automatic: photo_x2.png. Or add your own text after "
             "the name (photo_big.png) or before it (big_photo.png), so you can find the pictures again. "
             "Two files with the same name get _2.",
@@ -1305,7 +1768,8 @@ HELP = {
             "own; use this for a clean rebuild.",
     "open": "Opens the PDF, or the folder of bigger pictures, when the run is finished.",
     "run_preview": "Works on 4 of your pictures first (spread over the list) and shows each one next to its "
-                   "result, with close-ups. Then you choose 'Go on with all' or 'Change settings'.",
+                   "result, with close-ups. Then you choose 'Go on with all' or 'Change settings'. "
+                   "Not for Compare models: that already is a look-first run on 4 pictures.",
     "run": "Works on all the pictures straight away.",
 }
 HELP_DEFAULT = "Point at a setting to see what it does."
@@ -1360,13 +1824,9 @@ def build_window():
     mono = tkfont.nametofont("TkFixedFont")
 
     # words in the window <-> values in Options
-    MAKE = {"Bigger images": "upscale", "Tracing PDF": "pdf"}
+    MAKE = {"Bigger images": "upscale", "Tracing PDF": "pdf", "Compare models": "compare"}
     KIND = {"Detect for each image": "auto", "Drawing or line art": "drawing", "Photo": "photo"}
-    MODEL = {"Automatic": "auto", "Drawing (Real-ESRGAN anime)": "anime",
-             "Drawing AnimeSharp V4 (faithful)": "animesharp", "General photo (Real-ESRGAN)": "general",
-             "Web photo DAT (best, slower)": "dat", "Clean photo Real-HAT-GAN (sharp)": "hatgan",
-             "Photo HEART (new, experimental)": "heart",
-             **{n: n for n in extra_models()}}
+    MODEL = {"Automatic": "auto", **{label: key for key, label in MODEL_LABELS.items()}, **{n: n for n in extra_models()}}
     FACE = {"Natural (GFPGAN)": "gfpgan", "Strongest repair (CodeFormer)": "codeformer"}
     NAME = {"Automatic": "auto", "Text after the name": "suffix", "Text before the name": "prefix"}
     SAVE = {"Next to the images": False, "A folder I choose": True}
@@ -1406,6 +1866,13 @@ def build_window():
     v_color_model = tk.StringVar(value=word(COLOR_MODEL, o.color_model, "General (recommended)"))
     v_redo = tk.BooleanVar(value=o.redo)
     v_open = tk.BooleanVar(value=o.open_when_done)
+    v_cmp = {key: tk.BooleanVar(value=key in o.compare_models) for key in compare_choices(o)}
+    v_diff_prompt = tk.StringVar(value=o.diff_prompt)
+    v_diff_negative = tk.StringVar(value=o.diff_negative)
+    v_diff_noise = tk.StringVar(value=str(o.diff_noise))
+    v_diff_steps = tk.StringVar(value=str(o.diff_steps))
+    v_diff_guidance = tk.StringVar(value=f"{o.diff_guidance:g}")
+    v_diff_seed = tk.StringVar(value=str(o.diff_seed))
     v_help = tk.StringVar(value=HELP_DEFAULT)
     v_count = tk.StringVar()
 
@@ -1453,7 +1920,7 @@ def build_window():
     right.columnconfigure(0, weight=1)
 
     # ---- helpers to build rows
-    counters, only = {}, {"upscale": [], "pdf": []}
+    counters, only = {}, {"upscale": [], "pdf": [], "compare": []}
 
     def tip(w, key):
         """Show the help text of a setting while the pointer is over it or it has the focus."""
@@ -1469,7 +1936,8 @@ def build_window():
         return g
 
     def row(g, label, build, key, out=None):
-        """One setting: a label and what you change it with. out = 'upscale' or 'pdf': shown only for that output."""
+        """One setting: a label and what you change it with. out = 'upscale', 'pdf' or 'compare' (several, separated by
+        spaces): shown only for that output."""
         i = counters[g] = counters.get(g, -1) + 1
         g.columnconfigure(0, minsize=210)      # the settings of all groups line up
         lab = ttk.Label(g, text=label)
@@ -1478,8 +1946,8 @@ def build_window():
         w.grid(row=i, column=1, sticky="w", pady=2)
         tip(lab, key)
         tip(w, key)
-        if out:
-            only[out] += [lab, w]
+        for m in (out or "").split():
+            only[m] += [lab, w]
         return w
 
     def combo(var, values, width=30):
@@ -1609,6 +2077,14 @@ def build_window():
     g_make = group("2. What to make")
     row(g_make, "Make", combo(v_make, MAKE), "mode")
 
+    def compare_boxes(p):
+        f = ttk.Frame(p)
+        for key in v_cmp:
+            tk.Checkbutton(f, text=MODEL_LABELS.get(key, key), variable=v_cmp[key], anchor="w", justify="left",
+                           wraplength=290).pack(anchor="w")
+        return f
+    row(g_make, "Models to compare", compare_boxes, "compare_models", "compare")
+
     # ---- 3. What kind of images
     g2 = group("3. What kind of images")
     row(g2, "Kind", combo(v_kind, KIND), "kind", "upscale")
@@ -1619,6 +2095,17 @@ def build_window():
     row(g2, "Use AI upscaler", check(v_ai, "on  (needs a GPU)"), "ai")
     row(g2, "Model for coloured art", combo(v_color_model, COLOR_MODEL), "model", "pdf")
 
+    # ---- the inventing upscaler's settings: shown when it is the model, or is ticked for Compare models
+    g_diff = group("Inventing upscaler (Stable Diffusion x4)")
+    row(g_diff, "", lambda p: ttk.Label(p, text="Very slow, 3.4 GB on first use, and it makes things up.",
+                                        foreground="#c25a00", font=small, wraplength=300, justify="left"), "diff_warning")
+    row(g_diff, "Describe the picture", entry_row(v_diff_prompt), "diff_prompt")
+    row(g_diff, "Stay away from", entry_row(v_diff_negative), "diff_negative")
+    row(g_diff, "How much it may invent (0-350)", spin(v_diff_noise, 0, 350, 5), "diff_noise")
+    row(g_diff, "Steps (5-100)", spin(v_diff_steps, 5, 100, 5), "diff_steps")
+    row(g_diff, "Follow the description (1-15)", spin(v_diff_guidance, 1, 15, 0.5), "diff_guidance")
+    row(g_diff, "Seed (0 = random each run)", spin(v_diff_seed, 0, 2147483647, 1, 10), "diff_seed")
+
     # ---- 4. Options
     g3 = group("4. Options")
     def size_row(p):
@@ -1628,12 +2115,12 @@ def build_window():
         ttk.Label(f, textvariable=v_size_note).pack(side="left", padx=(4, 0))
         return f
     v_size_note = tk.StringVar()
-    w_size = row(g3, "Enlarge", size_row, "scale", "upscale")
-    w_shrink = row(g3, "Also make bigger pictures smaller", check(v_shrink, "on"), "shrink_bigger", "upscale")
-    row(g3, "Restore faces", check(v_faces, "on"), "faces", "upscale")
-    w_face_model = row(g3, "Face model", combo(v_face_model, FACE), "face_model", "upscale")
-    w_strength = row(g3, "Face strength (0-100)", spin(v_strength, 0, 100, 10), "face_strength", "upscale")
-    row(g3, "Colour black-and-white photos", check(v_colorize, "on"), "colorize", "upscale")
+    w_size = row(g3, "Enlarge", size_row, "scale", "upscale compare")
+    w_shrink = row(g3, "Also make bigger pictures smaller", check(v_shrink, "on"), "shrink_bigger", "upscale compare")
+    row(g3, "Restore faces", check(v_faces, "on"), "faces", "upscale compare")
+    w_face_model = row(g3, "Face model", combo(v_face_model, FACE), "face_model", "upscale compare")
+    w_strength = row(g3, "Face strength (0-100)", spin(v_strength, 0, 100, 10), "face_strength", "upscale compare")
+    row(g3, "Colour black-and-white photos", check(v_colorize, "on"), "colorize", "upscale compare")
     row(g3, "Crop empty paper", check(v_crop, "on"), "crop", "pdf")
     row(g3, "Strengthen thin lines (0-100)", spin(v_thick, 0, 100, 10), "thicken", "pdf")
     row(g3, "Lighten print (0-100)", spin(v_fade, 0, 90, 10), "fade", "pdf")
@@ -1644,7 +2131,7 @@ def build_window():
     g4 = group("5. What comes out")
     row(g4, "Name", combo(v_name, NAME), "name", "upscale")
     w_name_text = row(g4, "Text for the name", entry_row(v_name_text), "name_text", "upscale")
-    row(g4, "File type", combo(v_type, ["PNG", "JPG"], 8), "file_type", "upscale")
+    row(g4, "File type", combo(v_type, ["PNG", "JPG"], 8), "file_type", "upscale compare")
     row(g4, "Fit on the page", combo(v_fit, FIT), "fit", "pdf")
     row(g4, "Page margin (mm)", spin(v_margin, 0, 40, 1), "margin", "pdf")
 
@@ -1678,10 +2165,12 @@ def build_window():
     # ---- what shows and what is greyed
     def sync(*_):
         mode = MAKE.get(v_make.get(), "pdf")
-        for m, widgets in only.items():
-            for w in widgets:
-                (w.grid if m == mode else w.grid_remove)()
+        shown = set(only[mode])
+        for w in {w for widgets in only.values() for w in widgets}:    # a setting can belong to more than one output
+            (w.grid if w in shown else w.grid_remove)()
         picked = MODEL.get(v_model.get(), "auto")
+        invents = (mode == "upscale" and picked == "diffusion") or (mode == "compare" and v_cmp["diffusion"].get())
+        (g_diff.grid if invents else g_diff.grid_remove)()
         if MAKE.get(v_make.get()) == "upscale" and (picked == "animesharp" or (picked == "auto" and KIND.get(v_kind.get()) != "photo")):
             w_licence.grid()
             lab_licence.grid()
@@ -1700,7 +2189,7 @@ def build_window():
             e.configure(state="disabled" if auto_name else "normal")
         for e in w_save_to.winfo_children():
             e.configure(state="normal" if SAVE.get(v_save.get()) else "disabled")
-    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind, v_scale, v_px):
+    for var in (v_make, v_faces, v_name, v_save, v_model, v_kind, v_scale, v_px, v_cmp["diffusion"]):
         var.trace_add("write", sync)
     sync()
 
@@ -1714,6 +2203,12 @@ def build_window():
         b.pack(side="left", padx=(0, 6))
         tip(b, k)
     b_stop.pack(side="left", padx=(0, 6))
+
+    def sync_buttons(*_):
+        """Run with preview is not offered for Compare models: that already is a look-first run."""
+        b_prev.configure(state="disabled" if MAKE.get(v_make.get()) == "compare" else "normal")
+    v_make.trace_add("write", sync_buttons)
+    sync_buttons()
     log_text = tk.Text(right, wrap="none", font=mono, height=20, undo=False)
     ysb = ttk.Scrollbar(right, orient="vertical", command=log_text.yview)
     xsb = ttk.Scrollbar(right, orient="horizontal", command=log_text.xview)
@@ -1768,6 +2263,13 @@ def build_window():
         ob.face_strength = min(100, max(0, num(v_strength, "Face strength")))
         ob.face_model = FACE[v_face_model.get()]
         ob.colorize = bool(v_colorize.get())
+        ob.compare_models = [k for k, v in v_cmp.items() if v.get()]
+        ob.diff_prompt = v_diff_prompt.get().strip()
+        ob.diff_negative = v_diff_negative.get().strip()
+        ob.diff_noise = min(350, max(0, num(v_diff_noise, "How much it may invent")))
+        ob.diff_steps = min(100, max(5, num(v_diff_steps, "Steps")))
+        ob.diff_guidance = min(15.0, max(1.0, num(v_diff_guidance, "Follow the description", float)))
+        ob.diff_seed = min(2147483647, max(0, num(v_diff_seed, "Seed")))
         ob.name_mode = NAME[v_name.get()]
         ob.name_text = v_name_text.get().strip()
         ob.file_type = v_type.get().lower()
@@ -1807,6 +2309,8 @@ def build_window():
         threading.Thread(target=worker, args=(opts, preview), daemon=True).start()
 
     def begin(preview):
+        if preview and MAKE.get(v_make.get()) == "compare":
+            return
         try:
             opts = gather()
         except ValueError as e:
@@ -1931,8 +2435,8 @@ def build_window():
                 elif kind == "preview":
                     state["preview"] = show_preview(*payload)
                 else:
-                    for b in (b_prev, b_run):
-                        b.configure(state="normal")
+                    b_run.configure(state="normal")
+                    sync_buttons()
                     b_stop.configure(state="disabled")
                     refresh_list()
                     if payload:
@@ -1953,7 +2457,9 @@ def build_window():
     return SimpleNamespace(root=root, gather=gather, add_paths=add_paths, remove_selected=remove_selected,
                            clear_list=clear_list, last_run_images=last_run_images, inputs=inputs, listbox=lb,
                            count_text=v_count, vars=SimpleNamespace(make=v_make, save=v_save, save_to=v_save_to,
-                                                                    name=v_name, faces=v_faces, ai=v_ai),
+                                                                    name=v_name, faces=v_faces, ai=v_ai, model=v_model,
+                                                                    compare=v_cmp),
+                           group_diff=g_diff, b_prev=b_prev,
                            begin=begin, state=state, log_text=log_text, help_text=v_help, sync=sync,
                            toggle_more=toggle_more, dnd=dnd, left=left)
 
@@ -1970,8 +2476,8 @@ def main():
     ap = argparse.ArgumentParser(description="BlurNoMore: bigger AI-restored copies of pictures, or a sharp A4 tracing PDF "
                                              "(no arguments = open the window)")
     ap.add_argument("inputs", nargs="*", help="folders (all pictures directly in them) and/or picture files (never changed)")
-    ap.add_argument("--mode", choices=["pdf", "upscale"], default="pdf",
-                    help="pdf = Tracing PDF (default), upscale = Bigger images")
+    ap.add_argument("--mode", choices=["pdf", "upscale", "compare"], default="pdf",
+                    help="pdf = Tracing PDF (default), upscale = Bigger images, compare = Compare models (see --compare)")
     ap.add_argument("--save-to", default="", metavar="FOLDER",
                     help="where the PDF / upscaled folder and _blurnomore_work go (default: the folder of the first input)")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
@@ -1988,8 +2494,24 @@ def main():
                     help="upscale mode: name the files TEXT<name> instead of <name>_x2")
     ap.add_argument("--upscale-model", default="auto", metavar="NAME",
                     help="upscale mode: auto (default), general, anime, dat (Web photo model), animesharp (drawings), hatgan "
-                         "(clean photos), heart (new, experimental photo model), or the name of an extra model "
+                         "(clean photos), heart (new, experimental photo model), bhi, drct, atd (more web photo models), "
+                         "diffusion (inventing: makes up detail, very slow), or the name of an extra model "
                          "in the models folder: " + (", ".join(extra_models()) or "none found"))
+    ap.add_argument("--compare", default=None, metavar="MODELS",
+                    help="Compare models (blind): a comma separated list of upscale models, or all (every model, "
+                         "also the inventing one). Makes the first 4 pictures with each, plus plain resizing, as pictures "
+                         "A, B, C ... with a key.png saying which is which. Same as --mode compare with a list; "
+                         "without a list --mode compare uses " + ",".join(Options().compare_models))
+    ap.add_argument("--diff-prompt", default=Options.diff_prompt, help="inventing upscaler: describe the picture (default: %(default)s)")
+    ap.add_argument("--diff-negative", default=Options.diff_negative, help="inventing upscaler: what to stay away from (default: %(default)s)")
+    ap.add_argument("--diff-noise", type=int, default=Options.diff_noise, metavar="N",
+                    help="inventing upscaler: 0-350, how much it may invent (default %(default)s)")
+    ap.add_argument("--diff-steps", type=int, default=Options.diff_steps, metavar="N",
+                    help="inventing upscaler: 5-100, more is slower and a bit finer (default %(default)s)")
+    ap.add_argument("--diff-guidance", type=float, default=Options.diff_guidance, metavar="N",
+                    help="inventing upscaler: 1-15, how strongly it follows the prompt (default %(default)s)")
+    ap.add_argument("--diff-seed", type=int, default=Options.diff_seed, metavar="N",
+                    help="inventing upscaler: the same seed gives the same result; 0 = a new random seed each run (default %(default)s)")
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="upscale mode: picture file type")
     ap.add_argument("--faces", action="store_true", help="upscale mode: restore faces")
     ap.add_argument("--face-model", choices=list(FACE_MODELS), default="gfpgan",
@@ -2020,13 +2542,29 @@ def main():
         ap.error("the size in pixels must be between 1 and 20000")
     if a.name_suffix and a.name_prefix:
         ap.error("use --name-suffix or --name-prefix, not both")
+    for name, value, lo, hi in (("--diff-noise", a.diff_noise, 0, 350), ("--diff-steps", a.diff_steps, 5, 100),
+                                ("--diff-guidance", a.diff_guidance, 1, 15), ("--diff-seed", a.diff_seed, 0, 2 ** 31 - 1)):
+        if not lo <= value <= hi:
+            ap.error(f"{name} must be between {lo} and {hi}")
+    compare = Options().compare_models
+    if a.compare is not None:
+        every = compare_choices(None)
+        compare = every if a.compare.strip().lower() == "all" else [m.strip() for m in a.compare.split(",") if m.strip()]
+        unknown = [m for m in compare if m not in every]
+        if unknown or not compare:
+            ap.error(f"--compare: unknown model {', '.join(unknown) or '(none given)'}; choose from all, {', '.join(every)}")
+        a.mode = "compare"
+    if a.mode == "compare" and a.preview:
+        ap.error("--preview is not offered for compare: it already is a look-first run")
     o = Options(inputs=a.inputs, repeat_last=a.same, fit="fill" if a.fill else "whole", margin_mm=a.margin, dpi=a.dpi,
                 autocrop=not a.no_crop, thicken=a.thicken, fade=a.fade, keep_color=not a.grey,
                 color_boost=a.boost, use_ai=not a.no_ai, color_model=a.model, redo=a.redo,
                 mode=a.mode, save_to=a.save_to, scale=a.scale, size_mode=size_mode, size_px=size_px, shrink_bigger=a.shrink_bigger, up_model=a.upscale_model, file_type=a.format,
                 kind=a.kind, name_mode="prefix" if a.name_prefix else "suffix" if a.name_suffix else "auto",
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
-                face_model=a.face_model, colorize=a.colorize)
+                face_model=a.face_model, colorize=a.colorize, compare_models=compare, diff_prompt=a.diff_prompt,
+                diff_negative=a.diff_negative, diff_noise=a.diff_noise, diff_steps=a.diff_steps,
+                diff_guidance=a.diff_guidance, diff_seed=a.diff_seed)
     if a.preview:
         items = make_preview(o, print)
         if not items:
