@@ -121,26 +121,91 @@ def snapshot(d):
 def make_run(models_dir, work, **kw):
     """Run the program on the folder in kw['inputs'] with the models folder replaced; returns (result, log lines)."""
     lines = []
-    bn.MODELS_DIR = models_dir
-    o = bn.Options(save_to=str(work), **kw)
+    o = bn.Options(save_to=str(work), ai_dir=str(models_dir.parent), **kw)
     return bn.run(o, lines.append), lines
 
 
 def main():
-    saved_models_dir = bn.MODELS_DIR
+    saved = bn.APP_DIR, bn.SETTINGS_FILE, bn.ESRGAN_DIR, bn.MODELS_DIR, bn.SEEDVR2_DIR
     try:
         check()
     finally:
-        bn.MODELS_DIR = saved_models_dir
+        bn.APP_DIR, bn.SETTINGS_FILE, bn.ESRGAN_DIR, bn.MODELS_DIR, bn.SEEDVR2_DIR = saved
         (ROOT / "blurnomore_last_run.json").unlink(missing_ok=True)
+
+
+def ai_run(base, ai_dir, out):
+    """A run without AI on a tiny picture, with the AI files folder `ai_dir`; returns the log text."""
+    pic = out / "ai_pic.png"
+    photo(40, 30).save(pic)
+    lines = []
+    bn.run(bn.Options(inputs=[str(pic)], mode="upscale", use_ai=False, save_to=str(out / "ai_out"), ai_dir=str(ai_dir)), lines.append)
+    return "\n".join(lines)
+
+
+def fake_ai_files(base):
+    """Fake realesrgan/, models/ (with an extra model) and a ready seedvr2/ (venv, ready.json, tool, uv cache) in `base`."""
+    (base / "realesrgan").mkdir(parents=True)
+    (base / "realesrgan" / "realesrgan-ncnn-vulkan.exe").write_bytes(b"x" * 1000)
+    fake_upscaler(base / "models" / "mymodel_x4.onnx", "nearest")
+    install_fake_seedvr2(base / "seedvr2")
+    (base / "seedvr2" / "venv" / "marker").write_text("v")
+    (base / "seedvr2" / "uv" / "cache").mkdir(parents=True)
+    (base / "seedvr2" / "uv" / "cache" / "wheel").write_bytes(b"w" * 500)
+
+
+def check_ai_dir(out):
+    """The AI files folder: files move at the next run, the venv is dropped, a second run moves nothing, a folder that
+    exists in the target is left alone, a target that cannot be written falls back, uv gets its folders."""
+    with tempfile.TemporaryDirectory() as t_old, tempfile.TemporaryDirectory() as t_new, tempfile.TemporaryDirectory() as t_third:
+        old, new, third = Path(t_old), Path(t_new), Path(t_third)
+        bn.APP_DIR, bn.SETTINGS_FILE = old, old / "settings.json"
+        fake_ai_files(old)
+        # moving to another folder
+        text = ai_run(old, new, out)
+        assert "Moving the AI files (realesrgan)" in text and "Moving the AI files (models)" in text and "Moving the AI files (seedvr2)" in text, text
+        assert text.count("  done") == 3, text
+        assert not (old / "models").exists() and not (old / "realesrgan").exists() and not (old / "seedvr2").exists(), "old place not emptied"
+        assert (new / "realesrgan" / "realesrgan-ncnn-vulkan.exe").is_file() and (new / "seedvr2" / "src" / "inference_cli.py").is_file()
+        assert (new / "seedvr2" / "uv" / "cache" / "wheel").is_file(), "the uv cache did not move"
+        assert not (new / "seedvr2" / "venv").exists() and not (new / "seedvr2" / "ready.json").exists(), "venv / ready.json kept"
+        assert bn.MODELS_DIR == new / "models" and "mymodel_x4" in bn.extra_models(), "extra model not listed from the new place"
+        assert json.loads(bn.SETTINGS_FILE.read_text())["ai_dir_used"] == str(new)
+        # a second run moves nothing
+        text = ai_run(old, new, out)
+        assert "Moving" not in text and "already has" not in text, text
+        # the target already has a models folder: both are left, the rest moves
+        (third / "models").mkdir()
+        (third / "models" / "other.txt").write_text("o")
+        text = ai_run(new, third, out)
+        assert "already has a folder models" in text and "Moving the AI files (realesrgan)" in text, text
+        assert (new / "models" / "mymodel_x4.onnx").is_file() and (third / "models" / "other.txt").is_file()
+        assert not (third / "models" / "mymodel_x4.onnx").exists() and (third / "realesrgan").is_dir()
+        # a target that cannot be written to (a folder inside a file): nothing moves, the old place is used
+        blocker = old / "afile"
+        blocker.write_text("x")
+        text = ai_run(third, blocker / "sub", out)
+        assert "cannot be written to" in text, text
+        assert (third / "realesrgan").is_dir() and bn.ESRGAN_DIR == third / "realesrgan", "files lost or not used"
+        # uv keeps its Python and cache in seedvr2/uv: present in the environment of the programs the run starts
+        bn.point_ai_dirs(third)
+
+        class Ctx:
+            should_stop = staticmethod(lambda: False)
+            L = staticmethod(lambda m: got.append(m))
+        got = []
+        bn.run_streamed(Ctx, [sys.executable, "-c", "import os;print(os.environ['UV_PYTHON_INSTALL_DIR']);print(os.environ['UV_CACHE_DIR'])"])
+        assert got[-2:] == [f"    {third / 'seedvr2' / 'uv' / 'python'}", f"    {third / 'seedvr2' / 'uv' / 'cache'}"], got
+    print("AI files folder ok")
 
 
 def check():
     with tempfile.TemporaryDirectory() as t_models, tempfile.TemporaryDirectory() as t_in, \
-            tempfile.TemporaryDirectory() as t_out, tempfile.TemporaryDirectory() as t_sv:
-        models, pics, out = Path(t_models), Path(t_in), Path(t_out)
-        sv = Path(t_sv) / "seedvr2"
-        bn.SEEDVR2_DIR = sv
+            tempfile.TemporaryDirectory() as t_out, tempfile.TemporaryDirectory() as t_app:
+        # the AI files folder is t_models (models/, seedvr2/); "next to the program" is an empty temporary folder
+        bn.APP_DIR, bn.SETTINGS_FILE = Path(t_app), Path(t_app) / "settings.json"
+        models, pics, out = Path(t_models) / "models", Path(t_in), Path(t_out)
+        sv = Path(t_models) / "seedvr2"
         install_fakes(models)
         photo(48, 40).save(pics / "small.png")
         photo(200, 150, 2).save(pics / "bigger.png")
@@ -197,7 +262,7 @@ def check():
         t0 = time.time()
         try:
             bn.run(bn.Options(save_to=str(out / "sv_stop"), inputs=[str(pics / "small.png")], mode="upscale", up_model="seedvr2",
-                              scale=2, redo=True), lines.append, stop)
+                              scale=2, redo=True, ai_dir=str(models.parent)), lines.append, stop)
         finally:
             del os.environ["FAKE_SV_SLOW"]
         assert "Stopped by user." in "\n".join(lines) and time.time() - t0 < 20, lines[-8:]
@@ -332,6 +397,8 @@ def check():
         assert "failed:" in key and "out of graphics memory" in key, key
         assert len(list(Path(res).glob("*_?.png"))) == 8, "the letter of the failed model was not left out"
         print("compare with the inventing model ok")
+
+        check_ai_dir(out)
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"
         print("Fake-model check passed.")

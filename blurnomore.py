@@ -65,7 +65,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.5"
+VERSION = "4.6"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -77,7 +77,8 @@ AI_MIN_SCALE = 1.25  # below this much enlargement, plain Lanczos is enough
 APP_DIR = Path(__file__).parent
 SETTINGS_FILE = APP_DIR / "blurnomore_settings.json"
 LAST_RUN_FILE = APP_DIR / "blurnomore_last_run.json"   # the images of the last run
-ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once, next to the program
+AI_FOLDERS = ("realesrgan", "models", "seedvr2")   # the big folders; they live in the AI files folder (next to the program, or the one chosen)
+ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once; point_ai_dirs sets these three
 MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pairs
 BIG_RESULT_PIXELS = 100_000_000
 INSTALL_HINT = "Install onnxruntime-directml (and opencv-python-headless for faces) with pip"
@@ -186,6 +187,7 @@ class Options:
     sv_input_noise: float = 0.0  # 0-1, adds variation: higher = it makes up more
     sv_latent_noise: float = 0.0  # 0-1, the same, later in the process
     sv_low_memory: bool = False  # saves graphics memory, slower
+    ai_dir: str = ""             # where the AI files (realesrgan, models, seedvr2) live; empty = next to the program
     open_when_done: bool = True  # GUI only
 
 
@@ -304,6 +306,96 @@ def writable_dir(preferred, fallback):
         return preferred
     except OSError:
         return fallback
+
+
+def point_ai_dirs(base, old=None, failed=()):
+    """Make ESRGAN_DIR, MODELS_DIR and SEEDVR2_DIR the folders of that name in `base`; the ones named in `failed` stay in `old`."""
+    global ESRGAN_DIR, MODELS_DIR, SEEDVR2_DIR
+    ESRGAN_DIR, MODELS_DIR, SEEDVR2_DIR = [(old if n in failed else base) / n for n in AI_FOLDERS]
+
+
+def ai_base(o):
+    """The AI files folder chosen in the options (next to the program when empty)."""
+    t = o.ai_dir.strip().strip('"')
+    return Path(t).expanduser().absolute() if t else APP_DIR
+
+
+def ai_dir_used():
+    """Where the AI files were at the last run (remembered in the settings file); next to the program when unknown."""
+    try:
+        t = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")).get("ai_dir_used")
+        return Path(t) if t else APP_DIR
+    except Exception:  # noqa: BLE001
+        return APP_DIR
+
+
+def remember_ai_dir_used(path):
+    try:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            data = {}
+        data["ai_dir_used"] = str(path)
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def folder_bytes(path):
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def move_folder(src, dst):
+    """Move a folder to another place (maybe another disk): copied completely first, the old one deleted only after."""
+    try:
+        os.rename(src, dst)                 # the same disk: instant
+        return
+    except OSError:
+        pass
+    tmp = dst.with_name(dst.name + ".moving")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        shutil.copytree(src, tmp)
+        os.replace(tmp, dst)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    shutil.rmtree(src, ignore_errors=True)
+
+
+def prepare_ai_dir(o, L):
+    """At the start of a run: use the AI files folder from the options and, when it is not where the files were last time,
+    move realesrgan, models and seedvr2 there. A folder that cannot be moved stays in the old place for this run."""
+    new, old = ai_base(o), ai_dir_used()
+    same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    if same(new, old):
+        point_ai_dirs(new)
+        return
+    if writable_dir(new, None) is None:
+        L(f"The AI files folder {new} cannot be written to; the AI files stay in {old} for this run.")
+        point_ai_dirs(old)
+        return
+    failed = []
+    for n in AI_FOLDERS:
+        src, dst = old / n, new / n
+        if not src.is_dir():
+            continue
+        if dst.exists():
+            L(f"The AI files folder already has a folder {n}; both are left as they are and the one in {new} is used.")
+            continue
+        try:
+            L(f"Moving the AI files ({n}) to {new} ({folder_bytes(src) / 1e9:.1f} GB) ...")
+            move_folder(src, dst)
+            if n == "seedvr2":       # a Python environment cannot be moved: SeedVR2 builds it again (from the moved cache) when used
+                shutil.rmtree(dst / "venv", ignore_errors=True)
+                (dst / "ready.json").unlink(missing_ok=True)
+            L("  done")
+        except Exception as e:  # noqa: BLE001
+            L(f"  Could not move {n}: {e}\n  It stays in {old} for this run.")
+            failed.append(n)
+    point_ai_dirs(new, old, failed)
+    if not failed:
+        remember_ai_dir_used(new)
 
 
 def ensure_esrgan(work, log):
@@ -471,6 +563,12 @@ class Stopped(Exception):
     """The user pressed Stop in the middle of a long picture."""
 
 
+def uv_env():
+    """uv keeps its own Python 3.12 and its download cache inside seedvr2/, so nothing big lands in the user folder."""
+    base = SEEDVR2_DIR.absolute() / "uv"
+    return {"UV_PYTHON_INSTALL_DIR": str(base / "python"), "UV_CACHE_DIR": str(base / "cache")}
+
+
 def seedvr2_python():
     """The Python of SeedVR2's own environment (seedvr2/venv)."""
     return SEEDVR2_DIR / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -546,6 +644,7 @@ def run_streamed(c, argv, keep=None, cwd=None, every=0):
     # SeedVR2's tool asks PyTorch for the cudaMallocAsync memory allocator unless told otherwise; PyTorch's own
     # default allocator is the safe choice on AMD's PyTorch for Windows too
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:native")
+    env.update(uv_env())
     p = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace", cwd=cwd, env=env)
     q = queue.Queue()
@@ -1303,6 +1402,7 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
     L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
     L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
     L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
+    prepare_ai_dir(o, L)
 
     c = Context(o, L, work)
     c.should_stop = should_stop
@@ -1613,6 +1713,7 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     work = prepare(log, output_dir(o))
     if work is None:
         return []
+    prepare_ai_dir(o, log)
     c = Context(o, log, work)
     c.should_stop = should_stop
     numbered = list(enumerate(files, 1))
@@ -1812,6 +1913,12 @@ HELP = {
     "save_to": "Where the results are saved: the PDF, or the folder of bigger pictures, and the "
                "_blurnomore_work folder. 'Next to the images' = the folder of the first folder or picture in "
                "the list. A folder that does not exist yet is made. Your original pictures are never touched.",
+    "ai_dir": "Where the big AI files are kept: the downloaded models, Real-ESRGAN, and SeedVR2 with its Python and "
+              "PyTorch. Next to the program is the default; choose a folder on another disk to keep the program's disk "
+              "free. It needs up to about 8 GB (Real-ESRGAN and the photo models about 0.5 GB, SeedVR2 about 7 GB when "
+              "you use it). When you change it, what is already there is moved to the new folder at the next run (a "
+              "folder that already exists there is left alone). SeedVR2 then sets its Python up again once, without "
+              "downloading everything again. Your pictures are never touched.",
     "redo": "Ignore pages and results made in earlier runs. Changing a setting already makes new ones on its "
             "own; use this for a clean rebuild.",
     "open": "Opens the PDF, or the folder of bigger pictures, when the run is finished.",
@@ -1839,7 +1946,12 @@ def load_settings():
 
 def save_settings(o):
     try:
-        SETTINGS_FILE.write_text(json.dumps(asdict(o), indent=2), encoding="utf-8")
+        data = asdict(o)
+        try:    # the place of the AI files is remembered by the runs, not by the window
+            data["ai_dir_used"] = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))["ai_dir_used"]
+        except Exception:  # noqa: BLE001
+            pass
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
 
@@ -1902,6 +2014,7 @@ def build_window():
     v_type = tk.StringVar(value=o.file_type.upper())
     v_save = tk.StringVar(value=word(SAVE, bool(o.save_to.strip()), "Next to the images"))
     v_save_to = tk.StringVar(value=o.save_to)
+    v_ai_dir = tk.StringVar(value=o.ai_dir)
     v_fit = tk.StringVar(value=word(FIT, o.fit, "Whole picture"))
     v_margin = tk.StringVar(value=str(o.margin_mm))
     v_dpi = tk.StringVar(value=str(o.dpi))
@@ -2195,6 +2308,24 @@ def build_window():
     fold.grid(row=len(left.grid_slaves()), column=0, sticky="w", pady=(0, 4))
     g5 = group(None)
     row(g5, "Print resolution (dpi)", spin(v_dpi, 150, 600, 50), "dpi", "pdf")
+    def browse_ai_dir():
+        d = filedialog.askdirectory(initialdir=v_ai_dir.get() or None, title="Folder for the AI files")
+        if d:
+            v_ai_dir.set(d)
+
+    def ai_dir_row(p):
+        f = ttk.Frame(p)
+        ttk.Entry(f, textvariable=v_ai_dir, width=24).pack(side="left")
+        ttk.Button(f, text="Choose...", command=browse_ai_dir).pack(side="left", padx=4)
+        return f
+
+    def ai_dir_reset(p):
+        f = ttk.Frame(p)
+        ttk.Button(f, text="Next to the program", command=lambda: v_ai_dir.set("")).pack(side="left")
+        ttk.Label(f, text="moves at the next run").pack(side="left", padx=6)
+        return f
+    row(g5, "AI files folder", ai_dir_row, "ai_dir")
+    row(g5, "", ai_dir_reset, "ai_dir")
     row(g5, "Redo all pages", check(v_redo, "on"), "redo")
     row(g5, "Open the result when finished", check(v_open, "on"), "open")
 
@@ -2319,6 +2450,7 @@ def build_window():
         ob.name_text = v_name_text.get().strip()
         ob.file_type = v_type.get().lower()
         ob.save_to = v_save_to.get().strip().strip('"') if SAVE[v_save.get()] else ""
+        ob.ai_dir = v_ai_dir.get().strip().strip('"')
         ob.fit = FIT[v_fit.get()]
         ob.margin_mm = max(0.0, num(v_margin, "Page margin", float))
         ob.dpi = max(72, num(v_dpi, "Print resolution"))
@@ -2515,6 +2647,7 @@ def launch_gui():
 
 # ====================================================================== CLI
 def main():
+    point_ai_dirs(ai_dir_used())      # where the AI files are now (for the list of extra models)
     if len(sys.argv) == 1:
         launch_gui()
         return
@@ -2525,6 +2658,9 @@ def main():
                     help="pdf = Tracing PDF (default), upscale = Bigger images, compare = Compare models (see --compare)")
     ap.add_argument("--save-to", default="", metavar="FOLDER",
                     help="where the PDF / upscaled folder and _blurnomore_work go (default: the folder of the first input)")
+    ap.add_argument("--ai-dir", default="", metavar="FOLDER",
+                    help="where the big AI files (realesrgan, models, seedvr2 with Python and PyTorch) are kept, maybe on "
+                         "another disk (default: next to the program). When it changes, the files are moved there at the next run")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
     size = ap.add_mutually_exclusive_group()
     size.add_argument("--width", type=int, metavar="N", help="upscale mode: make every picture N pixels wide (instead of --scale)")
@@ -2609,7 +2745,7 @@ def main():
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
                 face_model=a.face_model, colorize=a.colorize, compare_models=compare, sv_seed=a.sv_seed,
                 sv_color=a.sv_color, sv_input_noise=a.sv_input_noise, sv_latent_noise=a.sv_latent_noise,
-                sv_low_memory=a.sv_low_memory)
+                sv_low_memory=a.sv_low_memory, ai_dir=a.ai_dir)
     if a.preview:
         items = make_preview(o, print)
         if not items:
