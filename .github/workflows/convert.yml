@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: [4xBHI_dat2_real, 4xRealWebPhoto_v4_drct-l, 4xRealWebPhoto_v3_atd]
+        model: [4xRealWebPhoto_v4_drct-l]   # 4xBHI_dat2_real is already in the release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

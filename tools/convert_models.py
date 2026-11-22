@@ -2,7 +2,7 @@
 BlurNoMore can run on any graphics card (DirectML). Run by the "Convert models" workflow on
 GitHub; the results are attached to the release "models-1" and downloaded from there.
 
-Each model is exported for 256x256 tiles (BlurNoMore always feeds full 256 px tiles), then
+Each model is exported for fixed square tiles (BlurNoMore feeds full tiles of the size the model has), then
 checked: the ONNX file must give the same picture as the original PyTorch model."""
 import gc
 import sys
@@ -16,12 +16,13 @@ import torch
 from spandrel import ModelLoader
 
 HF = "https://huggingface.co/Phips/"
-MODELS = {   # output name: source weights (all by Philip Hofmann, CC-BY-4.0)
-    "4xBHI_dat2_real": HF + "4xBHI_dat2_real/resolve/main/4xBHI_dat2_real.safetensors",
-    "4xRealWebPhoto_v4_drct-l": HF + "4xRealWebPhoto_v4_drct-l/resolve/main/4xRealWebPhoto_v4_drct-l.safetensors",
-    "4xRealWebPhoto_v3_atd": HF + "4xRealWebPhoto_v3_atd/resolve/main/4xRealWebPhoto_v3_atd.safetensors",
+MODELS = {   # output name: (source weights, tile size); all by Philip Hofmann, CC-BY-4.0
+    "4xBHI_dat2_real": (HF + "4xBHI_dat2_real/resolve/main/4xBHI_dat2_real.safetensors", 256),
+    # DRCT-L at 256 px ran a 16 GB machine out of memory, so it gets 128 px tiles
+    "4xRealWebPhoto_v4_drct-l": (HF + "4xRealWebPhoto_v4_drct-l/resolve/main/4xRealWebPhoto_v4_drct-l.safetensors", 128),
+    # ATD (4xRealWebPhoto_v3_atd) exports but gives a different picture (its token dictionary does not survive the
+    # export: largest difference 0.45), so it is not offered.
 }
-TILE = 256
 
 # ATD sorts with stable=True, which the ONNX exporter cannot write; plain sort gives the same order
 # when there are no ties (the check below compares the result with the original model anyway).
@@ -32,7 +33,7 @@ out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "converted")
 out_dir.mkdir(exist_ok=True)
 only = set(sys.argv[2:])
 failed = []
-for name, url in MODELS.items():
+for name, (url, TILE) in MODELS.items():
     if only and name not in only:
         continue
     print(f"== {name}", flush=True)
@@ -44,7 +45,7 @@ for name, url in MODELS.items():
         print(f"   architecture {desc.architecture.name}, scale {desc.scale}", flush=True)
         net = desc.model.eval().float()
         x = torch.rand(1, 3, TILE, TILE)
-        dst = out_dir / (name + "_fp32_256.onnx")
+        dst = out_dir / f"{name}_fp32_{TILE}.onnx"
         with torch.no_grad():
             ref = net(x).numpy()
             print("   PyTorch ran one tile; exporting", flush=True)
