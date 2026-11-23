@@ -67,7 +67,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.8.1"
+VERSION = "4.9"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -77,8 +77,21 @@ MODEL_GENERAL = "realesrgan-x4plus"
 MODEL_ANIME = "realesrgan-x4plus-anime"
 AI_MIN_SCALE = 1.25  # below this much enlargement, plain Lanczos is enough
 APP_DIR = Path(__file__).parent
-SETTINGS_FILE = APP_DIR / "blurnomore_settings.json"
-LAST_RUN_FILE = APP_DIR / "blurnomore_last_run.json"   # the images of the last run
+SETTINGS_DIR = APP_DIR / "settings"     # what the program remembers, in one folder that is easy to back up or move
+SETTINGS_FILE = SETTINGS_DIR / "blurnomore_settings.json"
+LAST_RUN_FILE = SETTINGS_DIR / "blurnomore_last_run.json"   # the images of the last run
+# The settings file in the order of the window's sections (the file is nested by section).
+SETTINGS_SECTIONS = (
+    ("1. Images", ("inputs", "repeat_last")),
+    ("2. What to make", ("mode", "compare_models")),
+    ("3. What kind of images", ("kind", "up_model", "use_ai", "color_model")),
+    ("Inventing upscaler (SeedVR2 3B)", ("sv_seed", "sv_color", "sv_input_noise", "sv_latent_noise", "sv_low_memory")),
+    ("4. Options", ("scale", "size_mode", "size_px", "shrink_bigger", "faces", "face_model", "face_strength", "colorize",
+                    "autocrop", "thicken", "fade", "keep_color", "color_boost")),
+    ("5. What comes out", ("name_mode", "name_text", "file_type", "jpg_quality", "max_mb", "fit", "margin_mm", "save_to")),
+    ("More settings", ("dpi", "ai_dir", "redo", "open_when_done")),
+    ("Remembered by the program", ("ai_dir_used",)),
+)
 AI_FOLDERS = ("realesrgan", "models", "seedvr2")   # the big folders; they live in the AI files folder (next to the program, or the one chosen)
 ESRGAN_DIR = APP_DIR / "realesrgan"   # downloaded once; point_ai_dirs sets these three
 MODELS_DIR = APP_DIR / "models"       # extra models: NAME.param + NAME.bin pairs
@@ -324,25 +337,65 @@ def ai_base(o):
     return Path(t).expanduser().absolute() if t else APP_DIR
 
 
+def move_old_settings():
+    """Before 4.9 the two files lay next to the program; move them into the settings folder (once)."""
+    for name in (SETTINGS_FILE.name, LAST_RUN_FILE.name):
+        old, new = APP_DIR / name, SETTINGS_DIR / name
+        if old.is_file() and not new.exists():
+            try:
+                SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+                os.replace(old, new)
+            except OSError:
+                pass
+
+
+def read_settings_file():
+    """The settings file as one flat dict (its sections merged); also reads the flat file of older versions. {} when
+    there is none or it cannot be read."""
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    flat = {}
+    for k, v in data.items():
+        if isinstance(v, dict) and k not in {f.name for f in fields(Options)}:
+            flat.update(v)          # a section
+        else:
+            flat[k] = v
+    return flat
+
+
+def write_settings_file(flat):
+    """Write the settings, grouped and ordered like the window's sections; a key the sections do not name goes under
+    'Remembered by the program'. Written to a temporary file first, so a crash never leaves half a file."""
+    data, left = {}, dict(flat)
+    for title, names in SETTINGS_SECTIONS:
+        part = {n: left.pop(n) for n in names if n in left}
+        if title == SETTINGS_SECTIONS[-1][0]:
+            part.update(left)
+        if part:
+            data[title] = part
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".part")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def ai_dir_used():
     """Where the AI files were at the last run (remembered in the settings file); next to the program when unknown."""
-    try:
-        t = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")).get("ai_dir_used")
-        return Path(t) if t else APP_DIR
-    except Exception:  # noqa: BLE001
-        return APP_DIR
+    t = read_settings_file().get("ai_dir_used")
+    return Path(t) if t else APP_DIR
 
 
 def remember_ai_dir_used(path):
-    try:
-        try:
-            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            data = {}
-        data["ai_dir_used"] = str(path)
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
+    data = read_settings_file()
+    data["ai_dir_used"] = str(path)
+    write_settings_file(data)
 
 
 def folder_bytes(path):
@@ -1230,7 +1283,7 @@ def spread(items, n):
 
 
 def read_last_run():
-    """The image paths the last run used (blurnomore_last_run.json next to the program), or []."""
+    """The image paths the last run used (settings/blurnomore_last_run.json next to the program), or []."""
     try:
         return [str(p) for p in json.loads(LAST_RUN_FILE.read_text(encoding="utf-8"))]
     except Exception:  # noqa: BLE001
@@ -1779,6 +1832,7 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
         L(m)
     numbered = list(enumerate(files, 1))
     try:
+        LAST_RUN_FILE.parent.mkdir(parents=True, exist_ok=True)
         LAST_RUN_FILE.write_text(json.dumps([str(Path(p).resolve()) for p in files], indent=1), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
@@ -2326,7 +2380,7 @@ HELP_DEFAULT = "Point at a setting to see what it does."
 def load_settings():
     o = Options()
     try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        data = read_settings_file()
         if "inputs" not in data and data.get("folder"):
             data["inputs"] = [data["folder"]]     # settings of an older version: one folder
         for f in fields(Options):
@@ -2338,15 +2392,11 @@ def load_settings():
 
 
 def save_settings(o):
-    try:
-        data = asdict(o)
-        try:    # the place of the AI files is remembered by the runs, not by the window
-            data["ai_dir_used"] = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))["ai_dir_used"]
-        except Exception:  # noqa: BLE001
-            pass
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
+    data = asdict(o)
+    used = read_settings_file().get("ai_dir_used")     # the place of the AI files is remembered by the runs
+    if used:
+        data["ai_dir_used"] = used
+    write_settings_file(data)
 
 
 def build_window():
@@ -3089,7 +3139,25 @@ def build_window():
         except queue.Empty:
             pass
         show_status()
+        state["ticks"] = state.get("ticks", 0) + 1
+        if state["ticks"] % 8 == 0:        # about once a second: remember what changed in the window
+            autosave()
         root.after(120, poll)
+
+    def autosave():
+        try:
+            o = gather()
+        except ValueError:                 # half-typed number: wait until it is a number again
+            return
+        now = asdict(o)
+        if now != state.get("saved"):
+            state["saved"] = now
+            save_settings(o)
+
+    def close():
+        autosave()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", close)
 
     b_prev.configure(command=lambda: begin(True))
     b_run.configure(command=lambda: begin(False))
@@ -3115,6 +3183,7 @@ def launch_gui():
 # ====================================================================== CLI
 def main():
     crash_trace(None)
+    move_old_settings()
     point_where_found(ai_base(load_settings()), ai_dir_used())      # where the AI files are now (for the list of extra models)
     if len(sys.argv) == 1:
         launch_gui()
@@ -3176,7 +3245,7 @@ def main():
                     help="upscale mode: 0-100, how much of the restored face is used (default 50)")
     ap.add_argument("--preview", action="store_true",
                     help="make picture sheets for up to 4 images (original, result, close-ups) and stop")
-    ap.add_argument("--same", action="store_true", help="use the images of the last run (blurnomore_last_run.json) instead of the inputs")
+    ap.add_argument("--same", action="store_true", help="use the images of the last run (settings/blurnomore_last_run.json) instead of the inputs")
     ap.add_argument("--margin", type=float, default=10.0)
     ap.add_argument("--fill", action="store_true", help="fill the page (trims edges) instead of fitting the whole picture")
     ap.add_argument("--dpi", type=int, default=300)

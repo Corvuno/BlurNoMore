@@ -13,7 +13,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
-LAST_RUN = ROOT / "blurnomore_last_run.json"      # every run writes it
+LAST_RUN = ROOT / "settings" / "blurnomore_last_run.json"      # every run writes it
 
 
 def make_images(d):
@@ -53,8 +53,58 @@ def main():
     finally:
         if saved is None:
             LAST_RUN.unlink(missing_ok=True)
+            try:
+                LAST_RUN.parent.rmdir()          # only when empty
+            except OSError:
+                pass
         else:
             LAST_RUN.write_bytes(saved)
+    check_settings_file()
+
+
+def check_settings_file():
+    """The settings live in settings/ next to the program, ordered by the window's sections; the old flat files next to
+    the program are moved there and still read."""
+    sys.path.insert(0, str(ROOT))
+    import dataclasses
+    import blurnomore as bn
+    names = [n for _, ns in bn.SETTINGS_SECTIONS for n in ns]
+    assert len(names) == len(set(names)), "a setting is in two sections"
+    missing = {f.name for f in dataclasses.fields(bn.Options)} - set(names)
+    assert not missing, f"settings without a section: {missing}"
+    saved = bn.APP_DIR, bn.SETTINGS_DIR, bn.SETTINGS_FILE, bn.LAST_RUN_FILE
+    with tempfile.TemporaryDirectory() as t:
+        app = Path(t)
+        bn.APP_DIR, bn.SETTINGS_DIR = app, app / "settings"
+        bn.SETTINGS_FILE, bn.LAST_RUN_FILE = bn.SETTINGS_DIR / "blurnomore_settings.json", bn.SETTINGS_DIR / "blurnomore_last_run.json"
+        try:
+            (app / "blurnomore_settings.json").write_text(json.dumps({"scale": 3, "mode": "upscale", "ai_dir_used": "D:/ai",
+                                                                      "something_old": 1}), encoding="utf-8")
+            (app / "blurnomore_last_run.json").write_text('["x.png"]', encoding="utf-8")
+            bn.move_old_settings()
+            assert not (app / "blurnomore_settings.json").exists() and not (app / "blurnomore_last_run.json").exists()
+            assert bn.read_last_run() == ["x.png"]
+            o = bn.load_settings()
+            assert o.scale == 3 and o.mode == "upscale", "the old flat file was not read"
+            o.save_to = "E:/out"
+            bn.save_settings(o)
+            data = json.loads(bn.SETTINGS_FILE.read_text(encoding="utf-8"))
+            assert list(data) == [title for title, _ in bn.SETTINGS_SECTIONS], list(data)
+            for title, ns in bn.SETTINGS_SECTIONS[:-1]:
+                assert list(data[title]) == list(ns), (title, list(data[title]))
+            assert data["Remembered by the program"] == {"ai_dir_used": "D:/ai"}, "old keys of earlier versions stay behind"
+            o2 = bn.load_settings()
+            assert dataclasses.asdict(o2) == dataclasses.asdict(o), "settings changed on the way through the file"
+            assert bn.ai_dir_used() == Path("D:/ai")
+            bn.remember_ai_dir_used(app / "ai")
+            assert bn.load_settings().save_to == "E:/out" and bn.ai_dir_used() == app / "ai"
+            assert sorted(p.name for p in bn.SETTINGS_DIR.iterdir()) == ["blurnomore_last_run.json", "blurnomore_settings.json"]
+            (app / "blurnomore_settings.json").write_text("{}", encoding="utf-8")
+            bn.move_old_settings()
+            assert (app / "blurnomore_settings.json").exists(), "an old file overwrote the newer one in settings/"
+        finally:
+            bn.APP_DIR, bn.SETTINGS_DIR, bn.SETTINGS_FILE, bn.LAST_RUN_FILE = saved
+    print("settings folder ok")
 
 
 def check():

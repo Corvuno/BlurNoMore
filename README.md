@@ -65,7 +65,7 @@ You collect drawings from the web and phone backups to learn to draw by tracing 
 | Setting | Default | What it does |
 |---|---|---|
 | Images list (`INPUT...` on the command line) | empty | Folders (every picture directly in them, not the folders inside, sorted by name) and/or single picture files, added with "Add folder...", "Add files..." or by dragging onto the list. Duplicates are left out. They are never changed. The list is remembered |
-| Last run's images (`--same`) | | Fills the list with the pictures of the last run (kept in `blurnomore_last_run.json`), so you can compare settings on the same pictures. On the command line it replaces the inputs |
+| Last run's images (`--same`) | | Fills the list with the pictures of the last run (kept in `settings\blurnomore_last_run.json`), so you can compare settings on the same pictures. On the command line it replaces the inputs |
 
 **What to make**
 
@@ -141,8 +141,11 @@ The same settings exist as command-line options. Run `python blurnomore.py --hel
 - In the folder you choose under "Save to" (by default the folder of the first image you added) it creates `BlurNoMore_A4_<date>_<time>_<n>p.pdf`, or for Bigger images a new folder `BlurNoMore_upscaled_<date>_<time>`, and a `_blurnomore_work` folder with caches, previews and a log of every run. An older `_tracing_work` folder is renamed automatically.
 - `realesrgan` (in the AI files folder, by default next to the program) holds the downloaded Real-ESRGAN, so it is downloaded once (an older copy inside a `_blurnomore_work` folder is still found and used).
 - `models` (in the AI files folder): the downloaded photo models, face models and (in `models/seedvr2`) the inventing model's files go here (first use only: the log says the size first). You can also put extra models there as `NAME.param` plus `NAME.bin` (ncnn format, as Real-ESRGAN ncnn uses) or as `NAME.onnx` (RGB 0..1 in and out). They show up as upscale models. A name with `2x`/`x2` or `3x`/`x3` is a 2x or 3x model; otherwise 4x (an `.onnx` model's size is checked with one small test picture, and the measured size is used if the name was wrong).
-- `blurnomore_settings.json` next to the program remembers your last settings, including the list of images.
-- `blurnomore_last_run.json` next to the program holds the images of your last run (for "Last run's images").
+- The `settings` folder next to the program holds what it remembers, so you can back it up or move it in one go:
+  - `blurnomore_settings.json` keeps your settings, including the list of images, grouped in the order of the window's sections. It is saved about a second after you change something, and when you close the window.
+  - `blurnomore_last_run.json` holds the images of your last run (for "Last run's images").
+
+  Versions before 4.9 kept these two files next to the program; they are moved into `settings` the first time 4.9 starts.
 
 ## Requirements
 
@@ -174,6 +177,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 - 4.8: you can see that a run is alive: every log line starts with the time, each picture line shows its size and opens the original when clicked (so do the saved results and the output folder), a status line above the log, progress lines (what and how long so far) from slow models, Real-ESRGAN, SeedVR2 and downloads, a model with no progress for 10 minutes is given up with a `FAILED:` line, and Stop now also works in the middle of a picture or a download. The tracing PDF and the pictures are unchanged.
 - 4.8.1: fixes the program closing about 14 seconds into a run on the graphics card: 4.8 ran each piece of a picture on a new thread, and DirectML wants its model made and run on one thread; now all model work runs on one thread. If the program ever dies hard again, the black window stays open with the error code, and Python's crash trace is written at the end of that run's log.
+- 4.9: the remembered settings and the last run's list live in a `settings` folder next to the program (moved there automatically), the settings file is grouped in the order of the window's sections, and settings are saved as soon as you change them instead of only when you press Run.
 - 4.7.1: scrolling the mouse wheel over an open dropdown list no longer fills the black window with errors.
 - 4.7: new settings JPG quality (`--jpg-quality`) and Limit file size (`--max-mb`) for Bigger images and the Compare letters: a picture that would be bigger than the limit gets a lower JPG quality (not below 50), then is made smaller; a PNG that is too big becomes a JPG. Off by default: the files are the same as in 4.6. The tracing PDF is unchanged.
 - 4.6: new setting AI files folder (window: More settings; `--ai-dir`): keeps `realesrgan`, `models` and `seedvr2` (Python, PyTorch, uv's Python and cache) on another disk if you want. When you change it, the files are moved there at the next run, and SeedVR2 sets its Python up again once (a set-up made by 4.5 kept its download cache in the user folder, so the first rebuild after moving downloads PyTorch, about 3 GB, again; from 4.6 on the cache moves along). A new folder that is inside the folders being moved or among your pictures is refused. The tracing PDF is unchanged.

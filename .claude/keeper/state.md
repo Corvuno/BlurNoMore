@@ -43,6 +43,10 @@ The overview every conversation starts from. One screen; what is no longer true 
   (likely, not reproduced here): 4.8 ran each tile's session.run on a new thread, session made on another. Now
   all onnxruntime work (make + run) is on one dedicated thread; faulthandler writes a hard crash into the run
   log; the .bat now pauses on a negative (crash) exit code too.
+- 4.9 (landed 2026-11-23): settings/ folder next to the program holds blurnomore_settings.json and
+  blurnomore_last_run.json (old files moved there at start); the settings file is nested by window section in
+  window order; the window saves settings about a second after a change and on close (owner: tidy, easy to
+  back up/move; exact place didn't matter).
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

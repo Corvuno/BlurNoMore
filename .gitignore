@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+settings/
 blurnomore_settings.json
 _blurnomore_work/
 _tracing_work/

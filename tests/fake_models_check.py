@@ -134,7 +134,11 @@ def main():
         check()
     finally:
         bn.APP_DIR, bn.SETTINGS_FILE, bn.ESRGAN_DIR, bn.MODELS_DIR, bn.SEEDVR2_DIR = saved
-        (ROOT / "blurnomore_last_run.json").unlink(missing_ok=True)
+        (ROOT / "settings" / "blurnomore_last_run.json").unlink(missing_ok=True)
+        try:
+            (ROOT / "settings").rmdir()      # only when empty
+        except OSError:
+            pass
 
 
 def ai_run(base, ai_dir, out):
@@ -173,7 +177,7 @@ def check_ai_dir(out):
         assert (new / "seedvr2" / "uv" / "cache" / "wheel").is_file(), "the uv cache did not move"
         assert not (new / "seedvr2" / "venv").exists() and not (new / "seedvr2" / "ready.json").exists(), "venv / ready.json kept"
         assert bn.MODELS_DIR == new / "models" and "mymodel_x4" in bn.extra_models(), "extra model not listed from the new place"
-        assert json.loads(bn.SETTINGS_FILE.read_text())["ai_dir_used"] == str(new)
+        assert bn.read_settings_file()["ai_dir_used"] == str(new)
         # a second run moves nothing
         text = ai_run(old, new, out)
         assert "Moving" not in text and "already has" not in text, text
