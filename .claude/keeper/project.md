@@ -33,7 +33,8 @@ the owner's use shows it is wrong.
 
 The owner runs BlurNoMore from `D:\PortableApps\BlurNoMore` on their Windows PC. Every landing on main
 also updates that folder while this project has folder access to it: copy the tracked files from main
-over it (the .bat with CRLF line endings), nothing else. First compare: a local file that differs from
+over it (the .bat with CRLF line endings), nothing else. Files under `.claude/` can't be written
+there by the remote folder tools; they are the Keeper's own files and the program doesn't need them. First compare: a local file that differs from
 main and matches no older commit is the owner's own edit; report it and never overwrite it silently.
 Never touch what the repo doesn't track: `settings/`, old `blurnomore_*.json`, `models/`, `realesrgan/`,
 `seedvr2/` and anything else there is the owner's data. (2026-11-23: the owner had been downloading the
