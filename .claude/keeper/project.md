@@ -29,6 +29,16 @@ the owner's use shows it is wrong.
   window gets no extra status lines, spinners or counters. (4.8 put a status line with a spinner above the log;
   the owner asked why it was there, and 4.9.1 took it out.)
 
+## The owner's own copy
+
+The owner runs BlurNoMore from `D:\PortableApps\BlurNoMore` on their Windows PC. Every landing on main
+also updates that folder while this project has folder access to it: copy the tracked files from main
+over it (the .bat with CRLF line endings), nothing else. First compare: a local file that differs from
+main and matches no older commit is the owner's own edit; report it and never overwrite it silently.
+Never touch what the repo doesn't track: `settings/`, old `blurnomore_*.json`, `models/`, `realesrgan/`,
+`seedvr2/` and anything else there is the owner's data. (2026-11-23: the owner had been downloading the
+files by hand after every landing.)
+
 ## What else to read, and when
 
 - `build-rules.md` before building anything.
