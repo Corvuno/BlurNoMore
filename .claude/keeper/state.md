@@ -47,6 +47,8 @@ The overview every conversation starts from. One screen; what is no longer true 
   blurnomore_last_run.json (old files moved there at start); the settings file is nested by window section in
   window order; the window saves settings about a second after a change and on close (owner: tidy, easy to
   back up/move; exact place didn't matter).
+- 4.9.1 (landed 2026-11-23): status line with spinner above the log removed; run info lives in the log
+  (see project.md, design readings).
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

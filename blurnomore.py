@@ -67,7 +67,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.9"
+VERSION = "4.9.1"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -2525,7 +2525,7 @@ def build_window():
 
     right = ttk.Frame(root)
     right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
-    right.rowconfigure(2, weight=1)
+    right.rowconfigure(1, weight=1)
     right.columnconfigure(0, weight=1)
 
     # ---- helpers to build rows
@@ -2847,18 +2847,15 @@ def build_window():
         b_prev.configure(state="disabled" if MAKE.get(v_make.get()) == "compare" else "normal")
     v_make.trace_add("write", sync_buttons)
     sync_buttons()
-    v_status = tk.StringVar(value="Ready")
-    status = ttk.Label(right, textvariable=v_status, font=small)
-    status.grid(row=1, column=0, sticky="w", pady=(0, 4))
     log_text = tk.Text(right, wrap="none", font=mono, height=20, undo=False)
     ysb = ttk.Scrollbar(right, orient="vertical", command=log_text.yview)
     xsb = ttk.Scrollbar(right, orient="horizontal", command=log_text.xview)
     log_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-    log_text.grid(row=2, column=0, sticky="nsew")
-    ysb.grid(row=2, column=1, sticky="ns")
-    xsb.grid(row=3, column=0, sticky="ew")
+    log_text.grid(row=1, column=0, sticky="nsew")
+    ysb.grid(row=1, column=1, sticky="ns")
+    xsb.grid(row=2, column=0, sticky="ew")
     foot = ttk.Frame(right)
-    foot.grid(row=4, column=0, sticky="w", pady=(6, 0))
+    foot.grid(row=3, column=0, sticky="w", pady=(6, 0))
     b_copy = ttk.Button(foot, text="Copy log")
     b_open = ttk.Button(foot, text="Open output folder")
     for b in (b_copy, b_open):
@@ -2874,8 +2871,7 @@ def build_window():
     log_text.bind("<Control-a>", lambda e: (log_text.tag_add("sel", "1.0", "end"), "break")[1])
 
     q = queue.Queue()
-    state = {"stop": False, "last_out": None, "busy": False, "started": 0.0, "last_log": 0.0, "step": "",
-             "preview_run": False}
+    state = {"stop": False, "last_out": None, "busy": False, "preview_run": False}
 
     link_no = [0]
 
@@ -2899,30 +2895,6 @@ def build_window():
             log_text.tag_bind(name, "<Enter>", lambda e: log_text.configure(cursor="hand2"))
             log_text.tag_bind(name, "<Leave>", lambda e: log_text.configure(cursor=""))
         log_text.see("end")
-
-    def note_step(msg):
-        """The short text of the last log line: what the run is doing now (the time in front is left out)."""
-        for ln in reversed(msg.splitlines()):
-            ln = re.sub(r"^\[\d\d:\d\d:\d\d\]\s*", "", ln.strip())
-            if ln:
-                state["step"] = ln if len(ln) <= 60 else ln[:57] + "..."
-                break
-        state["last_log"] = time.time()
-
-    def show_status():
-        """The line above the log while a run is busy: a turning bar, what it does now, and the time since it started.
-        It is called by the poll loop, so it keeps going when the worker says nothing."""
-        if not state["busy"]:
-            return
-        now = time.time()
-        spin = "|/-\\"[int(now * 4) % 4]
-        sec = int(now - state["started"])
-        clock = f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
-        quiet = now - state["last_log"]
-        step = state["step"] or "starting"
-        if quiet > 60:
-            step += f" (still working, last message {fmt_dur(quiet // 60 * 60)} ago)"
-        v_status.set(f"{spin} Working: {step} \u2014 {clock}")
 
     append("Add folders or pictures on the left, choose what to do with them, then press Run.\n"
            "The log here can be selected and copied (Ctrl+C), or press 'Copy log'.")
@@ -2990,8 +2962,7 @@ def build_window():
     def start_run(opts, preview=False):
         log_text.delete("1.0", "end")
         state["stop"] = False
-        state.update(busy=True, started=time.time(), last_log=time.time(), step="", preview_run=preview)
-        show_status()
+        state.update(busy=True, preview_run=preview)
         for b in (b_prev, b_run):
             b.configure(state="disabled")
         b_stop.configure(state="normal")
@@ -3121,13 +3092,10 @@ def build_window():
                 kind, payload = q.get_nowait()
                 if kind == "log":
                     append(payload)
-                    note_step(payload)
                 elif kind == "preview":
                     state["preview"] = show_preview(*payload)
                 else:
                     state["busy"] = False
-                    v_status.set("Stopped" if state["stop"] else "Done" if payload or state["preview_run"]
-                                 else "Finished (see the log)")
                     b_run.configure(state="normal")
                     sync_buttons()
                     b_stop.configure(state="disabled")
@@ -3138,7 +3106,6 @@ def build_window():
                             open_path(payload)
         except queue.Empty:
             pass
-        show_status()
         state["ticks"] = state.get("ticks", 0) + 1
         if state["ticks"] % 8 == 0:        # about once a second: remember what changed in the window
             autosave()
@@ -3171,7 +3138,7 @@ def build_window():
                            count_text=v_count, vars=SimpleNamespace(make=v_make, save=v_save, save_to=v_save_to,
                                                                     name=v_name, faces=v_faces, ai=v_ai, model=v_model,
                                                                     compare=v_cmp),
-                           group_diff=g_sv, b_prev=b_prev, status_text=v_status,
+                           group_diff=g_sv, b_prev=b_prev,
                            begin=begin, state=state, log_text=log_text, help_text=v_help, sync=sync,
                            toggle_more=toggle_more, dnd=dnd, left=left)
 

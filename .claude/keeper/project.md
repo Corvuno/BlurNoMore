@@ -19,6 +19,16 @@ of that file.
   download.
 - **Explaining** — `README.md`.
 
+## The Keeper's design readings
+
+How the Keeper reads the product's design. These are its own readings, not rules the owner set; change one when
+the owner's use shows it is wrong.
+
+- **Run information goes in the log; the window holds the setup controls.** The owner looks at the log while a
+  run works, not at the window. So progress, "still working" lines, FAILED lines and times go in the log. The
+  window gets no extra status lines, spinners or counters. (4.8 put a status line with a spinner above the log;
+  the owner asked why it was there, and 4.9.1 took it out.)
+
 ## What else to read, and when
 
 - `build-rules.md` before building anything.
