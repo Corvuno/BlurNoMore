@@ -20,9 +20,10 @@ if errorlevel 1 echo Note: the optional package tkinterdnd2 was not installed. D
 
 echo Opening BlurNoMore...
 %PY% "%~dp0blurnomore.py"
-if errorlevel 1 (
+rem A crash gives a negative exit code, which "if errorlevel 1" misses: compare with 0 instead.
+if not "%errorlevel%"=="0" (
   echo.
-  echo The program stopped with an error. Scroll up and copy the text above.
+  echo The program stopped with an error ^(code %errorlevel%^). Scroll up and copy the text above.
   pause
 )
 exit /b

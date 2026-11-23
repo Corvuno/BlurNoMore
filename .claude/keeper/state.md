@@ -39,6 +39,10 @@ The overview every conversation starts from. One screen; what is no longer true 
   for 10 min is skipped with a copyable "FAILED: <model>: <reason>" line, picture lines show the size and
   are clickable (also result names and the DONE folder), Stop works mid-picture and mid-download, status
   line above the log. Real-ESRGAN's guard assumes it prints progress; not checked on Windows.
+- 4.8.1 (landed 2026-11-23): owner's Compare run (DAT, DirectML) closed the whole program ~14 s in. Cause
+  (likely, not reproduced here): 4.8 ran each tile's session.run on a new thread, session made on another. Now
+  all onnxruntime work (make + run) is on one dedicated thread; faulthandler writes a hard crash into the run
+  log; the .bat now pauses on a negative (crash) exit code too.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

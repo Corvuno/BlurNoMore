@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -319,6 +320,37 @@ def check_progress(models, pics, out):
     print("progress ok")
 
 
+def check_ort_thread(models, pics, out):
+    """Every onnxruntime session is made and run on one and the same thread, never the caller's: DirectML crashed
+    the program when 4.8 ran each piece on a new thread."""
+    real = bn.ort.InferenceSession
+    where = []
+
+    class Watched(real):
+        def __init__(self, *a, **k):
+            where.append(("make", threading.current_thread()))
+            super().__init__(*a, **k)
+
+        def run(self, *a, **k):
+            where.append(("run", threading.current_thread()))
+            return super().run(*a, **k)
+    bn.ort.InferenceSession = Watched
+    try:
+        res, lines = make_run(models, out / "ort_thread", inputs=[str(pics / "tiles.png"), str(pics / "small.png")],
+                              mode="upscale", up_model="dat", scale=2, redo=True)
+        assert res, "\n".join(lines)[-800:]
+        res, lines = make_run(models, out / "ort_thread_cmp", inputs=[str(pics / "tiles.png")], mode="compare", scale=2,
+                              compare_models=["dat", "bhi"])
+        assert res, "\n".join(lines)[-800:]
+    finally:
+        bn.ort.InferenceSession = real
+    kinds = {k for k, _ in where}
+    threads = {t for _, t in where}
+    assert kinds == {"make", "run"} and len(threads) == 1, [(k, t.name) for k, t in where]
+    assert threading.current_thread() not in threads
+    print("one onnxruntime thread ok")
+
+
 def check_hang_and_links(models, pics, out):
     """A model that makes no progress for HANG_LIMIT is given up (tiny limit here): the run goes on, the log says FAILED
     once, and Compare shows that letter failed; the picture and result lines carry links."""
@@ -608,6 +640,7 @@ def check():
 
         check_ai_dir(out)
         check_progress(models, pics, out)
+        check_ort_thread(models, pics, out)
         check_hang_and_links(models, pics, out)
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"

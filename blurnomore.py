@@ -18,6 +18,7 @@ never touched. Work files and logs go in <save folder>\\_blurnomore_work.
 --preview shows up to 4 images (original next to result, plus close-ups) as picture sheets.
 """
 import argparse
+import faulthandler
 import hashlib
 import importlib.util
 import io
@@ -66,7 +67,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.8"
+VERSION = "4.8.1"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -582,7 +583,8 @@ class OnnxModel:
 
     def run(self, t):
         """One forward pass of a float32 NCHW array; the answer is float32 whatever the model uses."""
-        r = self.sess.run(None, {self.input: np.ascontiguousarray(t, np.float16 if self.half else np.float32)})[0]
+        x = np.ascontiguousarray(t, np.float16 if self.half else np.float32)
+        r = on_ort(lambda: self.sess.run(None, {self.input: x})[0])
         return r.astype(np.float32, copy=False)
 
 
@@ -624,13 +626,13 @@ def make_session(c, path):
     else:
         opts.enable_cpu_mem_arena = False     # the big models (DRCT-L) otherwise keep too much memory on the CPU
     try:
-        sess = ort.InferenceSession(str(path), opts, providers=prov)
+        sess = on_ort(lambda: ort.InferenceSession(str(path), opts, providers=prov))
     except Exception as e:  # noqa: BLE001
         if len(prov) < 2:
             raise
         c.L(f"  The GPU did not start ({e}); using the CPU.")
         c.prov = ["CPUExecutionProvider"]
-        sess = ort.InferenceSession(str(path), opts, providers=c.prov)
+        sess = on_ort(lambda: ort.InferenceSession(str(path), opts, providers=c.prov))
     on_gpu = sess.get_providers()[0] == "DmlExecutionProvider"
     c.once("provider", "ONNX Runtime uses " + ("the GPU (DirectML)" if on_gpu else "the CPU"))
     if on_gpu:
@@ -638,30 +640,52 @@ def make_session(c, path):
     return sess
 
 
-def run_guarded(model, t, c, where):
-    """model.run(t) in a worker thread, so that Stop and a model that hangs are noticed: Stopped when Stop is pressed,
-    Hung when it takes longer than HANG_LIMIT (the thread is left behind; the GPU may stay busy with it)."""
-    got = {}
+_ORT = {"thread": None, "jobs": None}
 
-    def work():
-        try:
-            got["r"] = model.run(t)
-        except BaseException as e:  # noqa: BLE001
-            got["e"] = e
-    th = threading.Thread(target=work, daemon=True)
-    started = time.time()
-    th.start()
+
+def _ort_worker(jobs):
     while True:
-        th.join(0.25)
-        if not th.is_alive():
-            break
-        if c.should_stop():
+        fn, box, done = jobs.get()
+        try:
+            box["r"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box["e"] = e
+        done.set()
+
+
+def on_ort(fn, c=None, where="", stop=False):
+    """Do fn() on the one thread that does all onnxruntime work (making sessions and running them). DirectML
+    sessions must be made and run on the same thread: 4.8 ran each piece on a new thread and the program
+    crashed on the graphics card. The caller waits, so Stop (when `stop`) and a model that hangs are noticed:
+    Stopped when Stop is pressed, Hung after HANG_LIMIT. A hung job's thread is left behind; the next job gets
+    a fresh thread, and the run's sessions (made on the old thread) are dropped so they are made again."""
+    th = _ORT["thread"]
+    if th is threading.current_thread():
+        return fn()
+    if th is None or not th.is_alive():
+        _ORT["jobs"] = queue.Queue()
+        th = _ORT["thread"] = threading.Thread(target=_ort_worker, args=(_ORT["jobs"],), daemon=True, name="onnxruntime")
+        th.start()
+    box, done = {}, threading.Event()
+    _ORT["jobs"].put((fn, box, done))
+    started = time.time()
+    while not done.wait(0.25):
+        if stop and c is not None and c.should_stop():
             raise Stopped()
         if time.time() - started >= HANG_LIMIT:
+            _ORT["thread"] = None
+            if c is not None:
+                for k in [k for k, v in c.models.items() if isinstance(v, (OnnxModel, ort.InferenceSession))]:
+                    del c.models[k]
             raise Hung(f"made no progress for {fmt_dur(HANG_LIMIT)}{where}")
-    if "e" in got:
-        raise got["e"]
-    return got["r"]
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
+
+
+def run_guarded(model, t, c, where):
+    """model.run(t) on the onnxruntime thread, honouring Stop and the hang limit."""
+    return on_ort(lambda: model.run(t), c, where, stop=True)
 
 
 def run_tiles(model, im, tile=256, over=16, c=None, label=""):
@@ -733,6 +757,20 @@ def load_onnx(c, name):
 
 
 # ================================================= inventing upscaler (SeedVR2 3B)
+def crash_trace(f):
+    """Where Python writes the trace when the program dies hard (no Python error, the window just goes): the
+    open file f, or the black window when f is None."""
+    try:
+        if f is not None:
+            faulthandler.enable(f, all_threads=True)
+        elif sys.stderr is not None:
+            faulthandler.enable(all_threads=True)
+        else:
+            faulthandler.disable()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 class Stopped(Exception):
     """The user pressed Stop in the middle of a long picture."""
 
@@ -1059,7 +1097,7 @@ def restore_faces(c, im):
             continue
         face = cv2.warpAffine(a, M, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         x = (face.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)[None]
-        y = sess.run(None, face_inputs(sess, x))[0][0].transpose(1, 2, 0)
+        y = on_ort(lambda: sess.run(None, face_inputs(sess, x)))[0][0].transpose(1, 2, 0)
         y = np.clip((y + 1.0) * 127.5, 0, 255).astype(np.float32)
         inv = cv2.invertAffineTransform(M)
         pts = cv2.transform(np.array([[[0, 0], [512, 0], [512, 512], [0, 512]]], np.float32), inv)[0]
@@ -1109,7 +1147,7 @@ def colorize(c, im):
     lab = np.concatenate((lab, np.zeros_like(lab), np.zeros_like(lab)), axis=-1)
     x = cv2.resize(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), (512, 512)).transpose(2, 0, 1)[None]
     half = "float16" in sess.get_inputs()[0].type
-    y = sess.run(None, {sess.get_inputs()[0].name: np.ascontiguousarray(x, np.float16 if half else np.float32)})[0]
+    y = on_ort(lambda: sess.run(None, {sess.get_inputs()[0].name: np.ascontiguousarray(x, np.float16 if half else np.float32)}))[0]
     ab = cv2.resize(y[0].astype(np.float32).transpose(1, 2, 0), (W, H))
     light = cv2.cvtColor((bgr / 255.0).astype(np.float32), cv2.COLOR_BGR2LAB)[:, :, :1]
     out = cv2.cvtColor(np.concatenate((light, ab), axis=-1), cv2.COLOR_LAB2BGR)
@@ -1428,6 +1466,7 @@ def run(o, log, should_stop=lambda: False):
     if work is None:
         return None
     logfile = open(work / "logs" / f"{stamp}.log", "w", encoding="utf-8")
+    crash_trace(logfile)      # a hard crash (in onnxruntime, say) leaves its trace at the end of this log
 
     def L(msg=""):
         msg = stamped(msg)
@@ -1446,6 +1485,7 @@ def run(o, log, should_stop=lambda: False):
         return None
     finally:
         L(f"Log saved: {work / 'logs' / (stamp + '.log')}")
+        crash_trace(None)
         logfile.close()
 
 
@@ -3074,6 +3114,7 @@ def launch_gui():
 
 # ====================================================================== CLI
 def main():
+    crash_trace(None)
     point_where_found(ai_base(load_settings()), ai_dir_used())      # where the AI files are now (for the list of extra models)
     if len(sys.argv) == 1:
         launch_gui()
