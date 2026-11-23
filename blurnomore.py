@@ -424,13 +424,40 @@ def prepare_ai_dir(o, L, files=()):
         remember_ai_dir_used(new)
 
 
+HANG_LIMIT = 600     # seconds a model may go without any sign of progress before it is given up
+
+
+class Msg(str):
+    """A log message that also says which parts of it open a file or folder when clicked in the window:
+    links = ((text, path), ...). It is an ordinary string everywhere else (log file, Copy log, command line)."""
+
+    def __new__(cls, text, links=()):
+        obj = str.__new__(cls, text)
+        obj.links = tuple(links)
+        return obj
+
+
+def open_file(path):
+    """Open a file or folder with the program the system has for it; an error text, or None when it went well."""
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(str(path))  # noqa: S606
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return None
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
 def stamped(msg):
     """A log message with the local time in front: [11:45:14] text. Blank messages stay blank, a message of
     several lines gets it on its first line only."""
     body = msg.lstrip("\n")
     if not body.strip():
         return msg
-    return msg[:len(msg) - len(body)] + f"[{datetime.now():%H:%M:%S}] " + body
+    text = msg[:len(msg) - len(body)] + f"[{datetime.now():%H:%M:%S}] " + body
+    return Msg(text, msg.links) if getattr(msg, "links", ()) else text
 
 
 def fmt_dur(seconds):
@@ -441,21 +468,28 @@ def fmt_dur(seconds):
     return f"{s // 60} min" + (f" {s % 60} s" if s % 60 else "")
 
 
-def download_file(url, dest, log, every=10):
-    """urllib's urlretrieve, saying 'downloaded X of Y MB' at most every `every` seconds (a quick download says nothing)."""
+def download_file(url, dest, log, every=10, should_stop=None):
+    """urllib's urlretrieve, saying 'downloaded X of Y MB' at most every `every` seconds (a quick download says nothing).
+    Pressing Stop ends it: dest is removed and Stopped is raised."""
     last = time.time()
 
     def hook(blocks, block_size, total):
         nonlocal last
+        if should_stop and should_stop():
+            raise Stopped()
         if time.time() - last < every:
             return
         last = time.time()
         got = blocks * block_size / 1e6
         log(f"    downloaded {got:.0f} of {total / 1e6:.0f} MB" if total > 0 else f"    downloaded {got:.0f} MB")
-    urllib.request.urlretrieve(url, dest, hook)
+    try:
+        urllib.request.urlretrieve(url, dest, hook)
+    except Stopped:
+        Path(dest).unlink(missing_ok=True)
+        raise
 
 
-def ensure_esrgan(work, log):
+def ensure_esrgan(work, log, should_stop=None):
     # Next to the program is the home of Real-ESRGAN; the old place (in the work folder) still counts.
     for base in (ESRGAN_DIR, work / "realesrgan"):
         exe = _find_exe(base)
@@ -466,12 +500,16 @@ def ensure_esrgan(work, log):
         log("Downloading Real-ESRGAN (about 45 MB) ...")
         d.mkdir(parents=True, exist_ok=True)
         z = d / "realesrgan.zip"
-        download_file(ESRGAN_URL, z, log)
+        part = z.with_name(z.name + ".part")
+        download_file(ESRGAN_URL, part, log, should_stop=should_stop)
+        os.replace(part, z)
         with zipfile.ZipFile(z) as zf:
             zf.extractall(d)
         return _find_exe(d)
+    except Stopped:
+        raise
     except Exception as e:  # noqa: BLE001
-        log(f"  Could not download Real-ESRGAN: {e}")
+        log(f"    FAILED: Real-ESRGAN: could not download: {e}")
         log(f"  Download it manually from {ESRGAN_URL}")
         log(f"  and unzip it into {d}. Continuing with plain resizing only.")
         return None
@@ -485,18 +523,27 @@ def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4, should_stop=
     cmd = [str(exe), "-i", str(tin), "-o", str(tout), "-n", model,
            "-s", str(native), "-m", str(model_dir or exe.parent / "models"), "-f", "png"]
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     except OSError as e:                      # the program is there but cannot start
         log(f"  Real-ESRGAN could not start: {e}")
+        log(f"    FAILED: Real-ESRGAN: could not start: {e}")
         return None
-    t0 = last = time.time()
-    while True:                               # wait for it, saying every 30 s that it is still working; Stop ends it
+    q = queue.Queue()
+    threading.Thread(target=lambda: ([q.put(ln) for ln in p.stdout], q.put(None)), daemon=True).start()
+    t0 = last = seen = time.time()            # seen: when it last printed something (its progress in per cent)
+    tail, done = "", False
+    while not done:                           # wait for it, saying every 30 s that it is still working; Stop ends it
         try:
-            stdout, stderr = p.communicate(timeout=0.5)
-            break
-        except subprocess.TimeoutExpired:
+            ln = q.get(timeout=0.3)
+            if ln is None:
+                done = True
+            else:
+                tail, seen = (tail + ln)[-600:], time.time()
+        except queue.Empty:
             pass
-        if should_stop and should_stop():
+        stopped = bool(should_stop and should_stop())
+        hung = not done and time.time() - seen >= HANG_LIMIT
+        if stopped or hung:
             p.terminate()
             try:
                 p.wait(10)
@@ -505,13 +552,18 @@ def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4, should_stop=
                 p.wait()
             if tout.exists():
                 tout.unlink()
-            raise Stopped()
-        if time.time() - last >= 30:
+            if stopped:
+                raise Stopped()
+            log(f"    FAILED: Real-ESRGAN made no progress for {fmt_dur(HANG_LIMIT)}; skipping it for the rest of this run")
+            return None
+        if not done and time.time() - last >= 30:
             last = time.time()
-            log(f"    Real-ESRGAN still working ({fmt_dur(last - t0)})")
+            log(f"    Real-ESRGAN still working, {fmt_dur(last - t0)} so far")
+    p.wait()
     if p.returncode != 0 or not tout.exists():
+        log(f"    FAILED: Real-ESRGAN: exit code {p.returncode}")
         log("  Real-ESRGAN failed. Output:")
-        log("  " + (stderr or stdout or "(no output)")[-600:].strip().replace("\n", "\n  "))
+        log("  " + (tail or "(no output)").strip().replace("\n", "\n  "))
         return None
     out = Image.open(tout).convert("RGB")
     out.load()
@@ -545,11 +597,14 @@ def fetch_model(c, name, url, size):
     try:
         c.L(f"Downloading {name} (about {size}) ...")
         part.parent.mkdir(parents=True, exist_ok=True)    # a name may have a sub folder
-        download_file(url, part, c.L)
+        download_file(url, part, c.L, should_stop=c.should_stop)
         os.replace(part, d / name)
         return d / name
     except Exception as e:  # noqa: BLE001
-        c.L(f"  Could not download {name}: {e}")
+        if isinstance(e, Stopped):
+            part.unlink(missing_ok=True)
+            raise
+        c.L(f"    FAILED: {name}: could not download: {e}")
         c.L(f"  Download it manually from {url}")
         c.L(f"  and put it in {d}.")
         try:
@@ -583,6 +638,32 @@ def make_session(c, path):
     return sess
 
 
+def run_guarded(model, t, c, where):
+    """model.run(t) in a worker thread, so that Stop and a model that hangs are noticed: Stopped when Stop is pressed,
+    Hung when it takes longer than HANG_LIMIT (the thread is left behind; the GPU may stay busy with it)."""
+    got = {}
+
+    def work():
+        try:
+            got["r"] = model.run(t)
+        except BaseException as e:  # noqa: BLE001
+            got["e"] = e
+    th = threading.Thread(target=work, daemon=True)
+    started = time.time()
+    th.start()
+    while True:
+        th.join(0.25)
+        if not th.is_alive():
+            break
+        if c.should_stop():
+            raise Stopped()
+        if time.time() - started >= HANG_LIMIT:
+            raise Hung(f"made no progress for {fmt_dur(HANG_LIMIT)}{where}")
+    if "e" in got:
+        raise got["e"]
+    return got["r"]
+
+
 def run_tiles(model, im, tile=256, over=16, c=None, label=""):
     """Enlarge a PIL image with an ONNX model in tiles (input RGB 0..1, NCHW). Each tile is full
     size (the picture is edge-padded), the overlap is cropped away and the centre kept. With the
@@ -604,17 +685,17 @@ def run_tiles(model, im, tile=256, over=16, c=None, label=""):
             if c is not None and c.should_stop():
                 raise Stopped()
             t = a[j * step:j * step + tile, i * step:i * step + tile].transpose(2, 0, 1)[None]
-            r = model.run(t)[0][:, keep, keep]
+            if c is None:
+                r = model.run(t)[0][:, keep, keep]
+            else:
+                r = run_guarded(model, t, c, f" (stuck at piece {done + 1} of {total})")[0][:, keep, keep]
             out[j * step * n:(j + 1) * step * n, i * step * n:(i + 1) * step * n] = (
                 np.clip(r.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
             done += 1
             now = time.time()
             if c is not None and done < total and now - last >= 10:
                 last = now
-                each = (now - t0) / done
-                left = each * (total - done)
-                c.L(f"    {label}: piece {done} of {total}, {each:.1f} s each, about "
-                    + (f"{left:.0f} s" if left < 60 else f"{-(-left // 60):.0f} min") + " left")
+                c.L(f"    {label}: piece {done} of {total}, {fmt_dur(now - t0)} so far")
     return Image.fromarray(out[:H * n, :W * n], "RGB")
 
 
@@ -645,7 +726,7 @@ def load_onnx(c, name):
             c.L(f"  Model '{name}': it should enlarge {model.native}x but it enlarges {got}x; using {got}x.")
             model.native = got
     except Exception as e:  # noqa: BLE001
-        c.L(f"  Could not start {what}: {e}")
+        c.L(f"    FAILED: {name}: could not start: {e}")
         return None
     c.models[name] = model
     return model
@@ -654,6 +735,10 @@ def load_onnx(c, name):
 # ================================================= inventing upscaler (SeedVR2 3B)
 class Stopped(Exception):
     """The user pressed Stop in the middle of a long picture."""
+
+
+class Hung(Exception):
+    """A model made no sign of progress for HANG_LIMIT seconds. The text says so (without the model's name)."""
 
 
 def uv_env():
@@ -729,10 +814,10 @@ def write_torch_constraints(path):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_streamed(c, argv, keep=None, cwd=None, every=0):
+def run_streamed(c, argv, keep=None, cwd=None, every=0, hang=False):
     """Run a program with its output going into the log, line by line (only lines that start with one of `keep`, when
     given; tqdm progress lines at most once every `every` seconds). Returns (exit code, its last lines). Pressing Stop
-    ends the program and raises Stopped."""
+    ends the program and raises Stopped; with hang=True, so does a program that prints nothing for HANG_LIMIT seconds (Hung)."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
     # SeedVR2's tool asks PyTorch for the cudaMallocAsync memory allocator unless told otherwise; PyTorch's own
     # default allocator is the safe choice on AMD's PyTorch for Windows too
@@ -742,12 +827,24 @@ def run_streamed(c, argv, keep=None, cwd=None, every=0):
                          encoding="utf-8", errors="replace", cwd=cwd, env=env)
     q = queue.Queue()
     threading.Thread(target=lambda: ([q.put(ln) for ln in p.stdout], q.put(None)), daemon=True).start()
-    tail, last_progress, done = [], 0.0, False
+    tail, last_progress, done, seen = [], 0.0, False, time.time()
+    began = said = seen
     while not done:
         try:
             ln = q.get(timeout=0.3)
+            seen = time.time()
         except queue.Empty:
             ln = ""
+        if hang and time.time() - seen >= HANG_LIMIT:
+            p.terminate()
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            raise Hung(f"made no progress for {fmt_dur(HANG_LIMIT)}")
+        if hang and time.time() - max(seen, said) >= 30:      # quiet for 30 s: say that it is still going
+            said = time.time()
+            c.L(f"    SeedVR2 still working, {fmt_dur(said - began)} so far")
         if c.should_stop():
             p.terminate()
             try:
@@ -776,7 +873,7 @@ def seedvr2_download_source(c):
     SEEDVR2_DIR.mkdir(parents=True, exist_ok=True)
     zpath, tmp = SEEDVR2_DIR / "src.zip", SEEDVR2_DIR / "unzipped"
     part = zpath.with_name("src.zip.part")
-    download_file(SEEDVR2_ZIP, part, c.L)
+    download_file(SEEDVR2_ZIP, part, c.L, should_stop=c.should_stop)
     os.replace(part, zpath)
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(zpath) as zf:
@@ -872,7 +969,7 @@ def run_seedvr2(c, im, target):
     dst.unlink(missing_ok=True)
     im.convert("RGB").save(src)
     cmd = seedvr2_options(o, c.sv_seed, models_dir, src, dst, side)
-    code, tail = run_streamed(c, cmd, None, cwd=SEEDVR2_DIR / "src", every=10)
+    code, tail = run_streamed(c, cmd, None, cwd=SEEDVR2_DIR / "src", every=10, hang=True)
     if not dst.is_file():
         raise RuntimeError(f"SeedVR2 made no picture (exit code {code}): " + " | ".join(tail[-3:]))
     with Image.open(dst) as r:
@@ -889,7 +986,7 @@ def load_detector(c):
             try:
                 c.models["detector"] = cv2.FaceDetectorYN.create(str(path), "", (320, 320), 0.7)
             except Exception as e:  # noqa: BLE001
-                c.L(f"  Could not start the face finder: {e}")
+                c.L(f"    FAILED: face finder: could not start: {e}")
     return c.models["detector"]
 
 
@@ -904,7 +1001,7 @@ def load_face(c, name):
             try:
                 c.models[key] = make_session(c, path)
             except Exception as e:  # noqa: BLE001
-                c.L(f"  Could not start the face restorer: {e}")
+                c.L(f"    FAILED: face restorer: could not start: {e}")
     return c.models[key]
 
 
@@ -993,7 +1090,7 @@ def load_colorizer(c):
             try:
                 c.models["colorizer"] = make_session(c, path)
             except Exception as e:  # noqa: BLE001
-                c.L(f"  Could not start the colouring model: {e}")
+                c.L(f"    FAILED: colouring model: could not start: {e}")
     return c.models["colorizer"]
 
 
@@ -1340,6 +1437,9 @@ def run(o, log, should_stop=lambda: False):
 
     try:
         return _run(o, L, should_stop, out, files, notes, stamp, work, started)
+    except Stopped:                  # Stop pressed while something was being downloaded
+        L("\nStopped by user.")
+        return None
     except Exception:  # noqa: BLE001
         L("UNEXPECTED ERROR:")
         L(traceback.format_exc())
@@ -1390,7 +1490,7 @@ class Context:
 
     def start_ai(self):
         if self.o.use_ai:
-            self.exe = ensure_esrgan(self.work, self.L)
+            self.exe = ensure_esrgan(self.work, self.L, self.should_stop)
         if self.o.use_ai and self.exe:
             self.L(f"Real-ESRGAN: {self.exe}")
 
@@ -1461,9 +1561,9 @@ def make_page(c, path, src_id, im):
             "cls": cls, "s": s, "method": method, "note": note}
 
 
-def page_line(tag, r, t0):
+def page_line(r, t0):
     warn = "  LOW SOURCE RESOLUTION (>6x enlargement, will look soft)" if r["s"] > 6 else ""
-    return (f"{tag}\n    {r['w']}x{r['h']}  {r['cls']}  x{r['s']:.2f}  {r['method']}  {r['note']}  "
+    return (f"    {r['w']}x{r['h']}  {r['cls']}  x{r['s']:.2f}  {r['method']}  {r['note']}  "
             f"({time.time() - t0:.1f}s){warn}")
 
 
@@ -1550,7 +1650,8 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
         try:
             coloured_im = colorize(c, im)
             coloured, im = coloured_im is not im, coloured_im
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            L(f"    FAILED: colouring: {type(e).__name__}: {e}")
             L("  Colouring failed; the picture is left black and white:\n  " + traceback.format_exc().replace("\n", "\n  "))
             c.models["colorizer"] = None
     if m:
@@ -1573,7 +1674,12 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
                 raise
             except Exception as e:  # noqa: BLE001
                 why = f"{type(e).__name__}: {e}"[:200]
-                L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
+                if isinstance(e, Hung):
+                    why = f"{m[1]} {e}"
+                    L(f"    FAILED: {why}; skipping it for the rest of this run")
+                else:
+                    L(f"    FAILED: {m[1]}: {why}")
+                    L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
                 L(f"  Using plain resizing instead of '{m[1]}' for the rest of this run.")
                 c.models[m[1]] = None
         if up is None and force:
@@ -1601,7 +1707,13 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
     return {"result": res, "cls": cls, "kind": kind, "w": w, "h": h, "method": method, "model": label, "target": target, "f": f, "kept": kept}
 
 
-def upscaled_line(tag, r, name, t0, limit_note=""):
+def picture_line(tag, path, im):
+    """The line that says which picture is being worked on, with its size; clicking it in the window opens the original."""
+    text = f"{tag} ({im.size[0]}x{im.size[1]})"
+    return Msg(text, [(text, path)])
+
+
+def upscaled_line(r, name, t0, limit_note="", folder=None):
     big = r["target"][0] * r["target"][1]
     warn = f"  VERY LARGE RESULT ({big / 1e6:.0f} megapixels): big file, slow" if big > BIG_RESULT_PIXELS else ""
     if r["kept"]:
@@ -1610,8 +1722,9 @@ def upscaled_line(tag, r, name, t0, limit_note=""):
         warn += "  " + limit_note
     if r["f"] > 6:
         warn += "  LOW SOURCE RESOLUTION (>6x enlargement, will look soft)"
-    return (f"{tag}\n    {r['w']}x{r['h']}  {r['kind']}  {r['method']}  x{round(r['f'], 2):g}  -> {name}  "
+    text = (f"    {r['w']}x{r['h']}  {r['kind']}  {r['method']}  x{round(r['f'], 2):g}  -> {name}  "
             f"({time.time() - t0:.1f}s){warn}")
+    return Msg(text, [(name, folder / name)]) if folder else text
 
 
 def _run(o, L, should_stop, out, files, notes, stamp, work, started):
@@ -1644,10 +1757,12 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
             L("\nStopped by user.")
             break
         t0 = time.time()
-        tag = f"[{n}/{len(numbered)}] #{idx} {path.name[:50]}"
+        tag, shown = f"[{n}/{len(numbered)}] #{idx} {path.name[:50]}", False
         try:
             src_id = source_id(path)
             im = load_rgb(path)
+            L(picture_line(tag, path, im))
+            shown = True
             if upscale:
                 r = make_upscaled(c, path, src_id, im)
                 up_dir.mkdir(parents=True, exist_ok=True)
@@ -1655,18 +1770,18 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
                 saved, limit_note = save_result(r["result"], up_dir / Path(name).stem, o, L)
                 name = saved.name
                 pdf_inputs.append(name)
-                L(upscaled_line(tag, r, name, t0, limit_note))
+                L(upscaled_line(r, name, t0, limit_note, up_dir))
                 report.append([idx, path.name, f"{r['w']}x{r['h']}", r["kind"], f"{round(r['f'], 2):g}", r["method"], name])
             else:
                 r = make_page(c, path, src_id, im)
                 pdf_inputs.append(str(r["page_path"]))
-                L(page_line(tag, r, t0))
+                L(page_line(r, t0))
                 report.append([idx, path.name, f"{r['w0']}x{r['h0']}", r["cls"], round(r["s"], 2), r["method"], r["note"]])
         except Stopped:
-            L(f"{tag}\n    stopped in the middle of this picture.\n\nStopped by user.")
+            L(("" if shown else tag + "\n") + "    stopped in the middle of this picture.\n\nStopped by user.")
             break
         except Exception:  # noqa: BLE001
-            L(f"{tag}\n    ERROR:")
+            L("    ERROR:" if shown else f"{tag}\n    ERROR:")
             L("    " + traceback.format_exc().replace("\n", "\n    "))
             report.append([idx, path.name, "", "ERROR", "", "", ""])
 
@@ -1697,9 +1812,9 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
         pass
 
     if upscale:
-        L(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} images)")
+        L(Msg(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} images)", [(str(result), result)]))
     else:
-        L(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} pages)")
+        L(Msg(f"\nDONE in {time.time() - started:.0f}s: {result}  ({len(pdf_inputs)} pages)", [(str(result), result)]))
         L("Print at 100% / 'Actual size', not 'Fit to page'.")
     return result
 
@@ -1763,7 +1878,7 @@ def closeup_sheet(original_crop, crops):
 
 def why_said(heard, default):
     """The line of what was just said that tells why a model could not be used (the first that says could not / failed), else the last."""
-    lines = [x.strip() for x in heard if x.strip()]
+    lines = [x.strip() for x in heard if x.strip() and not re.search(r"piece \d+ of|still working|downloaded", x)]
     return next((x for x in lines if re.search(r"could not|failed|install", x, re.I)), lines[-1] if lines else default)[:200]
 
 
@@ -1836,13 +1951,14 @@ def run_compare(c, files, stamp, out, should_stop, started):
             L("\nStopped by user.")
             break
         t0 = time.time()
-        L(f"[{n}/{len(pictures)}] {path.name[:50]}")
+        tag = f"[{n}/{len(pictures)}] {path.name[:50]}"
         results, stopped = {}, False
         try:
             src_id, im = source_id(path), load_rgb(path)
         except Exception:  # noqa: BLE001
-            L("    ERROR:\n    " + traceback.format_exc().replace("\n", "\n    "))
+            L(Msg(f"{tag}\n    ERROR:\n    " + traceback.format_exc().replace("\n", "\n    "), [(tag, path)]))
             continue
+        L(picture_line(tag, path, im))
         if target_size(o, *im.size)[0] / im.size[0] <= AI_MIN_SCALE:
             L("    This picture hardly grows, so every model gives plain resizing for it.")
         for m in contestants:                        # always in this order, so the log tells nothing about the letters
@@ -1899,7 +2015,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
     (folder / "key.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     key_picture(lines).save(folder / "key.png")
     L("Open key.png only after you have chosen.")
-    L(f"\nDONE in {time.time() - started:.0f}s: {folder}  ({made} pictures to compare)")
+    L(Msg(f"\nDONE in {time.time() - started:.0f}s: {folder}  ({made} pictures to compare)", [(str(folder), folder)]))
     return folder
 
 
@@ -1944,31 +2060,37 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     numbered = list(enumerate(files, 1))
     picks = spread(numbered, n)
     log(f"Preview of {len(picks)} of {len(files)} images")
-    c.start_ai()
+    try:
+        c.start_ai()
+    except Stopped:
+        log("\nStopped by user.")
+        return []
     items = []
     for k, (idx, path) in enumerate(picks, 1):
         if should_stop():
             log("\nStopped by user.")
             break
         t0 = time.time()
-        tag = f"[{k}/{len(picks)}] #{idx} {path.name[:50]}"
+        tag, shown = f"[{k}/{len(picks)}] #{idx} {path.name[:50]}", False
         try:
             src_id = source_id(path)
             im = load_rgb(path)
+            log(picture_line(tag, path, im))
+            shown = True
             if o.mode == "upscale":
                 r = make_upscaled(c, path, src_id, im, store=True)
                 orig, res = im, r["result"]
                 box = busiest_box(res)
                 fx = fy = r["f"]
                 dx = dy = 0.0
-                log(upscaled_line(tag, r, "(preview)", t0))
+                log(upscaled_line(r, "(preview)", t0))
             else:
                 r = make_page(c, path, src_id, im)
                 orig = r["im"]
                 res = Image.open(r["page_path"]).convert("RGB")
                 box = busiest_box(res)
                 fx, fy, dx, dy = page_to_original(o, r["w"], r["h"])
-                log(page_line(tag, r, t0))
+                log(page_line(r, t0))
             ow, oh = orig.size
             sx0, sx1 = (min(max((box[0] - dx) / fx, 0.0), ow - 1), min(max((box[2] - dx) / fx, 1.0), ow))
             sy0, sy1 = (min(max((box[1] - dy) / fy, 0.0), oh - 1), min(max((box[3] - dy) / fy, 1.0), oh))
@@ -1980,7 +2102,7 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
             log("\nStopped by user.")
             break
         except Exception:  # noqa: BLE001
-            log(f"{tag}\n    ERROR:")
+            log("    ERROR:" if shown else f"{tag}\n    ERROR:")
             log("    " + traceback.format_exc().replace("\n", "\n    "))
     return items
 
@@ -2665,8 +2787,27 @@ def build_window():
     state = {"stop": False, "last_out": None, "busy": False, "started": 0.0, "last_log": 0.0, "step": "",
              "preview_run": False}
 
+    link_no = [0]
+
+    def open_link(path):
+        err = open_file(path)
+        if err:
+            append(stamped(f"Could not open {path}: {err}"))
+
     def append(msg):
+        start = log_text.index("end-1c")
         log_text.insert("end", msg + "\n")
+        for text, path in getattr(msg, "links", ()):      # parts of the message that open a picture or folder
+            at = msg.rfind(text)
+            if at < 0:
+                continue
+            link_no[0] += 1
+            name = f"link{link_no[0]}"
+            log_text.tag_add(name, f"{start}+{at}c", f"{start}+{at + len(text)}c")
+            log_text.tag_configure(name, foreground="#0b57d0", underline=True)
+            log_text.tag_bind(name, "<Button-1>", lambda e, p=path: open_link(p))
+            log_text.tag_bind(name, "<Enter>", lambda e: log_text.configure(cursor="hand2"))
+            log_text.tag_bind(name, "<Leave>", lambda e: log_text.configure(cursor=""))
         log_text.see("end")
 
     def note_step(msg):

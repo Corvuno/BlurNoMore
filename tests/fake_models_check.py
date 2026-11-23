@@ -73,6 +73,8 @@ with open(root / "calls.jsonl", "a") as f:
 (root / "pid.txt").write_text(str(os.getpid()))
 if os.environ.get("FAKE_SV_FAIL"):
     print("RuntimeError: out of graphics memory (fake)"); sys.exit(1)
+if os.environ.get("FAKE_SV_HANG"):
+    time.sleep(60)
 if os.environ.get("FAKE_SV_SLOW"):
     for i in range(300):
         print(f"progress step {i}", flush=True); time.sleep(0.2)
@@ -252,8 +254,9 @@ def check_progress(models, pics, out):
         assert res, lines
         said = [ln for ln in lines if "piece " in ln]
         assert 2 <= len(said) <= 4, said                 # 12 pieces of 4 s = 48 s: one line every 3rd piece, none at the end
-        assert all(re.search(r"\] +dat: piece \d+ of 12, 4\.0 s each, about \d+ (s|min) left$", ln) for ln in said), said
-        assert "piece 3 of 12" in said[0] and "about 36 s left" in said[0], said[0]
+        assert all(re.search(r"\] +dat: piece \d+ of 12, \d+ (s|min)( \d+ s)? so far$", ln) for ln in said), said
+        assert said[0].endswith("dat: piece 3 of 12, 12 s so far"), said[0]
+        assert not any("left" in ln for ln in lines), "a finish-time guess"
         for ln in lines:
             if ln.strip():
                 assert re.match(r"\n*\[\d\d:\d\d:\d\d\] ", ln), f"no time in front: {ln!r}"
@@ -305,7 +308,7 @@ def check_progress(models, pics, out):
         assert bn.run_esrgan(Image.new("RGB", (8, 8)), "x", exe, tmp, said.append) is None
     finally:
         bn.time = real_time
-    assert any(re.fullmatch(r"    Real-ESRGAN still working \(\d+ (s|min)( \d+ s)?\)", m) for m in said), said
+    assert any(re.fullmatch(r"    Real-ESRGAN still working, \d+ (s|min)( \d+ s)? so far", m) for m in said), said
     t0 = time.time()
     try:
         bn.run_esrgan(Image.new("RGB", (8, 8)), "x", exe, tmp, said.append, should_stop=lambda: time.time() - t0 > 1)
@@ -314,6 +317,94 @@ def check_progress(models, pics, out):
         pass
     assert time.time() - t0 < 3, "Stop took too long"
     print("progress ok")
+
+
+def check_hang_and_links(models, pics, out):
+    """A model that makes no progress for HANG_LIMIT is given up (tiny limit here): the run goes on, the log says FAILED
+    once, and Compare shows that letter failed; the picture and result lines carry links."""
+    real_run, real_limit = bn.OnnxModel.run, bn.HANG_LIMIT
+    bn.HANG_LIMIT = 1
+    seen = []
+
+    def stuck_run(self, t):
+        seen.append(1)
+        if len(seen) >= 3:
+            time.sleep(4)                       # the third piece never comes back
+        return real_run(self, t)
+    bn.OnnxModel.run = stuck_run
+    try:
+        lines = []
+        t0 = time.time()
+        res = bn.run(bn.Options(save_to=str(out / "hang"), ai_dir=str(models.parent), inputs=[str(pics / "tiles.png")],
+                                mode="upscale", up_model="dat", scale=2, redo=True), lines.append)
+        text = "\n".join(lines)
+        assert res and time.time() - t0 < 30, text[-800:]
+        fails = [ln for ln in lines if "FAILED:" in ln]
+        assert len(fails) == 1 and fails[0].endswith("FAILED: dat made no progress for 1 s (stuck at piece 2 of 12); "
+                                                     "skipping it for the rest of this run"), fails
+        assert "lanczos (AI failed)" in text, text[-800:]
+        # the model that hung is not tried again in the same run
+        seen.clear()
+        lines = []
+        bn.run(bn.Options(save_to=str(out / "hang2"), ai_dir=str(models.parent), inputs=[str(pics / "tiles.png"), str(pics / "small.png")],
+                          mode="upscale", up_model="dat", scale=2, redo=True), lines.append)
+        assert sum("FAILED: dat" in ln for ln in lines) == 1 and len(seen) == 3, (len(seen), lines[-12:])
+        # Compare: that letter is failed in the key, the others are made
+        seen.clear()
+        res, lines = make_run(models, out / "hang_cmp", inputs=[str(pics / "tiles.png")], mode="compare", scale=2,
+                              compare_models=["dat", "bhi"])
+        assert res, lines
+        key = (Path(res) / "key.txt").read_text(encoding="utf-8")
+        assert "failed: dat made no progress for 1 s" in key or "failed: bhi made no progress for 1 s" in key, key
+        assert len(list(Path(res).glob("*_?.png"))) >= 1, "the other letters were not made"
+    finally:
+        bn.OnnxModel.run = real_run
+        bn.HANG_LIMIT = real_limit
+    # Real-ESRGAN that prints nothing, and SeedVR2 that prints nothing: ended after the limit
+    bn.HANG_LIMIT = 1
+    try:
+        exe = out / "mute_esrgan.sh"
+        exe.write_text("#!/bin/sh\nsleep 30\n")
+        exe.chmod(0o755)
+        tmp = out / "esr_tmp2"
+        tmp.mkdir()
+        said, t0 = [], time.time()
+        assert bn.run_esrgan(Image.new("RGB", (8, 8)), "x", exe, tmp, said.append) is None
+        assert time.time() - t0 < 5 and any(m.endswith("FAILED: Real-ESRGAN made no progress for 1 s; skipping it for the rest of this run") or
+                                            m == "    FAILED: Real-ESRGAN made no progress for 1 s; skipping it for the rest of this run"
+                                            for m in said), said
+        sv = models.parent / "seedvr2"
+        os.environ["FAKE_SV_HANG"] = "1"
+        try:
+            lines = []
+            t0 = time.time()
+            bn.run(bn.Options(save_to=str(out / "sv_hang"), inputs=[str(pics / "small.png")], mode="upscale", up_model="seedvr2",
+                              scale=2, redo=True, ai_dir=str(models.parent)), lines.append)
+        finally:
+            del os.environ["FAKE_SV_HANG"]
+        assert time.time() - t0 < 20 and any("FAILED: seedvr2 made no progress for 1 s; skipping it" in ln for ln in lines), lines[-8:]
+        pid = int((sv / "pid.txt").read_text())
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+            raise AssertionError("the fake tool still runs after the guard gave up")
+        except ProcessLookupError:
+            pass
+    finally:
+        bn.HANG_LIMIT = real_limit
+    # links: the picture line (the original), the line naming the result, the DONE line (the folder); the log file is plain
+    lines = []
+    res = bn.run(bn.Options(save_to=str(out / "links"), ai_dir=str(models.parent), inputs=[str(pics / "small.png")],
+                            mode="upscale", up_model="dat", scale=2, redo=True), lines.append)
+    pic = next(ln for ln in lines if "small.png (48x40)" in ln)
+    assert pic.lstrip("\n")[11:].startswith("[1/1] #1 small.png (48x40)") and pic.links == (("[1/1] #1 small.png (48x40)", pics / "small.png"),)
+    done = next(ln for ln in lines if "DONE in" in ln)
+    assert done.links == ((str(res), Path(res)),)
+    got = next(ln for ln in lines if "->" in ln)
+    assert got.links[0][0] in got and got.links[0][1] == Path(res) / got.links[0][0], got.links
+    logfile = next((Path(res).parent / "_blurnomore_work" / "logs").glob("*.log")).read_text(encoding="utf-8")
+    assert "small.png (48x40)" in logfile and type(logfile) is str
+    print("hang guard and links ok")
 
 
 def check():
@@ -517,6 +608,7 @@ def check():
 
         check_ai_dir(out)
         check_progress(models, pics, out)
+        check_hang_and_links(models, pics, out)
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"
         print("Fake-model check passed.")
