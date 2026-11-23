@@ -355,6 +355,138 @@ def check_ort_thread(models, pics, out):
     print("one onnxruntime thread ok")
 
 
+def check_card_choice(models):
+    """DirectML is asked for the fast card and the log names it; an onnxruntime that does not know that wish gets each
+    card timed and the fastest kept. (Fake DirectML: there is no Windows here.)"""
+    real, real_list = bn.ort.InferenceSession, bn.gpu_list
+    made = []
+    old = {"on": False}
+    cards = {"plain": [{"name": "AMD Radeon(TM) Graphics", "vram_mb": 512}, {"name": "AMD Radeon RX 7800 XT", "vram_mb": 16368}],
+             "fast": [{"name": "AMD Radeon RX 7800 XT", "vram_mb": 16368}, {"name": "AMD Radeon(TM) Graphics", "vram_mb": 512}]}
+
+    class FakeDml(real):
+        def __init__(self, path, opts=None, providers=None):
+            first = providers[0]
+            made.append(first)
+            if isinstance(first, tuple):
+                if old["on"] and "performance_preference" in first[1]:
+                    raise RuntimeError("Unknown provider option: performance_preference")
+                self.slow = first[1].get("device_id") == 0
+            super().__init__(path, providers=["CPUExecutionProvider"])
+            self.fake = first[0] if isinstance(first, tuple) else first
+
+        def get_providers(self):
+            return [self.fake, "CPUExecutionProvider"]
+
+        def run(self, *a, **k):
+            if getattr(self, "slow", False):
+                time.sleep(0.05)
+            return super().run(*a, **k)
+    bn.ort.InferenceSession, bn.gpu_list = FakeDml, lambda: cards
+    try:
+        path = models / bn.UPSCALERS["bhi"]["file"]
+        for old["on"] in (False, True):
+            lines = []
+            c = bn.Context(bn.Options(), lines.append, models.parent)
+            c.prov = ["DmlExecutionProvider", "CPUExecutionProvider"]
+            made.clear()
+            bn.make_session(c, path)
+            bn.make_session(c, path)
+            text = "\n".join(lines)
+            assert "ONNX Runtime uses the graphics card AMD Radeon RX 7800 XT (16 GB) (DirectML)" in text, text
+            if not old["on"]:
+                assert made == [("DmlExecutionProvider", bn.DML_FAST)] * 2, made
+            else:
+                assert "timing the cards instead" in text and made[-1] == ("DmlExecutionProvider", {"device_id": 1}), (made, text)
+        old["on"] = False
+        for want, device, said in (("AMD Radeon(TM) Graphics", 0, "AMD Radeon(TM) Graphics"),
+                                   ("AMD Radeon RX 7800 XT (16 GB)", 1, "AMD Radeon RX 7800 XT (16 GB)"),
+                                   ("Some Old Card", None, "was not found")):
+            lines = []
+            c = bn.Context(bn.Options(gpu=want), lines.append, models.parent)
+            c.prov = ["DmlExecutionProvider", "CPUExecutionProvider"]
+            made.clear()
+            bn.make_session(c, path)
+            text = "\n".join(lines)
+            assert said in text, text
+            assert made[0] == (("DmlExecutionProvider", {"device_id": device}) if device is not None
+                               else ("DmlExecutionProvider", bn.DML_FAST)), (want, made)
+    finally:
+        bn.ort.InferenceSession, bn.gpu_list = real, real_list
+    print("graphics card choice ok")
+
+
+def check_compare_memory_and_crash(models, pics, out):
+    """Compare lets each model go after its picture (memory back for the next one), keeps each result in
+    _blurnomore_work/compare_unfinished right away (gone after a finished run), and a run that dies keeps them."""
+    real = bn.ort.InferenceSession
+    made = []
+
+    class Counted(real):
+        def __init__(self, *a, **k):
+            made.append(1)
+            super().__init__(*a, **k)
+    bn.ort.InferenceSession = Counted
+    try:
+        res, lines = make_run(models, out / "cmp_mem", inputs=[str(pics / "small.png"), str(pics / "bigger.png")], mode="compare",
+                              scale=2, compare_models=["dat", "bhi"])
+    finally:
+        bn.ort.InferenceSession = real
+    assert res and len(made) >= 4, f"models were not let go between pictures ({len(made)} sessions)"
+    assert not (out / "cmp_mem" / "_blurnomore_work" / "compare_unfinished").exists(), "unfinished results left after a finished run"
+
+    real_make = bn.make_upscaled
+    calls = []
+
+    def dies(c, path, src_id, im, force=None):
+        calls.append(force)
+        if len(calls) == 2:
+            raise KeyboardInterrupt("the program dies")
+        return real_make(c, path, src_id, im, force=force)
+    bn.make_upscaled = dies
+    try:
+        try:
+            make_run(models, out / "cmp_dies", inputs=[str(pics / "small.png")], mode="compare", scale=2, compare_models=["dat", "bhi"])
+            raise AssertionError("the fake crash did not happen")
+        except KeyboardInterrupt:
+            pass
+    finally:
+        bn.make_upscaled = real_make
+    kept = list((out / "cmp_dies" / "_blurnomore_work" / "compare_unfinished").glob("*/*"))
+    names = sorted(p.name for p in kept)
+    assert len(names) == 2 and names[0] == "key.txt" and names[1].startswith("small_") and names[1].endswith(".png"), names
+    key = next(p for p in kept if p.name == "key.txt").read_text(encoding="utf-8")
+    assert f"{names[1][6]} = " in key, key
+    print("compare memory and unfinished results ok")
+
+
+def check_failed_lines(models, pics, out):
+    """A model that fails shows one FAILED line in the window; the full trace is only in the log file (and Copy log)."""
+    real_run = bn.OnnxModel.run
+
+    calls = []
+
+    def boom(self, t):
+        calls.append(1)
+        if len(calls) == 1:                    # the test run when it loads works; the first piece fails
+            return real_run(self, t)
+        raise RuntimeError("Not enough memory resources are available to complete this operation.")
+    bn.OnnxModel.run = boom
+    try:
+        res, lines = make_run(models, out / "failed_line", inputs=[str(pics / "small.png")], mode="upscale", up_model="bhi", scale=2,
+                              redo=True)
+    finally:
+        bn.OnnxModel.run = real_run
+    text = "\n".join(lines)
+    assert res and "Traceback" not in text, text[-1500:]
+    fails = [ln for ln in lines if "FAILED: bhi" in ln]
+    assert len(fails) == 1 and fails[0].endswith(
+        "FAILED: bhi: RuntimeError: Not enough memory resources are available to complete this operation."), fails
+    log = next((out / "failed_line" / "_blurnomore_work" / "logs").glob("*.log")).read_text(encoding="utf-8")
+    assert "Traceback" in log and "FAILED: bhi" in log, log[-1500:]
+    print("one FAILED line ok")
+
+
 def check_hang_and_links(models, pics, out):
     """A model that makes no progress for HANG_LIMIT is given up (tiny limit here): the run goes on, the log says FAILED
     once, and Compare shows that letter failed; the picture and result lines carry links."""
@@ -645,6 +777,9 @@ def check():
         check_ai_dir(out)
         check_progress(models, pics, out)
         check_ort_thread(models, pics, out)
+        check_card_choice(models)
+        check_compare_memory_and_crash(models, pics, out)
+        check_failed_lines(models, pics, out)
         check_hang_and_links(models, pics, out)
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"

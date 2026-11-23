@@ -49,6 +49,12 @@ The overview every conversation starts from. One screen; what is no longer true 
   back up/move; exact place didn't matter).
 - 4.9.1 (landed 2026-11-23): status line with spinner above the log removed; run info lives in the log
   (see project.md, design readings).
+- 4.10 (landed 2026-11-23): owner's Compare ran ~33 s per DAT piece and hatgan/heart hit DirectML "Not enough
+  memory": DirectML took adapter 0 = the Ryzen 7800X3D's built-in Radeon, not the 7800XT. Now asks DirectML for
+  high_performance (option names checked in onnxruntime-directml 1.24.4's DLL), times cards if that is refused, logs
+  the card's name; setting Graphics card (More settings, --gpu) overrides. Compare releases each model after its
+  picture, keeps results in _blurnomore_work/compare_unfinished at once (with a key). FAILED = one line in the
+  window, full trace only in the log file; Copy log copies the file. Not yet confirmed on the owner's PC.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

@@ -19,6 +19,7 @@ never touched. Work files and logs go in <save folder>\\_blurnomore_work.
 """
 import argparse
 import faulthandler
+import gc
 import hashlib
 import importlib.util
 import io
@@ -67,7 +68,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.9.1"
+VERSION = "4.10"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -89,7 +90,7 @@ SETTINGS_SECTIONS = (
     ("4. Options", ("scale", "size_mode", "size_px", "shrink_bigger", "faces", "face_model", "face_strength", "colorize",
                     "autocrop", "thicken", "fade", "keep_color", "color_boost")),
     ("5. What comes out", ("name_mode", "name_text", "file_type", "jpg_quality", "max_mb", "fit", "margin_mm", "save_to")),
-    ("More settings", ("dpi", "ai_dir", "redo", "open_when_done")),
+    ("More settings", ("dpi", "ai_dir", "gpu", "redo", "open_when_done")),
     ("Remembered by the program", ("ai_dir_used",)),
 )
 AI_FOLDERS = ("realesrgan", "models", "seedvr2")   # the big folders; they live in the AI files folder (next to the program, or the one chosen)
@@ -205,6 +206,7 @@ class Options:
     sv_latent_noise: float = 0.0  # 0-1, the same, later in the process
     sv_low_memory: bool = False  # saves graphics memory, slower
     ai_dir: str = ""             # where the AI files (realesrgan, models, seedvr2) live; empty = next to the program
+    gpu: str = ""                # the graphics card for the AI models, by name; empty = automatic (the fast one)
     open_when_done: bool = True  # GUI only
 
 
@@ -504,6 +506,21 @@ def open_file(path):
         return str(e)
 
 
+class FileOnly(str):
+    """A log message for the log file only: a full error trace. The window shows the one FAILED or ERROR line before it."""
+
+
+def error_trace(indent="    "):
+    """The trace of the error being handled, for the log file only."""
+    return FileOnly(indent + traceback.format_exc().rstrip().replace("\n", "\n" + indent))
+
+
+def error_text():
+    """The error being handled in one line: 'Type: message'."""
+    e = sys.exc_info()[1]
+    return (f"{type(e).__name__}: {e}".strip().splitlines() or [""])[0][:300]
+
+
 def stamped(msg):
     """A log message with the local time in front: [11:45:14] text. Blank messages stay blank, a message of
     several lines gets it on its first line only."""
@@ -669,13 +686,128 @@ def fetch_model(c, name, url, size):
         return None
 
 
+# Ask DirectML for the fast graphics card. Without this it takes the first card Windows lists, which on a PC whose
+# processor has graphics built in can be that small chip instead of the real card (slow, and little memory).
+GPU_AUTO = "Automatic (fastest)"
+DML_FAST = {"performance_preference": "high_performance", "device_filter": "gpu"}
+# Run in a separate Python (a mistake in talking to Windows' graphics there cannot take the program down): the graphics
+# cards as Windows lists them, and in the order of its "high performance" choice. Prints JSON.
+GPU_LIST_CODE = r"""
+import ctypes, json, uuid
+class GUID(ctypes.Structure):
+    _fields_ = [("b", ctypes.c_ubyte * 16)]
+def guid(s):
+    g = GUID(); ctypes.memmove(ctypes.byref(g), uuid.UUID(s).bytes_le, 16); return g
+class DESC1(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_wchar * 128), ("vendor", ctypes.c_uint), ("device", ctypes.c_uint), ("subsys", ctypes.c_uint),
+                ("rev", ctypes.c_uint), ("vram", ctypes.c_size_t), ("sysmem", ctypes.c_size_t), ("shared", ctypes.c_size_t),
+                ("luid_lo", ctypes.c_uint), ("luid_hi", ctypes.c_int), ("flags", ctypes.c_uint)]
+def method(obj, index, *args):
+    vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *args)(vt[index])
+def desc(adapter):
+    d = DESC1(); method(adapter, 10, ctypes.POINTER(DESC1))(adapter, ctypes.byref(d))
+    method(adapter, 2)(adapter)
+    return {"name": d.name, "vram_mb": d.vram // 1048576, "software": bool(d.flags & 2)}
+f = ctypes.c_void_p()
+if ctypes.WinDLL("dxgi").CreateDXGIFactory1(ctypes.byref(guid("c1b6694f-ff09-44a9-b03c-77900a0a1d17")), ctypes.byref(f)):
+    raise SystemExit(1)
+IA1 = guid("29038f61-3839-4626-91fd-086879011a05")
+plain, fast = [], []
+for i in range(16):
+    a = ctypes.c_void_p()
+    if method(f, 12, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(f, i, ctypes.byref(a)):
+        break
+    plain.append(desc(a))
+for i in range(16):
+    a = ctypes.c_void_p()
+    if method(f, 29, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))(f, i, 2, ctypes.byref(IA1), ctypes.byref(a)):
+        break
+    fast.append(desc(a))
+method(f, 2)(f)
+print(json.dumps({"plain": plain, "fast": fast}))
+"""
+
+
+def gpu_list():
+    """{'plain': [...], 'fast': [...]} with {'name', 'vram_mb', 'software'} per graphics card (Windows only); {} when it
+    cannot tell. 'plain' is the order DirectML's device numbers follow, 'fast' its high-performance order."""
+    if os.name != "nt":
+        return {}
+    try:
+        r = subprocess.run([sys.executable, "-c", GPU_LIST_CODE], capture_output=True, text=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        got = json.loads(r.stdout) if r.returncode == 0 else {}
+        return {k: [g for g in got.get(k, []) if not g.get("software")] for k in ("plain", "fast")} if got else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def card_text(g):
+    return f"{g['name']} ({g['vram_mb'] / 1024:.0f} GB)" if g.get("vram_mb", 0) >= 1024 else g["name"]
+
+
+def time_session(make, path):
+    """Seconds for one run of a fresh session on a zero picture (the second run: the first one prepares the model)."""
+    sess = make()
+    inp = sess.get_inputs()[0]
+    shape = [d if isinstance(d, int) and d > 0 else (1 if i == 0 else 3 if i == 1 else 64) for i, d in enumerate(inp.shape)]
+    x = np.zeros(shape, np.float16 if "float16" in inp.type else np.float32)
+    feed = {inp.name: x}
+    sess.run(None, feed)
+    t = time.time()
+    sess.run(None, feed)
+    return time.time() - t
+
+
+def time_cards(c, path, opts, cards, why):
+    """This onnxruntime could not be asked for the fast card: time this model once on each card and keep the fastest
+    (DirectML's device numbers follow Windows' plain list of cards)."""
+    c.L(f"    This onnxruntime cannot be asked for the fast graphics card ({why[:120]}); timing the cards instead.")
+    plain = cards.get("plain") or []
+    best, best_t = 0, None
+    for i in range(min(len(plain), 4)) if len(plain) > 1 else ():
+        try:
+            t = on_ort(lambda i=i: time_session(lambda: ort.InferenceSession(
+                str(path), opts, providers=[("DmlExecutionProvider", {"device_id": i})]), path))
+        except Exception as e:  # noqa: BLE001
+            c.L(f"    {card_text(plain[i])}: did not run ({str(e)[:120]})")
+            continue
+        c.L(f"    {card_text(plain[i])}: {t:.2f} s for a test piece")
+        if best_t is None or t < best_t:
+            best, best_t = i, t
+    c.dml = {"device_id": best}
+    c.card = card_text(plain[best]) if best < len(plain) else ""
+
+
 def make_session(c, path):
-    """An onnxruntime session on the GPU (DirectML) when there is one, else the CPU."""
+    """An onnxruntime session on the GPU (DirectML, the fast card) when there is one, else the CPU."""
     prov = c.providers()
     opts = ort.SessionOptions()
     if "DmlExecutionProvider" in prov:
         opts.enable_mem_pattern = False       # DirectML needs these two
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        if c.dml is None and c.o.gpu:         # the card chosen under More settings
+            cards = gpu_list()
+            plain = cards.get("plain") or []
+            names = [g["name"] for g in plain]
+            want = re.sub(r"\s*\(\d+ GB\)$", "", c.o.gpu.strip())       # the name as the log shows it, with its memory, is fine too
+            if want in names:
+                c.o.gpu = want
+                c.dml, c.card = {"device_id": names.index(c.o.gpu)}, card_text(plain[names.index(c.o.gpu)])
+            else:
+                c.L(f"    The graphics card '{c.o.gpu}' was not found" + (f" (there are: {', '.join(names)})" if names else "")
+                    + "; choosing automatically.")
+        if c.dml is None:                     # the first model of the run: ask for the fast card
+            cards = gpu_list()
+            try:
+                sess = on_ort(lambda: ort.InferenceSession(str(path), opts, providers=[("DmlExecutionProvider", DML_FAST), *prov[1:]]))
+                c.dml = dict(DML_FAST)
+                c.card = card_text(cards["fast"][0]) if cards.get("fast") else ""
+                return said_where(c, sess)
+            except Exception as e:  # noqa: BLE001
+                time_cards(c, path, opts, cards, str(e))
+        prov = [("DmlExecutionProvider", c.dml), *prov[1:]]
     else:
         opts.enable_cpu_mem_arena = False     # the big models (DRCT-L) otherwise keep too much memory on the CPU
     try:
@@ -685,11 +817,19 @@ def make_session(c, path):
             raise
         c.L(f"  The GPU did not start ({e}); using the CPU.")
         c.prov = ["CPUExecutionProvider"]
+        opts.enable_cpu_mem_arena = False
         sess = on_ort(lambda: ort.InferenceSession(str(path), opts, providers=c.prov))
+    return said_where(c, sess)
+
+
+def said_where(c, sess):
+    """Say once where the models run, with the card's name."""
     on_gpu = sess.get_providers()[0] == "DmlExecutionProvider"
-    c.once("provider", "ONNX Runtime uses " + ("the GPU (DirectML)" if on_gpu else "the CPU"))
     if on_gpu:
+        c.once("provider", "ONNX Runtime uses the graphics card" + (f" {c.card}" if c.card else "") + " (DirectML)")
         c.once("dml-prepare", "    The first run on the graphics card prepares the model; this can take a minute.")
+    else:
+        c.once("provider", "ONNX Runtime uses the CPU")
     return sess
 
 
@@ -1522,8 +1662,10 @@ def run(o, log, should_stop=lambda: False):
     crash_trace(logfile)      # a hard crash (in onnxruntime, say) leaves its trace at the end of this log
 
     def L(msg=""):
+        only_file = isinstance(msg, FileOnly)
         msg = stamped(msg)
-        raw(msg)
+        if not only_file:
+            raw(msg)
         logfile.write(msg + "\n")
         logfile.flush()
 
@@ -1533,8 +1675,8 @@ def run(o, log, should_stop=lambda: False):
         L("\nStopped by user.")
         return None
     except Exception:  # noqa: BLE001
-        L("UNEXPECTED ERROR:")
-        L(traceback.format_exc())
+        L(f"UNEXPECTED ERROR: {error_text()} (the full trace is in the log file)")
+        L(error_trace(""))
         return None
     finally:
         L(f"Log saved: {work / 'logs' / (stamp + '.log')}")
@@ -1549,6 +1691,7 @@ class Context:
     def __init__(self, o, L, work):
         self.o, self.L, self.work, self.exe = o, L, work, None
         self.models, self.prov, self.said = {}, None, set()   # ONNX models by name, providers, notes made
+        self.dml, self.card = None, ""     # DirectML options (which card) and that card's name, chosen once
         self.sv_seed = int(o.sv_seed) or random.SystemRandom().randrange(1, 2 ** 31)   # the inventing upscaler's seed this run
         self.should_stop = lambda: False
         key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
@@ -1745,7 +1888,8 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
             coloured, im = coloured_im is not im, coloured_im
         except Exception as e:  # noqa: BLE001
             L(f"    FAILED: colouring: {type(e).__name__}: {e}")
-            L("  Colouring failed; the picture is left black and white:\n  " + traceback.format_exc().replace("\n", "\n  "))
+            L("    Colouring failed; the picture is left black and white.")
+            L(error_trace())
             c.models["colorizer"] = None
     if m:
         up, why = None, "Real-ESRGAN did not work"
@@ -1772,7 +1916,7 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
                     L(f"    FAILED: {why}; skipping it for the rest of this run")
                 else:
                     L(f"    FAILED: {m[1]}: {why}")
-                    L(f"  The model '{m[1]}' failed:\n  " + traceback.format_exc().replace("\n", "\n  "))
+                    L(error_trace())
                 L(f"  Using plain resizing instead of '{m[1]}' for the rest of this run.")
                 c.models[m[1]] = None
         if up is None and force:
@@ -1875,8 +2019,8 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
             L(("" if shown else tag + "\n") + "    stopped in the middle of this picture.\n\nStopped by user.")
             break
         except Exception:  # noqa: BLE001
-            L("    ERROR:" if shown else f"{tag}\n    ERROR:")
-            L("    " + traceback.format_exc().replace("\n", "\n    "))
+            L(f"    ERROR: {error_text()}" if shown else f"{tag}\n    ERROR: {error_text()}")
+            L(error_trace())
             report.append([idx, path.name, "", "ERROR", "", "", ""])
 
     if not pdf_inputs:
@@ -2017,6 +2161,16 @@ def key_picture(lines):
     return sheet
 
 
+def release_model(c, name):
+    """Forget a loaded ONNX model so its (graphics) memory is given back; it is loaded again when needed. The session is
+    let go on the onnxruntime thread, where it was made. A failed model keeps its mark (None)."""
+    if isinstance(c.models.get(name), OnnxModel):
+        def drop():
+            c.models.pop(name, None)
+            gc.collect()
+        on_ort(drop)
+
+
 def run_compare(c, files, stamp, out, should_stop, started):
     """Compare models, blind: each of the first pictures is made with each ticked model (and plain resizing) at the
     same size and options. The results get shuffled letters; the key says which letter is which model. Returns the folder."""
@@ -2037,6 +2191,14 @@ def run_compare(c, files, stamp, out, should_stop, started):
     if any(m in ("general", "anime") or (MODELS_DIR / f"{m}.param").is_file() for m in models):
         c.start_ai()
     folder = out / f"BlurNoMore_compare_{stamp}"
+    unfinished = c.work / "compare_unfinished" / folder.name      # each result right away, so a crash loses nothing
+    try:
+        unfinished.mkdir(parents=True, exist_ok=True)
+        (unfinished / "key.txt").write_text(
+            f"Results of {folder.name} whose picture was not finished. Open only after you have chosen.\n"
+            + "".join(f"{letter_of[m]} = {labels[m]}\n" for m in sorted(contestants, key=letter_of.get)), encoding="utf-8")
+    except OSError:
+        unfinished = None
     times, fails, made, used = {}, {}, 0, set()
     limit_notes = []
     L(f"Comparing {len(models)} models and plain resizing on {len(pictures)} pictures. Which result is which model is not told here.")
@@ -2050,11 +2212,18 @@ def run_compare(c, files, stamp, out, should_stop, started):
         try:
             src_id, im = source_id(path), load_rgb(path)
         except Exception:  # noqa: BLE001
-            L(Msg(f"{tag}\n    ERROR:\n    " + traceback.format_exc().replace("\n", "\n    "), [(tag, path)]))
+            L(Msg(f"{tag}\n    ERROR: {error_text()}", [(tag, path)]))
+            L(error_trace())
             continue
         L(picture_line(tag, path, im))
         if target_size(o, *im.size)[0] / im.size[0] <= AI_MIN_SCALE:
             L("    This picture hardly grows, so every model gives plain resizing for it.")
+        base = path.stem[:40]
+        k = 2
+        while base in used:
+            base, k = f"{path.stem[:40]}_{k}", k + 1
+        used.add(base)
+        kept = []
         for m in contestants:                        # always in this order, so the log tells nothing about the letters
             heard, real = [], c.L
 
@@ -2066,6 +2235,12 @@ def run_compare(c, files, stamp, out, should_stop, started):
             try:
                 results[m] = make_upscaled(c, path, src_id, im, force=m)["result"]
                 times.setdefault(m, []).append(time.time() - t1)
+                if unfinished is not None:
+                    try:
+                        results[m].save(unfinished / f"{base}_{letter_of[m]}.png")
+                        kept.append(unfinished / f"{base}_{letter_of[m]}.png")
+                    except OSError:
+                        pass
             except Stopped:
                 stopped = True
                 break
@@ -2077,17 +2252,15 @@ def run_compare(c, files, stamp, out, should_stop, started):
                 L("    a model could not make this picture (the key says which)")
             finally:
                 c.L = real
+                release_model(c, m)          # its graphics memory is free for the next model
         if stopped:                  # a picture stopped in the middle is not saved
+            for p in kept:
+                p.unlink(missing_ok=True)
             L("\nStopped by user.")
             break
         if not results:
             continue
         folder.mkdir(parents=True, exist_ok=True)
-        base = path.stem[:40]
-        k = 2
-        while base in used:
-            base, k = f"{path.stem[:40]}_{k}", k + 1
-        used.add(base)
         order = sorted(results.items(), key=lambda kv: letter_of[kv[0]])     # letter order: file times tell nothing
         saved = save_group([(res, folder / f"{base}_{letter_of[m]}") for m, res in order], o, L)
         for (m, _), (_, limit_note) in zip(order, saved):
@@ -2101,7 +2274,15 @@ def run_compare(c, files, stamp, out, should_stop, started):
         zoom = im.resize(size, Image.NEAREST, box=(box[0] * sx, box[1] * sy, max(box[2] * sx, box[0] * sx + 1), max(box[3] * sy, box[1] * sy + 1)))
         crops = [(letter_of[m], results[m].crop(box)) for m in sorted(results, key=letter_of.get)]
         closeup_sheet(zoom, crops).save(folder / f"{base}_closeups.png")
+        for p in kept:               # saved under their letters now
+            p.unlink(missing_ok=True)
         L(f"    done ({time.time() - t0:.1f}s)")
+    if unfinished is not None and not any(unfinished.glob("*.png")):
+        shutil.rmtree(unfinished, ignore_errors=True)
+        try:
+            unfinished.parent.rmdir()
+        except OSError:
+            pass
     if not made:
         L("Nothing to write.")
         return None
@@ -2148,6 +2329,21 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     work = prepare(log, output_dir(o))
     if work is None:
         return []
+    logfile = open(work / "logs" / f"{datetime.now():%Y-%m-%d_%H%M%S}_preview.log", "w", encoding="utf-8")
+    try:
+        return _preview(o, raw, logfile, files, work, n, should_stop)
+    finally:
+        logfile.close()
+
+
+def _preview(o, raw, logfile, files, work, n, should_stop):
+    def log(msg=""):
+        only_file = isinstance(msg, FileOnly)
+        msg = stamped(msg)
+        if not only_file:
+            raw(msg)
+        logfile.write(msg + "\n")
+        logfile.flush()
     prepare_ai_dir(o, log, files)
     c = Context(o, log, work)
     c.should_stop = should_stop
@@ -2196,8 +2392,8 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
             log("\nStopped by user.")
             break
         except Exception:  # noqa: BLE001
-            log("    ERROR:" if shown else f"{tag}\n    ERROR:")
-            log("    " + traceback.format_exc().replace("\n", "\n    "))
+            log(f"    ERROR: {error_text()}" if shown else f"{tag}\n    ERROR: {error_text()}")
+            log(error_trace())
     return items
 
 
@@ -2366,6 +2562,9 @@ HELP = {
               "you use it). When you change it, what is already there is moved to the new folder at the next run (a "
               "folder that already exists there is left alone). SeedVR2 then sets its Python up again once; a set-up made by version 4.5 "
               "kept its download cache in your user folder, so that first time PyTorch (about 3 GB) is downloaded again. Your pictures are never touched.",
+    "gpu": "Which graphics card runs the AI models. Automatic asks Windows for the fast one (on a PC whose processor has "
+           "graphics built in, that is the real card, not the small built-in chip). Choose a card by name only if the log "
+           "names the wrong one: the log says which card each run uses.",
     "redo": "Ignore pages and results made in earlier runs. Changing a setting already makes new ones on its "
             "own; use this for a clean rebuild.",
     "open": "Opens the PDF, or the folder of bigger pictures, when the run is finished.",
@@ -2461,6 +2660,7 @@ def build_window():
     v_save = tk.StringVar(value=word(SAVE, bool(o.save_to.strip()), "Next to the images"))
     v_save_to = tk.StringVar(value=o.save_to)
     v_ai_dir = tk.StringVar(value=o.ai_dir)
+    v_gpu = tk.StringVar(value=o.gpu or GPU_AUTO)
     v_fit = tk.StringVar(value=word(FIT, o.fit, "Whole picture"))
     v_margin = tk.StringVar(value=str(o.margin_mm))
     v_dpi = tk.StringVar(value=str(o.dpi))
@@ -2785,6 +2985,7 @@ def build_window():
         return f
     row(g5, "AI files folder", ai_dir_row, "ai_dir")
     row(g5, "", ai_dir_reset, "ai_dir")
+    w_gpu = row(g5, "Graphics card", combo(v_gpu, [GPU_AUTO] + ([o.gpu] if o.gpu else []), 30), "gpu")
     row(g5, "Redo all pages", check(v_redo, "on"), "redo")
     row(g5, "Open the result when finished", check(v_open, "on"), "open")
 
@@ -2933,6 +3134,7 @@ def build_window():
         ob.max_mb = min(200.0, max(0.5, num(v_mb, "File size limit", float))) if v_limit.get() else 0.0
         ob.save_to = v_save_to.get().strip().strip('"') if SAVE[v_save.get()] else ""
         ob.ai_dir = v_ai_dir.get().strip().strip('"')
+        ob.gpu = "" if v_gpu.get() == GPU_AUTO else v_gpu.get()
         ob.fit = FIT[v_fit.get()]
         ob.margin_mm = max(0.0, num(v_margin, "Page margin", float))
         ob.dpi = max(72, num(v_dpi, "Print resolution"))
@@ -2988,9 +3190,19 @@ def build_window():
         append(stamped("Stopping ..."))
 
     def copy_log():
+        """Copies the run's log file when there is one (it also has the full error traces), else what the window shows."""
+        text = log_text.get("1.0", "end-1c")
+        saved = re.findall(r"Log saved: (.+\.log)\s*$", text, re.M)
+        what = "log"
+        if saved:
+            try:
+                text = Path(saved[-1].strip()).read_text(encoding="utf-8")
+                what = "log file, with the full error traces"
+            except OSError:
+                pass
         root.clipboard_clear()
-        root.clipboard_append(log_text.get("1.0", "end-1c"))
-        append("(log copied to clipboard)")
+        root.clipboard_append(text)
+        append(f"({what} copied to clipboard)")
 
     def open_path(p):
         if hasattr(os, "startfile"):
@@ -3092,6 +3304,9 @@ def build_window():
                 kind, payload = q.get_nowait()
                 if kind == "log":
                     append(payload)
+                elif kind == "cards":
+                    names = list(dict.fromkeys([*payload, *([v_gpu.get()] if v_gpu.get() != GPU_AUTO else [])]))
+                    w_gpu.configure(values=[GPU_AUTO, *names])
                 elif kind == "preview":
                     state["preview"] = show_preview(*payload)
                 else:
@@ -3132,6 +3347,10 @@ def build_window():
     b_copy.configure(command=copy_log)
     b_open.configure(command=open_output)
     refresh_list()
+
+    def find_cards():               # asking Windows takes a moment: not in the way of the window
+        q.put(("cards", [g["name"] for g in (gpu_list().get("plain") or [])]))
+    threading.Thread(target=find_cards, daemon=True).start()
     root.after(120, poll)
     return SimpleNamespace(root=root, gather=gather, add_paths=add_paths, remove_selected=remove_selected,
                            clear_list=clear_list, last_run_images=last_run_images, inputs=inputs, listbox=lb,
@@ -3165,6 +3384,8 @@ def main():
     ap.add_argument("--ai-dir", default="", metavar="FOLDER",
                     help="where the big AI files (realesrgan, models, seedvr2 with Python and PyTorch) are kept, maybe on "
                          "another disk (default: next to the program). When it changes, the files are moved there at the next run")
+    ap.add_argument("--gpu", default="", metavar="NAME",
+                    help="the graphics card for the AI models, by its name as the log shows it (default: automatic, the fast one)")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
     size = ap.add_mutually_exclusive_group()
     size.add_argument("--width", type=int, metavar="N", help="upscale mode: make every picture N pixels wide (instead of --scale)")
@@ -3255,7 +3476,7 @@ def main():
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
                 face_model=a.face_model, colorize=a.colorize, compare_models=compare, sv_seed=a.sv_seed,
                 sv_color=a.sv_color, sv_input_noise=a.sv_input_noise, sv_latent_noise=a.sv_latent_noise,
-                sv_low_memory=a.sv_low_memory, ai_dir=a.ai_dir)
+                sv_low_memory=a.sv_low_memory, ai_dir=a.ai_dir, gpu=a.gpu)
     if a.preview:
         items = make_preview(o, print)
         if not items:
