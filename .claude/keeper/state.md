@@ -59,6 +59,11 @@ The overview every conversation starts from. One screen; what is no longer true 
   because the old 4.9.1 Compare was still running (owner confirmed). Now each run/preview leaves a note in
   settings/running; a new run warns in its first log lines when another is alive. Out-of-memory FAILED lines say
   so; Compare logs one "N of M could not make this picture" line per picture.
+- 4.11 (landed 2026-11-23): owner's PC stutters (choppy video calls) while a run has the 7800XT at full load.
+  Pause/Resume next to Stop (after the current piece, logged, not kept after closing); "Use at most"
+  100/75/50/25% by the run buttons, live during a run (rests piece time x (100/pct - 1); Real-ESRGAN/SeedVR2 rest
+  after each picture), default under More settings; below-normal process priority (children inherit on Windows).
+  Not tried on Windows yet. Note: process priority only helps the processor, not the graphics card.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

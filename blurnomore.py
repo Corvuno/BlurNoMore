@@ -68,7 +68,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.10.1"
+VERSION = "4.11"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -90,7 +90,7 @@ SETTINGS_SECTIONS = (
     ("4. Options", ("scale", "size_mode", "size_px", "shrink_bigger", "faces", "face_model", "face_strength", "colorize",
                     "autocrop", "thicken", "fade", "keep_color", "color_boost")),
     ("5. What comes out", ("name_mode", "name_text", "file_type", "jpg_quality", "max_mb", "fit", "margin_mm", "save_to")),
-    ("More settings", ("dpi", "ai_dir", "gpu", "redo", "open_when_done")),
+    ("More settings", ("dpi", "ai_dir", "gpu", "use_at_most", "redo", "open_when_done")),
     ("Remembered by the program", ("ai_dir_used",)),
 )
 AI_FOLDERS = ("realesrgan", "models", "seedvr2")   # the big folders; they live in the AI files folder (next to the program, or the one chosen)
@@ -207,6 +207,8 @@ class Options:
     sv_low_memory: bool = False  # saves graphics memory, slower
     ai_dir: str = ""             # where the AI files (realesrgan, models, seedvr2) live; empty = next to the program
     gpu: str = ""                # the graphics card for the AI models, by name; empty = automatic (the fast one)
+    use_at_most: int = 100       # % of the time the program works (100, 75, 50, 25); it rests the rest. The window's
+                                 # control by the run buttons starts from this and can change during a run
     open_when_done: bool = True  # GUI only
 
 
@@ -982,7 +984,9 @@ def run_tiles(model, im, tile=256, over=16, c=None, label=""):
             if c is None:
                 r = model.run(t)[0][:, keep, keep]
             else:
+                t_piece = time.time()
                 r = run_guarded(model, t, c, f" (stuck at piece {done + 1} of {total})")[0][:, keep, keep]
+                c.breathe(time.time() - t_piece)
             out[j * step * n:(j + 1) * step * n, i * step * n:(i + 1) * step * n] = (
                 np.clip(r.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
             done += 1
@@ -1716,7 +1720,7 @@ def prepare(L, out):
     return work
 
 
-def run(o, log, should_stop=lambda: False):
+def run(o, log, should_stop=lambda: False, pace=None):
     """Do the whole job. Returns the PDF path (mode pdf) or the folder of upscaled
     copies (mode upscale), or None."""
     raw = log
@@ -1748,7 +1752,7 @@ def run(o, log, should_stop=lambda: False):
 
     mark = mark_run("run")
     try:
-        return _run(o, L, should_stop, out, files, notes, stamp, work, started)
+        return _run(o, L, should_stop, out, files, notes, stamp, work, started, pace)
     except Stopped:                  # Stop pressed while something was being downloaded
         L("\nStopped by user.")
         return None
@@ -1763,6 +1767,17 @@ def run(o, log, should_stop=lambda: False):
         logfile.close()
 
 
+USE_AT_MOST = (100, 75, 50, 25)
+
+
+class Pace:
+    """How hard a run may work, changeable while it runs (the window's Pause and Use at most): paused holds it after
+    the current piece; share is the % of the time it works, resting the rest."""
+
+    def __init__(self, share=100):
+        self.paused, self.share = False, share
+
+
 class Context:
     """What the per-image work needs: settings, log, folders, and the Real-ESRGAN program
     (exe becomes None for the rest of the run when it fails)."""
@@ -1773,6 +1788,7 @@ class Context:
         self.dml, self.card = None, ""     # DirectML options (which card) and that card's name, chosen once
         self.sv_seed = int(o.sv_seed) or random.SystemRandom().randrange(1, 2 ** 31)   # the inventing upscaler's seed this run
         self.should_stop = lambda: False
+        self.pace, self.share_said = Pace(o.use_at_most), None
         key_fields = (o.fit, o.margin_mm, o.dpi, o.autocrop, o.thicken, o.fade, o.keep_color,
                       o.color_boost, o.use_ai, o.color_model)
         key = hashlib.md5(repr(key_fields).encode()).hexdigest()[:8]
@@ -1787,6 +1803,35 @@ class Context:
         if o.mode == "upscale" and o.up_model not in ("auto", "general", "anime", "seedvr2", *UPSCALERS, *extra_models()):
             L(f"Unknown upscale model '{o.up_model}'; choosing automatically.")
             self.up_model = "auto"
+
+    def breathe(self, worked=0.0):
+        """Between two pieces of work: hold while paused, then rest so that the work takes only the chosen share of
+        the time (rest = time of the last piece x (100 / share - 1)). Stop ends a pause or a rest at once."""
+        p = self.pace
+        if p.share != self.share_said:
+            if self.share_said is not None or p.share < 100:
+                self.L(f"Use at most: {p.share}% (it rests {100 - p.share}% of the time)" if p.share < 100
+                       else "Use at most: 100% (no resting)")
+            self.share_said = p.share
+        if p.paused:
+            t0 = time.time()
+            self.L("Paused.")
+            while p.paused:
+                if self.should_stop():
+                    raise Stopped()
+                time.sleep(0.2)
+            self.L(f"Resumed after {fmt_dur(time.time() - t0)}.")
+            return self.breathe()
+        start = time.time()
+        while p.share < 100 and worked > 0:
+            left = start + worked * (100 / max(1, p.share) - 1) - time.time()
+            if left <= 0:
+                break
+            if self.should_stop():
+                raise Stopped()
+            if p.paused or p.share != self.share_said:
+                return self.breathe(worked)
+            time.sleep(min(0.2, left))
 
     def once(self, key, msg):
         """Say something once per run."""
@@ -1820,6 +1865,7 @@ def make_page(c, path, src_id, im):
     """Crop, upscale and place one image on its A4 page (or reuse the cached page).
     Returns a dict about it; 'im' is the picture after the crop."""
     o, L = c.o, c.L
+    c.breathe()
     w0, h0 = im.size
     box = find_content_box(im) if o.autocrop else None
     note = ""
@@ -1845,7 +1891,9 @@ def make_page(c, path, src_id, im):
                 fit = Image.open(cache).convert("RGB")
                 method = f"AI {model} (cached)"
             else:
+                t_run = time.time()
                 up = run_esrgan(im, model, c.exe, c.tmp, L, should_stop=c.should_stop)
+                c.breathe(time.time() - t_run)
                 if up is None:
                     L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
                     c.exe = None
@@ -1930,6 +1978,7 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
     model, or plain with force="plain", never with another model and never from the cache; when that model cannot
     do it, RuntimeError says why."""
     o, L = c.o, c.L
+    c.breathe()
     w, h = im.size
     auto_cls, stats = classify(im)
     cls = {"drawing": "lineart", "photo": "photo"}.get(o.kind) or auto_cls
@@ -1973,14 +2022,18 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
     if m:
         up, why = None, "Real-ESRGAN did not work"
         if m[0] == "ncnn":
+            t_run = time.time()
             up = run_esrgan(im, m[1], c.exe, c.tmp, L, m[2], m[3], c.should_stop)
+            c.breathe(time.time() - t_run)
             if up is None:
                 L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
                 c.exe = None
         else:
             try:
                 if m[0] == "seedvr2":
+                    t_run = time.time()
                     up = run_seedvr2(c, im, target)
+                    c.breathe(time.time() - t_run)
                 else:
                     model = c.models[m[1]]
                     up = run_tiles(model, im, c=c, label=m[1])
@@ -2043,7 +2096,7 @@ def upscaled_line(r, name, t0, limit_note="", folder=None):
     return Msg(text, [(name, folder / name)]) if folder else text
 
 
-def _run(o, L, should_stop, out, files, notes, stamp, work, started):
+def _run(o, L, should_stop, out, files, notes, stamp, work, started, pace=None):
     L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
     warn_other_runs(L)
     L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
@@ -2052,6 +2105,7 @@ def _run(o, L, should_stop, out, files, notes, stamp, work, started):
 
     c = Context(o, L, work)
     c.should_stop = should_stop
+    c.pace = pace or c.pace
     for m in notes:
         L(m)
     numbered = list(enumerate(files, 1))
@@ -2398,7 +2452,7 @@ def busiest_box(im, size=400):
     return (x0, y0, x0 + bw, y0 + bh)
 
 
-def make_preview(o, log, n=4, should_stop=lambda: False):
+def make_preview(o, log, n=4, should_stop=lambda: False, pace=None):
     """Process up to n images (spread over the list) exactly as the run would and return what to show: a list of dicts
     with name, kind, method, original, result, detail_original, detail_result.
     Writes only into the work folder (pages and results are kept for the run that follows)."""
@@ -2414,13 +2468,13 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     logfile = open(work / "logs" / f"{datetime.now():%Y-%m-%d_%H%M%S}_preview.log", "w", encoding="utf-8")
     mark = mark_run("preview")
     try:
-        return _preview(o, raw, logfile, files, work, n, should_stop)
+        return _preview(o, raw, logfile, files, work, n, should_stop, pace)
     finally:
         unmark_run(mark)
         logfile.close()
 
 
-def _preview(o, raw, logfile, files, work, n, should_stop):
+def _preview(o, raw, logfile, files, work, n, should_stop, pace=None):
     def log(msg=""):
         only_file = isinstance(msg, FileOnly)
         msg = stamped(msg)
@@ -2432,6 +2486,7 @@ def _preview(o, raw, logfile, files, work, n, should_stop):
     prepare_ai_dir(o, log, files)
     c = Context(o, log, work)
     c.should_stop = should_stop
+    c.pace = pace or c.pace
     numbered = list(enumerate(files, 1))
     picks = spread(numbered, n)
     log(f"Preview of {len(picks)} of {len(files)} images")
@@ -2657,6 +2712,13 @@ HELP = {
                    "result, with close-ups. Then you choose 'Go on with all' or 'Change settings'. "
                    "Not for Compare models: that already is a look-first run on 4 pictures.",
     "run": "Works on all the pictures straight away.",
+    "pause": "Holds the run after the piece it is working on, so the PC is free (for a call, say); press Resume to go on "
+             "where it was. The log notes when it paused and resumed. Closing the program ends a paused run.",
+    "use_now": "How much of the time the run may work: at 50% it rests as long as it worked after every piece, so the "
+               "graphics card and the PC stay usable for other things. Change it any time, also during a run; the log "
+               "notes it. It starts at the value under More settings.",
+    "use_at_most": "What 'Use at most' by the run buttons starts at when the program opens: 100% works flat out; lower "
+                   "lets the program rest part of the time, slower, but the PC stays smooth for browsing and calls.",
 }
 HELP_DEFAULT = "Point at a setting to see what it does."
 
@@ -2746,6 +2808,7 @@ def build_window():
     v_save_to = tk.StringVar(value=o.save_to)
     v_ai_dir = tk.StringVar(value=o.ai_dir)
     v_gpu = tk.StringVar(value=o.gpu or GPU_AUTO)
+    v_use = tk.StringVar(value=f"{o.use_at_most if o.use_at_most in USE_AT_MOST else 100}%")
     v_fit = tk.StringVar(value=word(FIT, o.fit, "Whole picture"))
     v_margin = tk.StringVar(value=str(o.margin_mm))
     v_dpi = tk.StringVar(value=str(o.dpi))
@@ -3071,6 +3134,7 @@ def build_window():
     row(g5, "AI files folder", ai_dir_row, "ai_dir")
     row(g5, "", ai_dir_reset, "ai_dir")
     w_gpu = row(g5, "Graphics card", combo(v_gpu, [GPU_AUTO] + ([o.gpu] if o.gpu else []), 30), "gpu")
+    row(g5, "Use at most (when it opens)", combo(v_use, [f"{x}%" for x in USE_AT_MOST], 6), "use_at_most")
     row(g5, "Redo all pages", check(v_redo, "on"), "redo")
     row(g5, "Open the result when finished", check(v_open, "on"), "open")
 
@@ -3123,10 +3187,28 @@ def build_window():
     b_prev = ttk.Button(btns, text="Run with preview")
     b_run = ttk.Button(btns, text="Run")
     b_stop = ttk.Button(btns, text="Stop", state="disabled")
+    b_pause = ttk.Button(btns, text="Pause", state="disabled", width=8)
     for b, k in ((b_prev, "run_preview"), (b_run, "run")):
         b.pack(side="left", padx=(0, 6))
         tip(b, k)
     b_stop.pack(side="left", padx=(0, 6))
+    b_pause.pack(side="left", padx=(0, 12))
+    tip(b_pause, "pause")
+    pace = Pace(o.use_at_most if o.use_at_most in USE_AT_MOST else 100)    # the live controls; each run reads them
+    v_share = tk.StringVar(value=f"{pace.share}%")
+    lab_share = ttk.Label(btns, text="Use at most")
+    lab_share.pack(side="left", padx=(0, 4))
+    w_share = ttk.Combobox(btns, textvariable=v_share, state="readonly", width=5, values=[f"{x}%" for x in USE_AT_MOST])
+    w_share.pack(side="left")
+    tip(lab_share, "use_now")
+    tip(w_share, "use_now")
+    v_share.trace_add("write", lambda *_: setattr(pace, "share", int(v_share.get().rstrip("%"))))
+
+    def pause():
+        pace.paused = not pace.paused
+        b_pause.configure(text="Resume" if pace.paused else "Pause")
+        append(stamped("Pausing after the current piece ..." if pace.paused else "Resuming ..."))
+    b_pause.configure(command=pause)
 
     def sync_buttons(*_):
         """Run with preview is not offered for Compare models: that already is a look-first run."""
@@ -3220,6 +3302,7 @@ def build_window():
         ob.save_to = v_save_to.get().strip().strip('"') if SAVE[v_save.get()] else ""
         ob.ai_dir = v_ai_dir.get().strip().strip('"')
         ob.gpu = "" if v_gpu.get() == GPU_AUTO else v_gpu.get()
+        ob.use_at_most = int(v_use.get().rstrip("%"))
         ob.fit = FIT[v_fit.get()]
         ob.margin_mm = max(0.0, num(v_margin, "Page margin", float))
         ob.dpi = max(72, num(v_dpi, "Print resolution"))
@@ -3238,10 +3321,10 @@ def build_window():
         out = None
         try:
             if preview:
-                items = make_preview(opts, lambda m: q.put(("log", m)), 4, lambda: state["stop"])
+                items = make_preview(opts, lambda m: q.put(("log", m)), 4, lambda: state["stop"], pace)
                 q.put(("preview", (items, opts)))
             else:
-                out = run(opts, lambda m: q.put(("log", m)), lambda: state["stop"])
+                out = run(opts, lambda m: q.put(("log", m)), lambda: state["stop"], pace)
         except Exception:  # noqa: BLE001
             q.put(("log", "UNEXPECTED ERROR:\n" + traceback.format_exc()))
         q.put(("done", str(out) if out else None))
@@ -3253,6 +3336,8 @@ def build_window():
         for b in (b_prev, b_run):
             b.configure(state="disabled")
         b_stop.configure(state="normal")
+        pace.paused = False
+        b_pause.configure(state="normal", text="Pause")
         threading.Thread(target=worker, args=(opts, preview), daemon=True).start()
 
     def begin(preview):
@@ -3399,6 +3484,8 @@ def build_window():
                     b_run.configure(state="normal")
                     sync_buttons()
                     b_stop.configure(state="disabled")
+                    pace.paused = False
+                    b_pause.configure(state="disabled", text="Pause")
                     refresh_list()
                     if payload:
                         state["last_out"] = payload
@@ -3452,8 +3539,23 @@ def launch_gui():
 
 
 # ====================================================================== CLI
+def lower_priority():
+    """Run below normal priority, so the PC stays smooth for other work; Real-ESRGAN, SeedVR2 and the other programs
+    it starts get the same (Windows passes it on to them)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.SetPriorityClass(k32.GetCurrentProcess(), 0x4000)      # BELOW_NORMAL_PRIORITY_CLASS
+        elif os.nice(0) < 5:
+            os.nice(5 - os.nice(0))
+    except (OSError, AttributeError):
+        pass
+
+
 def main():
     crash_trace(None)
+    lower_priority()
     move_old_settings()
     point_where_found(ai_base(load_settings()), ai_dir_used())      # where the AI files are now (for the list of extra models)
     if len(sys.argv) == 1:
@@ -3469,6 +3571,8 @@ def main():
     ap.add_argument("--ai-dir", default="", metavar="FOLDER",
                     help="where the big AI files (realesrgan, models, seedvr2 with Python and PyTorch) are kept, maybe on "
                          "another disk (default: next to the program). When it changes, the files are moved there at the next run")
+    ap.add_argument("--use-at-most", type=int, choices=list(USE_AT_MOST), default=100, metavar="PERCENT",
+                    help="work only this %% of the time (100, 75, 50 or 25) and rest the rest, so the PC stays usable")
     ap.add_argument("--gpu", default="", metavar="NAME",
                     help="the graphics card for the AI models, by its name as the log shows it (default: automatic, the fast one)")
     ap.add_argument("--scale", type=int, choices=[2, 3, 4], default=2, help="upscale mode: times bigger")
@@ -3561,7 +3665,7 @@ def main():
                 name_text=a.name_prefix or a.name_suffix, faces=a.faces, face_strength=min(100, max(0, a.face_strength)),
                 face_model=a.face_model, colorize=a.colorize, compare_models=compare, sv_seed=a.sv_seed,
                 sv_color=a.sv_color, sv_input_noise=a.sv_input_noise, sv_latent_noise=a.sv_latent_noise,
-                sv_low_memory=a.sv_low_memory, ai_dir=a.ai_dir, gpu=a.gpu)
+                sv_low_memory=a.sv_low_memory, ai_dir=a.ai_dir, gpu=a.gpu, use_at_most=a.use_at_most)
     if a.preview:
         items = make_preview(o, print)
         if not items:

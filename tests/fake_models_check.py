@@ -489,6 +489,57 @@ def check_failed_lines(models, pics, out):
     print("one FAILED line ok")
 
 
+def check_pace(models, pics, out):
+    """Pause holds the run after the current piece and logs when; Use at most rests (100 / share - 1) times the piece
+    time and logs a change made during the run; Stop ends a pause or a rest at once."""
+    lines = []
+    c = bn.Context(bn.Options(), lines.append, out)
+    t = time.time()
+    c.breathe(0.3)
+    assert time.time() - t < 0.1 and not lines, lines            # 100%: no rest, nothing said
+    c.pace.share = 50
+    t = time.time()
+    c.breathe(0.4)
+    took = time.time() - t
+    assert 0.35 < took < 0.8 and lines[-1].startswith("Use at most: 50%"), (took, lines)
+    c.pace.share = 25
+    t = time.time()
+    c.breathe(0.1)
+    assert 0.25 < time.time() - t < 0.6 and lines[-1].startswith("Use at most: 25%"), lines
+    c.pace.share = 100
+    c.pace.paused = True
+    threading.Timer(0.6, lambda: setattr(c.pace, "paused", False)).start()
+    t = time.time()
+    c.breathe(0.1)
+    assert time.time() - t >= 0.5 and "Paused." in lines and any(ln.startswith("Resumed after") for ln in lines), lines
+    c.pace.paused = True
+    c.should_stop = lambda: True
+    t = time.time()
+    try:
+        c.breathe()
+        raise AssertionError("Stop did not end the pause")
+    except bn.Stopped:
+        assert time.time() - t < 0.5
+
+    # a whole run: the share is said in the log; Pause in the middle holds it, Resume goes on, the picture is made
+    pace = bn.Pace(50)
+    lines = []
+    paused_at = []
+
+    def watch(msg=""):
+        lines.append(msg)
+        if "Use at most: 50%" in msg and not paused_at:
+            pace.paused = True
+            paused_at.append(time.time())
+            threading.Timer(0.8, lambda: setattr(pace, "paused", False)).start()
+    res = bn.run(bn.Options(save_to=str(out / "pace"), ai_dir=str(models.parent), inputs=[str(pics / "bigger.png")],
+                            mode="upscale", up_model="bhi", scale=2, redo=True), watch, lambda: False, pace)
+    text = "\n".join(lines)
+    assert res and "Paused." in text and "Resumed after" in text, text[-1500:]
+    assert len(list(Path(res).iterdir())) == 1
+    print("pause and use at most ok")
+
+
 def check_hang_and_links(models, pics, out):
     """A model that makes no progress for HANG_LIMIT is given up (tiny limit here): the run goes on, the log says FAILED
     once, and Compare shows that letter failed; the picture and result lines carry links."""
@@ -784,6 +835,7 @@ def check():
         check_card_choice(models)
         check_compare_memory_and_crash(models, pics, out)
         check_failed_lines(models, pics, out)
+        check_pace(models, pics, out)
         check_hang_and_links(models, pics, out)
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"
