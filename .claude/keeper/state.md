@@ -33,6 +33,12 @@ The overview every conversation starts from. One screen; what is no longer true 
   target inside the moved folders or among the pictures. Not tried on real Windows disks.
 - 4.7 (landed 2026-11-22, #9): JPG quality setting and opt-in "Limit file size" (MB): lower JPG quality
   first, a PNG over the limit becomes JPG, smaller picture only as last resort; Compare decides per picture.
+- 4.7.1 (landed 2026-11-23): mouse wheel over an open dropdown list no longer throws KeyError 'popdown'.
+- 4.8 (landed 2026-11-23, #10): run log is alive: [HH:MM:SS] on every line, "piece N of M, X so far" and
+  "still working, X so far" lines (no finish-time guesses, by the owner's wish), a model with no progress
+  for 10 min is skipped with a copyable "FAILED: <model>: <reason>" line, picture lines show the size and
+  are clickable (also result names and the DONE folder), Stop works mid-picture and mid-download, status
+  line above the log. Real-ESRGAN's guard assumes it prints progress; not checked on Windows.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 
