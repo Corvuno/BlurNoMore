@@ -66,7 +66,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.7.1"
+VERSION = "4.8"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -424,6 +424,37 @@ def prepare_ai_dir(o, L, files=()):
         remember_ai_dir_used(new)
 
 
+def stamped(msg):
+    """A log message with the local time in front: [11:45:14] text. Blank messages stay blank, a message of
+    several lines gets it on its first line only."""
+    body = msg.lstrip("\n")
+    if not body.strip():
+        return msg
+    return msg[:len(msg) - len(body)] + f"[{datetime.now():%H:%M:%S}] " + body
+
+
+def fmt_dur(seconds):
+    """'45 s', '2 min 30 s', '3 min'."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s} s"
+    return f"{s // 60} min" + (f" {s % 60} s" if s % 60 else "")
+
+
+def download_file(url, dest, log, every=10):
+    """urllib's urlretrieve, saying 'downloaded X of Y MB' at most every `every` seconds (a quick download says nothing)."""
+    last = time.time()
+
+    def hook(blocks, block_size, total):
+        nonlocal last
+        if time.time() - last < every:
+            return
+        last = time.time()
+        got = blocks * block_size / 1e6
+        log(f"    downloaded {got:.0f} of {total / 1e6:.0f} MB" if total > 0 else f"    downloaded {got:.0f} MB")
+    urllib.request.urlretrieve(url, dest, hook)
+
+
 def ensure_esrgan(work, log):
     # Next to the program is the home of Real-ESRGAN; the old place (in the work folder) still counts.
     for base in (ESRGAN_DIR, work / "realesrgan"):
@@ -435,7 +466,7 @@ def ensure_esrgan(work, log):
         log("Downloading Real-ESRGAN (about 45 MB) ...")
         d.mkdir(parents=True, exist_ok=True)
         z = d / "realesrgan.zip"
-        urllib.request.urlretrieve(ESRGAN_URL, z)
+        download_file(ESRGAN_URL, z, log)
         with zipfile.ZipFile(z) as zf:
             zf.extractall(d)
         return _find_exe(d)
@@ -446,7 +477,7 @@ def ensure_esrgan(work, log):
         return None
 
 
-def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4):
+def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4, should_stop=None):
     tin, tout = tmp / "in.png", tmp / "out.png"
     if tout.exists():
         tout.unlink()
@@ -454,13 +485,33 @@ def run_esrgan(img, model, exe, tmp, log, model_dir=None, native=4):
     cmd = [str(exe), "-i", str(tin), "-o", str(tout), "-n", model,
            "-s", str(native), "-m", str(model_dir or exe.parent / "models"), "-f", "png"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except OSError as e:                      # the program is there but cannot start
         log(f"  Real-ESRGAN could not start: {e}")
         return None
-    if r.returncode != 0 or not tout.exists():
+    t0 = last = time.time()
+    while True:                               # wait for it, saying every 30 s that it is still working; Stop ends it
+        try:
+            stdout, stderr = p.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if should_stop and should_stop():
+            p.terminate()
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            if tout.exists():
+                tout.unlink()
+            raise Stopped()
+        if time.time() - last >= 30:
+            last = time.time()
+            log(f"    Real-ESRGAN still working ({fmt_dur(last - t0)})")
+    if p.returncode != 0 or not tout.exists():
         log("  Real-ESRGAN failed. Output:")
-        log("  " + (r.stderr or r.stdout or "(no output)")[-600:].strip().replace("\n", "\n  "))
+        log("  " + (stderr or stdout or "(no output)")[-600:].strip().replace("\n", "\n  "))
         return None
     out = Image.open(tout).convert("RGB")
     out.load()
@@ -494,7 +545,7 @@ def fetch_model(c, name, url, size):
     try:
         c.L(f"Downloading {name} (about {size}) ...")
         part.parent.mkdir(parents=True, exist_ok=True)    # a name may have a sub folder
-        urllib.request.urlretrieve(url, part)
+        download_file(url, part, c.L)
         os.replace(part, d / name)
         return d / name
     except Exception as e:  # noqa: BLE001
@@ -525,14 +576,18 @@ def make_session(c, path):
         c.L(f"  The GPU did not start ({e}); using the CPU.")
         c.prov = ["CPUExecutionProvider"]
         sess = ort.InferenceSession(str(path), opts, providers=c.prov)
-    c.once("provider", "ONNX Runtime uses " + ("the GPU (DirectML)" if sess.get_providers()[0] == "DmlExecutionProvider"
-                                               else "the CPU"))
+    on_gpu = sess.get_providers()[0] == "DmlExecutionProvider"
+    c.once("provider", "ONNX Runtime uses " + ("the GPU (DirectML)" if on_gpu else "the CPU"))
+    if on_gpu:
+        c.once("dml-prepare", "    The first run on the graphics card prepares the model; this can take a minute.")
     return sess
 
 
-def run_tiles(model, im, tile=256, over=16):
+def run_tiles(model, im, tile=256, over=16, c=None, label=""):
     """Enlarge a PIL image with an ONNX model in tiles (input RGB 0..1, NCHW). Each tile is full
-    size (the picture is edge-padded), the overlap is cropped away and the centre kept."""
+    size (the picture is edge-padded), the overlap is cropped away and the centre kept. With the
+    run's context `c`, Stop ends it between two tiles (Stopped) and a step that takes longer than 10 s
+    says how far it is, at most every 10 s."""
     tile = model.tile or tile
     over = min(over, tile // 4)
     step, n = tile - 2 * over, model.native
@@ -542,12 +597,24 @@ def run_tiles(model, im, tile=256, over=16):
     a = np.pad(a, ((over, ny * step + over - H), (over, nx * step + over - W), (0, 0)), mode="reflect")
     out = np.zeros((ny * step * n, nx * step * n, 3), np.uint8)
     keep = slice(over * n, (over + step) * n)
+    total, done = ny * nx, 0
+    t0 = last = time.time()
     for j in range(ny):
         for i in range(nx):
+            if c is not None and c.should_stop():
+                raise Stopped()
             t = a[j * step:j * step + tile, i * step:i * step + tile].transpose(2, 0, 1)[None]
             r = model.run(t)[0][:, keep, keep]
             out[j * step * n:(j + 1) * step * n, i * step * n:(i + 1) * step * n] = (
                 np.clip(r.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
+            done += 1
+            now = time.time()
+            if c is not None and done < total and now - last >= 10:
+                last = now
+                each = (now - t0) / done
+                left = each * (total - done)
+                c.L(f"    {label}: piece {done} of {total}, {each:.1f} s each, about "
+                    + (f"{left:.0f} s" if left < 60 else f"{-(-left // 60):.0f} min") + " left")
     return Image.fromarray(out[:H * n, :W * n], "RGB")
 
 
@@ -709,7 +776,7 @@ def seedvr2_download_source(c):
     SEEDVR2_DIR.mkdir(parents=True, exist_ok=True)
     zpath, tmp = SEEDVR2_DIR / "src.zip", SEEDVR2_DIR / "unzipped"
     part = zpath.with_name("src.zip.part")
-    urllib.request.urlretrieve(SEEDVR2_ZIP, part)
+    download_file(SEEDVR2_ZIP, part, c.L)
     os.replace(part, zpath)
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(zpath) as zf:
@@ -1247,6 +1314,8 @@ def prepare(L, out):
 def run(o, log, should_stop=lambda: False):
     """Do the whole job. Returns the PDF path (mode pdf) or the folder of upscaled
     copies (mode upscale), or None."""
+    raw = log
+    log = lambda msg="": raw(stamped(msg))      # noqa: E731  every line of a run starts with the time
     notes = []
     files = resolve_images(o, notes.append)
     if not files:
@@ -1264,7 +1333,8 @@ def run(o, log, should_stop=lambda: False):
     logfile = open(work / "logs" / f"{stamp}.log", "w", encoding="utf-8")
 
     def L(msg=""):
-        log(msg)
+        msg = stamped(msg)
+        raw(msg)
         logfile.write(msg + "\n")
         logfile.flush()
 
@@ -1360,7 +1430,7 @@ def make_page(c, path, src_id, im):
                 fit = Image.open(cache).convert("RGB")
                 method = f"AI {model} (cached)"
             else:
-                up = run_esrgan(im, model, c.exe, c.tmp, L)
+                up = run_esrgan(im, model, c.exe, c.tmp, L, should_stop=c.should_stop)
                 if up is None:
                     L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
                     c.exe = None
@@ -1486,7 +1556,7 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
     if m:
         up, why = None, "Real-ESRGAN did not work"
         if m[0] == "ncnn":
-            up = run_esrgan(im, m[1], c.exe, c.tmp, L, m[2], m[3])
+            up = run_esrgan(im, m[1], c.exe, c.tmp, L, m[2], m[3], c.should_stop)
             if up is None:
                 L("  Real-ESRGAN did not work; using plain resizing for the rest of this run.")
                 c.exe = None
@@ -1496,9 +1566,9 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
                     up = run_seedvr2(c, im, target)
                 else:
                     model = c.models[m[1]]
-                    up = run_tiles(model, im)
+                    up = run_tiles(model, im, c=c, label=m[1])
                     if model.twice and f > model.native:    # more than twice as big: a second pass on the result
-                        up = run_tiles(model, up)
+                        up = run_tiles(model, up, c=c, label=m[1])
             except Stopped:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1767,7 +1837,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
             break
         t0 = time.time()
         L(f"[{n}/{len(pictures)}] {path.name[:50]}")
-        results = {}
+        results, stopped = {}, False
         try:
             src_id, im = source_id(path), load_rgb(path)
         except Exception:  # noqa: BLE001
@@ -1787,6 +1857,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
                 results[m] = make_upscaled(c, path, src_id, im, force=m)["result"]
                 times.setdefault(m, []).append(time.time() - t1)
             except Stopped:
+                stopped = True
                 break
             except Exception as e:  # noqa: BLE001
                 why = str(e) or type(e).__name__
@@ -1796,6 +1867,9 @@ def run_compare(c, files, stamp, out, should_stop, started):
                 L("    a model could not make this picture (the key says which)")
             finally:
                 c.L = real
+        if stopped:                  # a picture stopped in the middle is not saved
+            L("\nStopped by user.")
+            break
         if not results:
             continue
         folder.mkdir(parents=True, exist_ok=True)
@@ -1855,6 +1929,8 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     """Process up to n images (spread over the list) exactly as the run would and return what to show: a list of dicts
     with name, kind, method, original, result, detail_original, detail_result.
     Writes only into the work folder (pages and results are kept for the run that follows)."""
+    raw = log
+    log = lambda msg="": raw(stamped(msg))      # noqa: E731
     files = resolve_images(o, log)
     if not files:
         log("No images to work on. Add a folder or some pictures first.")
@@ -2237,7 +2313,7 @@ def build_window():
 
     right = ttk.Frame(root)
     right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
-    right.rowconfigure(1, weight=1)
+    right.rowconfigure(2, weight=1)
     right.columnconfigure(0, weight=1)
 
     # ---- helpers to build rows
@@ -2559,15 +2635,18 @@ def build_window():
         b_prev.configure(state="disabled" if MAKE.get(v_make.get()) == "compare" else "normal")
     v_make.trace_add("write", sync_buttons)
     sync_buttons()
+    v_status = tk.StringVar(value="Ready")
+    status = ttk.Label(right, textvariable=v_status, font=small)
+    status.grid(row=1, column=0, sticky="w", pady=(0, 4))
     log_text = tk.Text(right, wrap="none", font=mono, height=20, undo=False)
     ysb = ttk.Scrollbar(right, orient="vertical", command=log_text.yview)
     xsb = ttk.Scrollbar(right, orient="horizontal", command=log_text.xview)
     log_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-    log_text.grid(row=1, column=0, sticky="nsew")
-    ysb.grid(row=1, column=1, sticky="ns")
-    xsb.grid(row=2, column=0, sticky="ew")
+    log_text.grid(row=2, column=0, sticky="nsew")
+    ysb.grid(row=2, column=1, sticky="ns")
+    xsb.grid(row=3, column=0, sticky="ew")
     foot = ttk.Frame(right)
-    foot.grid(row=3, column=0, sticky="w", pady=(6, 0))
+    foot.grid(row=4, column=0, sticky="w", pady=(6, 0))
     b_copy = ttk.Button(foot, text="Copy log")
     b_open = ttk.Button(foot, text="Open output folder")
     for b in (b_copy, b_open):
@@ -2583,11 +2662,36 @@ def build_window():
     log_text.bind("<Control-a>", lambda e: (log_text.tag_add("sel", "1.0", "end"), "break")[1])
 
     q = queue.Queue()
-    state = {"stop": False, "last_out": None}
+    state = {"stop": False, "last_out": None, "busy": False, "started": 0.0, "last_log": 0.0, "step": "",
+             "preview_run": False}
 
     def append(msg):
         log_text.insert("end", msg + "\n")
         log_text.see("end")
+
+    def note_step(msg):
+        """The short text of the last log line: what the run is doing now (the time in front is left out)."""
+        for ln in reversed(msg.splitlines()):
+            ln = re.sub(r"^\[\d\d:\d\d:\d\d\]\s*", "", ln.strip())
+            if ln:
+                state["step"] = ln if len(ln) <= 60 else ln[:57] + "..."
+                break
+        state["last_log"] = time.time()
+
+    def show_status():
+        """The line above the log while a run is busy: a turning bar, what it does now, and the time since it started.
+        It is called by the poll loop, so it keeps going when the worker says nothing."""
+        if not state["busy"]:
+            return
+        now = time.time()
+        spin = "|/-\\"[int(now * 4) % 4]
+        sec = int(now - state["started"])
+        clock = f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+        quiet = now - state["last_log"]
+        step = state["step"] or "starting"
+        if quiet > 60:
+            step += f" (still working, last message {fmt_dur(quiet // 60 * 60)} ago)"
+        v_status.set(f"{spin} Working: {step} \u2014 {clock}")
 
     append("Add folders or pictures on the left, choose what to do with them, then press Run.\n"
            "The log here can be selected and copied (Ctrl+C), or press 'Copy log'.")
@@ -2655,6 +2759,8 @@ def build_window():
     def start_run(opts, preview=False):
         log_text.delete("1.0", "end")
         state["stop"] = False
+        state.update(busy=True, started=time.time(), last_log=time.time(), step="", preview_run=preview)
+        show_status()
         for b in (b_prev, b_run):
             b.configure(state="disabled")
         b_stop.configure(state="normal")
@@ -2677,7 +2783,7 @@ def build_window():
     def stop():
         state["stop"] = True
         b_stop.configure(state="disabled")
-        append("Stopping after the current image ...")
+        append(stamped("Stopping ..."))
 
     def copy_log():
         root.clipboard_clear()
@@ -2784,9 +2890,13 @@ def build_window():
                 kind, payload = q.get_nowait()
                 if kind == "log":
                     append(payload)
+                    note_step(payload)
                 elif kind == "preview":
                     state["preview"] = show_preview(*payload)
                 else:
+                    state["busy"] = False
+                    v_status.set("Stopped" if state["stop"] else "Done" if payload or state["preview_run"]
+                                 else "Finished (see the log)")
                     b_run.configure(state="normal")
                     sync_buttons()
                     b_stop.configure(state="disabled")
@@ -2797,6 +2907,7 @@ def build_window():
                             open_path(payload)
         except queue.Empty:
             pass
+        show_status()
         root.after(120, poll)
 
     b_prev.configure(command=lambda: begin(True))
@@ -2811,7 +2922,7 @@ def build_window():
                            count_text=v_count, vars=SimpleNamespace(make=v_make, save=v_save, save_to=v_save_to,
                                                                     name=v_name, faces=v_faces, ai=v_ai, model=v_model,
                                                                     compare=v_cmp),
-                           group_diff=g_sv, b_prev=b_prev,
+                           group_diff=g_sv, b_prev=b_prev, status_text=v_status,
                            begin=begin, state=state, log_text=log_text, help_text=v_help, sync=sync,
                            toggle_more=toggle_more, dnd=dnd, left=left)
 

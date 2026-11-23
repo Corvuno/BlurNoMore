@@ -227,6 +227,95 @@ def check_ai_dir(out):
     print("AI files folder ok")
 
 
+def check_progress(models, pics, out):
+    """A run says that it is alive: every line has the time, a slow model reports its pieces (at most every 10 s, on a
+    clock we move ourselves), Stop works between two pieces and leaves no file for that picture, and a slow
+    Real-ESRGAN says it is still working and is ended by Stop."""
+    import re
+    import types
+    photo(700, 500, 3).save(pics / "tiles.png")           # 12 pieces with the 256 pixel fake model
+    clock = types.SimpleNamespace(t=1000.0)
+    real_time, real_run = bn.time, bn.OnnxModel.run
+    bn.time = types.SimpleNamespace(time=lambda: clock.t, sleep=real_time.sleep)
+
+    def slow_run(self, t):
+        clock.t += 4.0                                   # every piece takes 4 s of the fake clock
+        calls.append(clock.t)
+        return real_run(self, t)
+    bn.OnnxModel.run = slow_run
+    try:
+        calls = []
+        lines = []
+        o = bn.Options(save_to=str(out / "prog"), ai_dir=str(models.parent), inputs=[str(pics / "tiles.png")],
+                       mode="upscale", up_model="dat", scale=2)
+        res = bn.run(o, lines.append)
+        assert res, lines
+        said = [ln for ln in lines if "piece " in ln]
+        assert 2 <= len(said) <= 4, said                 # 12 pieces of 4 s = 48 s: one line every 3rd piece, none at the end
+        assert all(re.search(r"\] +dat: piece \d+ of 12, 4\.0 s each, about \d+ (s|min) left$", ln) for ln in said), said
+        assert "piece 3 of 12" in said[0] and "about 36 s left" in said[0], said[0]
+        for ln in lines:
+            if ln.strip():
+                assert re.match(r"\n*\[\d\d:\d\d:\d\d\] ", ln), f"no time in front: {ln!r}"
+        assert any("The first run on the graphics card" in ln for ln in lines) == ("DmlExecutionProvider" in bn.ort.get_available_providers())
+        logfile = next((Path(res).parent / "_blurnomore_work" / "logs").glob("*.log")).read_text(encoding="utf-8")
+        assert logfile.startswith("[") and "piece 3 of 12" in logfile and logfile.rstrip().splitlines()[-1].startswith("["), logfile
+        # a quick step says nothing about pieces
+        calls.clear()
+        bn.OnnxModel.run = lambda self, t: real_run(self, t)
+        lines = []
+        bn.run(bn.Options(save_to=str(out / "prog_fast"), ai_dir=str(models.parent), inputs=[str(pics / "tiles.png")],
+                          mode="upscale", up_model="dat", scale=2), lines.append)
+        assert not any("piece " in ln for ln in lines), lines
+        # Stop after the 5th piece: it ends there, says so, and no file is made for that picture
+        bn.OnnxModel.run = slow_run
+        calls.clear()
+        lines = []
+        o = bn.Options(save_to=str(out / "prog_stop"), ai_dir=str(models.parent), inputs=[str(pics / "tiles.png")],
+                       mode="upscale", up_model="dat", scale=2, redo=True)
+        res = bn.run(o, lines.append, lambda: len(calls) >= 5)
+        assert res is None and len(calls) == 5, (res, len(calls))
+        assert any("Stopped by user." in ln for ln in lines), lines
+        assert not any(f.suffix in (".png", ".jpg") for f in (out / "prog_stop").rglob("*") if "_blurnomore_work" not in f.parts and f.is_file()), "a file was left"
+        assert not list((out / "prog_stop" / "_blurnomore_work" / "preview_cache").glob("*.png")), "a stopped picture was cached"
+        # Compare: a picture stopped in the middle is not written
+        calls.clear()
+        lines = []
+        res = bn.run(bn.Options(save_to=str(out / "prog_cmp"), ai_dir=str(models.parent), inputs=[str(pics / "tiles.png")],
+                                mode="compare", scale=2, compare_models=["dat", "bhi"]), lines.append, lambda: len(calls) >= 5)
+        assert res is None and any("Stopped by user." in ln for ln in lines), lines
+        assert not list((out / "prog_cmp").glob("BlurNoMore_compare_*/*_?.png")), "a half picture was written"
+    finally:
+        bn.OnnxModel.run = real_run
+        bn.time = real_time
+    # Real-ESRGAN: still working every 30 s (fake clock +10 s per look), and Stop ends the program
+    exe = out / "slow_esrgan.sh"
+    exe.write_text("#!/bin/sh\nsleep 3\nexit 1\n")
+    exe.chmod(0o755)
+    tmp = out / "esr_tmp"
+    tmp.mkdir()
+    said = []
+    clock.t = 0.0
+
+    def tick():
+        clock.t += 10.0
+        return clock.t
+    bn.time = types.SimpleNamespace(time=tick, sleep=real_time.sleep)
+    try:
+        assert bn.run_esrgan(Image.new("RGB", (8, 8)), "x", exe, tmp, said.append) is None
+    finally:
+        bn.time = real_time
+    assert any(re.fullmatch(r"    Real-ESRGAN still working \(\d+ (s|min)( \d+ s)?\)", m) for m in said), said
+    t0 = time.time()
+    try:
+        bn.run_esrgan(Image.new("RGB", (8, 8)), "x", exe, tmp, said.append, should_stop=lambda: time.time() - t0 > 1)
+        raise AssertionError("Stop did not end Real-ESRGAN")
+    except bn.Stopped:
+        pass
+    assert time.time() - t0 < 3, "Stop took too long"
+    print("progress ok")
+
+
 def check():
     with tempfile.TemporaryDirectory() as t_models, tempfile.TemporaryDirectory() as t_in, \
             tempfile.TemporaryDirectory() as t_out, tempfile.TemporaryDirectory() as t_app:
@@ -427,6 +516,7 @@ def check():
         print("compare with the inventing model ok")
 
         check_ai_dir(out)
+        check_progress(models, pics, out)
 
         assert all(snapshot(pics).get(n) == hsh for n, hsh in before.items()), "an original changed"
         print("Fake-model check passed.")
