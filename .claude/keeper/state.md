@@ -55,6 +55,10 @@ The overview every conversation starts from. One screen; what is no longer true 
   the card's name; setting Graphics card (More settings, --gpu) overrides. Compare releases each model after its
   picture, keeps results in _blurnomore_work/compare_unfinished at once (with a key). FAILED = one line in the
   window, full trace only in the log file; Copy log copies the file. Not yet confirmed on the owner's PC.
+- 4.10.1 (landed 2026-11-23): 4.10 picked the RX 7800 XT on the owner's PC, but everything ran out of memory
+  because the old 4.9.1 Compare was still running (owner confirmed). Now each run/preview leaves a note in
+  settings/running; a new run warns in its first log lines when another is alive. Out-of-memory FAILED lines say
+  so; Compare logs one "N of M could not make this picture" line per picture.
 - The PDF pages are byte-identical to 3.1 for the same settings. Every choice has its reason in
   the README.
 

@@ -135,10 +135,11 @@ def main():
     finally:
         bn.APP_DIR, bn.SETTINGS_FILE, bn.ESRGAN_DIR, bn.MODELS_DIR, bn.SEEDVR2_DIR = saved
         (ROOT / "settings" / "blurnomore_last_run.json").unlink(missing_ok=True)
-        try:
-            (ROOT / "settings").rmdir()      # only when empty
-        except OSError:
-            pass
+        for d in (ROOT / "settings" / "running", ROOT / "settings"):
+            try:
+                d.rmdir()                    # only when empty
+            except OSError:
+                pass
 
 
 def ai_run(base, ai_dir, out):
@@ -481,7 +482,8 @@ def check_failed_lines(models, pics, out):
     assert res and "Traceback" not in text, text[-1500:]
     fails = [ln for ln in lines if "FAILED: bhi" in ln]
     assert len(fails) == 1 and fails[0].endswith(
-        "FAILED: bhi: RuntimeError: Not enough memory resources are available to complete this operation."), fails
+        "FAILED: bhi: RuntimeError: Not enough memory resources are available to complete this operation. (out of memory: "
+        "is another BlurNoMore, or an earlier run, still going? Close it, or restart the PC, and try again)"), fails
     log = next((out / "failed_line" / "_blurnomore_work" / "logs").glob("*.log")).read_text(encoding="utf-8")
     assert "Traceback" in log and "FAILED: bhi" in log, log[-1500:]
     print("one FAILED line ok")
@@ -751,6 +753,8 @@ def check():
         key = (folder / "key.txt").read_text(encoding="utf-8")
         assert "failed:" in key and "no internet here" in key, key
         assert len(list(folder.glob("small_?.png"))) == 2 and len(list(folder.glob("bigger_?.png"))) == 2
+        missing = [ln for ln in log if "could not make this picture" in ln]
+        assert len(missing) == 2 and all(ln.endswith("1 of the 3 could not make this picture (the key says which)") for ln in missing), missing
         print("compare with a missing model ok")
 
         # SeedVR2 inside Compare (also when it fails); and more than 4 pictures use the first 4

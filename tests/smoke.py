@@ -53,13 +53,49 @@ def main():
     finally:
         if saved is None:
             LAST_RUN.unlink(missing_ok=True)
-            try:
-                LAST_RUN.parent.rmdir()          # only when empty
-            except OSError:
-                pass
+            for d in (LAST_RUN.parent / "running", LAST_RUN.parent):
+                try:
+                    d.rmdir()                    # only when empty
+                except OSError:
+                    pass
         else:
             LAST_RUN.write_bytes(saved)
     check_settings_file()
+    check_other_runs()
+
+
+def check_other_runs():
+    """A run says in its first lines when another BlurNoMore run is still working; notes of runs that are gone are
+    cleared away."""
+    sys.path.insert(0, str(ROOT))
+    import blurnomore as bn
+    saved = bn.SETTINGS_DIR
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            bn.SETTINGS_DIR = Path(t)
+            run_dir = bn.runs_dir()
+            run_dir.mkdir()
+            (run_dir / "a.json").write_text(json.dumps({"pid": other.pid, "kind": "run", "started": "13:07"}))
+            (run_dir / "b.json").write_text(json.dumps({"pid": dead.pid, "kind": "run", "started": "12:00"}))
+            mine = bn.mark_run("run")
+            lines = []
+            bn.warn_other_runs(lines.append)
+            assert len(lines) == 1 and "another BlurNoMore run is still working (started 13:07)" in lines[0] and \
+                "run out of memory" in lines[0], lines
+            assert not (run_dir / "b.json").exists(), "the note of a run that is gone was kept"
+            bn.unmark_run(mine)
+            assert not mine.exists()
+            (run_dir / "a.json").unlink()
+            lines.clear()
+            bn.warn_other_runs(lines.append)
+            assert not lines, lines
+    finally:
+        bn.SETTINGS_DIR = saved
+        other.kill()
+    print("other runs warning ok")
 
 
 def check_settings_file():

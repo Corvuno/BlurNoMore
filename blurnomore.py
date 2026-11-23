@@ -68,7 +68,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.10"
+VERSION = "4.10.1"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -515,6 +515,83 @@ def error_trace(indent="    "):
     return FileOnly(indent + traceback.format_exc().rstrip().replace("\n", "\n" + indent))
 
 
+def pid_alive(pid):
+    """Whether a process with this number is still running."""
+    if pid == os.getpid():
+        return True
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return bool(ok) and code.value == 259             # STILL_ACTIVE
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def runs_dir():
+    return SETTINGS_DIR / "running"
+
+
+def mark_run(kind):
+    """Leave a note in settings/running while a run or preview works, so another run can tell it is not alone."""
+    path = runs_dir() / f"{os.getpid()}_{threading.get_ident()}_{random.getrandbits(32):08x}.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"pid": os.getpid(), "kind": kind, "started": f"{datetime.now():%H:%M}"}), encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
+def unmark_run(path):
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def warn_other_runs(L):
+    """Say in the first lines of the log when another BlurNoMore run is still working (it shares the graphics card and
+    the memory). Notes of runs that are gone (the program was closed or crashed) are cleared away. Warns, never blocks."""
+    others = []
+    try:
+        for f in sorted(runs_dir().glob("*.json")):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if d.get("pid") == os.getpid():          # this program's own run (the window does one at a time)
+                continue
+            if pid_alive(d.get("pid", -1)):
+                others.append(d)
+            else:
+                f.unlink(missing_ok=True)
+    except OSError:
+        return
+    for d in others:
+        what = "Run with preview" if d.get("kind") == "preview" else "run"
+        L(f"WARNING: another BlurNoMore {what} is still working (started {d.get('started', '?')}). It shares the graphics card "
+          "and the memory, so this run can be very slow or run out of memory. Stop or close it first if this is not meant.")
+
+
+def memory_hint(text):
+    """A plain hint when an error means the PC ran out of memory (graphics or normal memory)."""
+    t = str(text).lower()
+    if any(k in t for k in ("bad allocation", "8007000e", "not enough memory", "out of memory", "bad_alloc")):
+        return (" (out of memory: is another BlurNoMore, or an earlier run, still going? Close it, or restart the PC, "
+                "and try again)")
+    return ""
+
+
 def error_text():
     """The error being handled in one line: 'Type: message'."""
     e = sys.exc_info()[1]
@@ -943,7 +1020,7 @@ def load_onnx(c, name):
             c.L(f"  Model '{name}': it should enlarge {model.native}x but it enlarges {got}x; using {got}x.")
             model.native = got
     except Exception as e:  # noqa: BLE001
-        c.L(f"    FAILED: {name}: could not start: {e}")
+        c.L(f"    FAILED: {name}: could not start: {e}{memory_hint(e)}")
         return None
     c.models[name] = model
     return model
@@ -1669,6 +1746,7 @@ def run(o, log, should_stop=lambda: False):
         logfile.write(msg + "\n")
         logfile.flush()
 
+    mark = mark_run("run")
     try:
         return _run(o, L, should_stop, out, files, notes, stamp, work, started)
     except Stopped:                  # Stop pressed while something was being downloaded
@@ -1680,6 +1758,7 @@ def run(o, log, should_stop=lambda: False):
         return None
     finally:
         L(f"Log saved: {work / 'logs' / (stamp + '.log')}")
+        unmark_run(mark)
         crash_trace(None)
         logfile.close()
 
@@ -1915,7 +1994,7 @@ def make_upscaled(c, path, src_id, im, store=False, force=None):
                     why = f"{m[1]} {e}"
                     L(f"    FAILED: {why}; skipping it for the rest of this run")
                 else:
-                    L(f"    FAILED: {m[1]}: {why}")
+                    L(f"    FAILED: {m[1]}: {why}{memory_hint(e)}")
                     L(error_trace())
                 L(f"  Using plain resizing instead of '{m[1]}' for the rest of this run.")
                 c.models[m[1]] = None
@@ -1966,6 +2045,7 @@ def upscaled_line(r, name, t0, limit_note="", folder=None):
 
 def _run(o, L, should_stop, out, files, notes, stamp, work, started):
     L(f"BlurNoMore v{VERSION}   {datetime.now():%Y-%m-%d %H:%M:%S}")
+    warn_other_runs(L)
     L(f"Python {platform.python_version()}  Pillow {Image.__version__}  numpy {np.__version__}  {platform.platform()}")
     L("Settings: " + ", ".join(f"{k}={v}" for k, v in asdict(o).items()))
     prepare_ai_dir(o, L, files)
@@ -2223,7 +2303,7 @@ def run_compare(c, files, stamp, out, should_stop, started):
         while base in used:
             base, k = f"{path.stem[:40]}_{k}", k + 1
         used.add(base)
-        kept = []
+        kept, missing = [], 0
         for m in contestants:                        # always in this order, so the log tells nothing about the letters
             heard, real = [], c.L
 
@@ -2249,10 +2329,12 @@ def run_compare(c, files, stamp, out, should_stop, started):
                 if "see the log" in why:       # not started: the reason it gave the first time stands, else the last thing said
                     why = next(iter(fails.get(m, {}).values()), None) or why_said(heard, why)
                 fails.setdefault(m, {})[path.name] = why
-                L("    a model could not make this picture (the key says which)")
+                missing += 1
             finally:
                 c.L = real
                 release_model(c, m)          # its graphics memory is free for the next model
+        if missing:
+            L(f"    {missing} of the {len(contestants)} could not make this picture (the key says which)")
         if stopped:                  # a picture stopped in the middle is not saved
             for p in kept:
                 p.unlink(missing_ok=True)
@@ -2330,9 +2412,11 @@ def make_preview(o, log, n=4, should_stop=lambda: False):
     if work is None:
         return []
     logfile = open(work / "logs" / f"{datetime.now():%Y-%m-%d_%H%M%S}_preview.log", "w", encoding="utf-8")
+    mark = mark_run("preview")
     try:
         return _preview(o, raw, logfile, files, work, n, should_stop)
     finally:
+        unmark_run(mark)
         logfile.close()
 
 
@@ -2344,6 +2428,7 @@ def _preview(o, raw, logfile, files, work, n, should_stop):
             raw(msg)
         logfile.write(msg + "\n")
         logfile.flush()
+    warn_other_runs(log)
     prepare_ai_dir(o, log, files)
     c = Context(o, log, work)
     c.should_stop = should_stop
