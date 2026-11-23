@@ -171,6 +171,7 @@ The "Models" check on GitHub downloads these and runs them on made-up pictures; 
 
 ## Version history
 
+- 4.7.1: scrolling the mouse wheel over an open dropdown list no longer fills the black window with errors.
 - 4.7: new settings JPG quality (`--jpg-quality`) and Limit file size (`--max-mb`) for Bigger images and the Compare letters: a picture that would be bigger than the limit gets a lower JPG quality (not below 50), then is made smaller; a PNG that is too big becomes a JPG. Off by default: the files are the same as in 4.6. The tracing PDF is unchanged.
 - 4.6: new setting AI files folder (window: More settings; `--ai-dir`): keeps `realesrgan`, `models` and `seedvr2` (Python, PyTorch, uv's Python and cache) on another disk if you want. When you change it, the files are moved there at the next run, and SeedVR2 sets its Python up again once (a set-up made by 4.5 kept its download cache in the user folder, so the first rebuild after moving downloads PyTorch, about 3 GB, again; from 4.6 on the cache moves along). A new folder that is inside the folders being moved or among your pictures is refused. The tracing PDF is unchanged.
 - 4.5: the inventing upscaler is now SeedVR2 3B (restores by making up detail, opt-in, sets itself up the first time in the folder `seedvr2`) instead of Stable Diffusion x4, with its own settings: seed, how it keeps the colours, input noise, latent noise, save graphics memory. Automatic never picks it. The tracing PDF is unchanged.

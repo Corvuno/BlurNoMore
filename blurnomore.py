@@ -66,7 +66,7 @@ except Exception:  # noqa: BLE001
 
 Image.MAX_IMAGE_PIXELS = None
 
-VERSION = "4.7"
+VERSION = "4.7.1"
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 A4_MM = (210.0, 297.0)
 DEFAULT_FOLDER = str(Path.home() / "Pictures")
@@ -2224,7 +2224,10 @@ def build_window():
 
     def wheel(e):
         """Scroll the settings only while the pointer is over them (and not over the list, which scrolls itself)."""
-        w = root.winfo_containing(e.x_root, e.y_root)
+        try:
+            w = root.winfo_containing(e.x_root, e.y_root)
+        except (KeyError, tk.TclError):   # over an open dropdown list: Tk's own window, not one of ours
+            return
         if w is None or not over_left(w) or isinstance(w, tk.Listbox) or canvas.yview() == (0.0, 1.0):
             return
         step = (-1 if e.delta > 0 else 1) if e.delta else (-1 if e.num == 4 else 1)
